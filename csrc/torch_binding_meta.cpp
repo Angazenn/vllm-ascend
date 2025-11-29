@@ -157,6 +157,19 @@ void batch_matmul_transpose(const at::Tensor &tensor_a, const at::Tensor &tensor
 {
     return;
 
+at::Tensor& dispatch_ffn_combine_meta(
+    const at::Tensor& x,
+    const at::Tensor& weight1,
+    const at::Tensor& weight2,
+    const at::Tensor& expert_idx,
+    const at::Tensor& scale1,
+    const at::Tensor& scale2,
+    const at::Tensor& probs,
+    c10::string_view group,
+    int64_t max_output_size,
+    at::Tensor& out
+) {
+    return out;
 }
 
 } // namespace meta
@@ -182,5 +195,7 @@ TORCH_LIBRARY_IMPL_EXPAND(CONCAT(_C, _ascend), Meta, ops) {
     ops.impl("grouped_matmul_swiglu_quant_weight_nz_tensor_list", &vllm_ascend::meta::grouped_matmul_swiglu_quant_weight_nz_tensor_list_meta);
     // batch_matmul_transpose
     ops.impl("batch_matmul_transpose", &vllm_ascend::meta::batch_matmul_transpose);
+    // MoE dispatch-ffn-combine
+    ops.impl("dispatch_ffn_combine", &vllm_ascend::meta::dispatch_ffn_combine_meta);
 }
 }
