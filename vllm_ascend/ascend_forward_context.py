@@ -117,7 +117,10 @@ def set_ascend_forward_context(
         mmrs_fusion = True
         if is_moe_model(vllm_config):
             sp_enabled = enable_sp(vllm_config) and num_tokens is not None
-            mmrs_fusion = False
+            if num_tokens is not None and num_tokens > 1000:
+                mmrs_fusion = True
+            else:
+                mmrs_fusion = False
         else:
             sp_enabled = enable_sp(vllm_config) and \
                 num_tokens is not None and num_tokens > 1000
