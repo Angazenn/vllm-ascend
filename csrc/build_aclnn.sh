@@ -23,6 +23,9 @@ else
     exit 0
 fi
 
+git submodule init
+git submodule update
+
 # build custom ops
 cd csrc
 rm -rf build output

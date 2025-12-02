@@ -5,8 +5,8 @@
 #include "kernel_operator.h"
 #include "const_args.hpp"
 
-#include "hccl/hccl_common.h"
-#include "hccl/common/hccl_inner_def.h"
+#include "highlevel_api/lib/hccl/hccl_common.h"
+#include "highlevel_api/impl/hccl/common/hccl_inner_def.h"
 
 #ifndef HCCL_COMM
 #include "shmem_api.h"

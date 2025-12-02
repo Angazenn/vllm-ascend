@@ -20,8 +20,8 @@ using namespace AscendC;
 
 #include "kernel_operator.h"
 
-#include "hccl/hccl_common.h"
-#include "hccl/common/hccl_inner_def.h"
+#include "highlevel_api/lib/hccl/hccl_common.h"
+#include "highlevel_api/impl/hccl/common/hccl_inner_def.h"
 
 #include "dispatch_ffn_combine_tiling.h"
 
@@ -38,7 +38,6 @@ using namespace AscendC;
 #include "catlass/gemm/kernel/matmul_epilogue.hpp"
 #include "catlass/gemm/gemm_type.hpp"
 #include "catlass/layout/layout.hpp"
-#include "catlass/status.hpp"
 
 #include "utils/select_helper.hpp"
 #include "utils/const_args.hpp"
