@@ -335,8 +335,8 @@ class AscendAttentionMetadataBuilder:
                     query_start_loc_cpu.device).to(query_start_loc_cpu.dtype)
             ])
 
-        query_start_loc = query_start_loc_cpu.to(self.device,
-                                                 non_blocking=True)
+        query_start_loc = query_start_loc_cpu.pin_memory().to(
+            self.device, non_blocking=True)
 
         common_long_seq_metadata = common_attn_metadata.prefill_context_parallel_metadata
         prefill_metadata = None
