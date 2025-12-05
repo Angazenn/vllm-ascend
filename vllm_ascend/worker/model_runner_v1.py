@@ -2362,7 +2362,7 @@ class NPUModelRunner(LoRAModelRunnerMixin, ECConnectorModelRunnerMixin):
         elif soc_version in {AscendDeviceType._910_93}:
             moe_comm_type = (MoECommType.FUSED_MC2
                              if num_tokens <= self.mc2_tokens_capacity else
-                             MoECommType.FUSED_ALLTOALL if quant_type
+                             MoECommType.ALLTOALL if quant_type
                              == "w8a8_dynamic" else MoECommType.ALLTOALL)
         else:
             raise ValueError(f"Unsupported soc_version: {soc_version}")

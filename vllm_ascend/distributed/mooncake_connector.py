@@ -640,6 +640,7 @@ class MooncakeConnector(KVConnectorBase_V1):
                  role: KVConnectorRole,
                  kv_cache_config: Optional[KVCacheConfig] = None):
         assert vllm_config.kv_transfer_config is not None
+        self._connector_metadata = MooncakeConnectorMetadata()
         self.engine_id = vllm_config.kv_transfer_config.engine_id
 
         if role == KVConnectorRole.SCHEDULER:
