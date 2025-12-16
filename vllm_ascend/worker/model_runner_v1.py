@@ -1984,7 +1984,7 @@ class NPUModelRunner(LoRAModelRunnerMixin, ECConnectorModelRunnerMixin):
                     attn_metadata[layer_name] = attn_metadata_i
 
         # update global cos, sin
-        update_cos_sin(positions)
+        update_cos_sin(self.model, self.vllm_config, positions)
 
         if lmhead_tp_enable():
             max_num_reqs_across_dp = maybe_padded_num_tokens if not with_prefill else self.max_num_reqs
@@ -3156,7 +3156,7 @@ class NPUModelRunner(LoRAModelRunnerMixin, ECConnectorModelRunnerMixin):
                 positions = self.positions[:num_tokens_padded]
 
             # update global cos, sin
-            update_cos_sin(positions)
+            update_cos_sin(self.model, self.vllm_config, positions)
 
             if get_pp_group().is_first_rank:
                 intermediate_tensors = None

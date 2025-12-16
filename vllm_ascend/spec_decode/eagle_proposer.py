@@ -146,9 +146,8 @@ class EagleProposer(Proposer):
                   batch_descriptor=None,
                   dummy_compute_logits=lambda hidden_states: None):
         moe_comm_type = self.runner._select_moe_comm_method(num_tokens)
-        positions = self.positions[:num_tokens]
         # update global cos, sin
-        update_cos_sin(positions)
+        update_cos_sin(self.model, self.vllm_config, self.positions[:num_tokens])
         with set_ascend_forward_context(None,
                                         self.vllm_config,
                                         moe_comm_type=moe_comm_type,
@@ -348,9 +347,8 @@ class EagleProposer(Proposer):
         attn_metadata = builder.build(0, common_attn_metadata,
                                       self.runner.get_model())
 
-        positions = self.positions[:num_input_tokens]
         # update global cos, sin
-        update_cos_sin(positions)
+        update_cos_sin(self.model, self.vllm_config, self.positions[:num_input_tokens])
 
         with set_ascend_forward_context(attn_metadata,
                                         self.vllm_config,
@@ -460,9 +458,8 @@ class EagleProposer(Proposer):
             attn_metadata.attn_mask = attn_mask
             # Run the model.
 
-            positions = self.positions[:input_batch_size]
             # update global cos, sin
-            update_cos_sin(positions)
+            update_cos_sin(self.model, self.vllm_config, self.positions[:input_batch_size])
 
             with set_ascend_forward_context(attn_metadata,
                                             self.vllm_config,

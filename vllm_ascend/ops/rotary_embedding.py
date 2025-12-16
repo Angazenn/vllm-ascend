@@ -32,18 +32,10 @@ from vllm_ascend.utils import (AscendDeviceType, enable_custom_op,
 # However, RotaryEmbedding in vllm use cos_sin_cache as a whole variable.
 # So we have to preprocess cos_sin_cache int cos && sin. In the future,
 # we shall implement a new rope ops which accept cos_sin_cache as inputs.
-_cos_sin_cache: Optional[torch.Tensor] = None
 _cos_cache: Optional[torch.Tensor] = None
 _sin_cache: Optional[torch.Tensor] = None
 _cos: Optional[torch.Tensor] = None
 _sin: Optional[torch.Tensor] = None
-
-
-def _record_cos_sin_cache(cos_sin_cache):
-    global _cos_sin_cache
-    if _cos_sin_cache is not None:
-        return
-    _cos_sin_cache = cos_sin_cache
 
 
 def initialize_cos_sin(vllm_config, dtype, device):
@@ -66,22 +58,28 @@ def initialize_cos_sin(vllm_config, dtype, device):
                              device=device)
 
 
-def update_cos_sin(positions):
+def update_cos_sin(model, vllm_config, positions):
     global _cos_cache
     global _sin_cache
     global _cos
     global _sin
 
-    if _cos_sin_cache is None or \
-        _cos_cache is None or \
+    if _cos_cache is None or \
         _sin_cache is None:
         return
 
+    model_type = vllm_config.model_config.hf_config.model_type
+    if model_type in ["qwen3_next"]:
+        rope_layer = 3
+    else:
+        rope_layer = 0
+    cos_sin_cache = model.model.layers[rope_layer].self_attn.rotary_emb.cos_sin_cache
+
     num_tokens = positions.size(0)
-    _cos_cache[:, :num_tokens] = _cos_sin_cache.index_select(
+    _cos_cache[:, :num_tokens] = cos_sin_cache.index_select(
         0, positions).view(num_tokens, 2, -1).repeat(1, 1, 2).chunk(2,
                                                                     dim=-2)[0]
-    _sin_cache[:, :num_tokens] = _cos_sin_cache.index_select(
+    _sin_cache[:, :num_tokens] = cos_sin_cache.index_select(
         0, positions).view(num_tokens, 2, -1).repeat(1, 1, 2).chunk(2,
                                                                     dim=-2)[1]
     _cos = _cos_cache[:, :num_tokens]
@@ -190,7 +188,6 @@ class AscendRotaryEmbedding(RotaryEmbedding):
     ) -> None:
         super().__init__(head_size, rotary_dim, max_position_embeddings, base,
                          is_neox_style, dtype)
-        _record_cos_sin_cache(self.cos_sin_cache)
 
     def forward_oot(
         self,
@@ -232,7 +229,6 @@ class AscendYaRNRotaryEmbedding(YaRNScalingRotaryEmbedding):
         }
         super().__init__(head_size, rotary_dim, max_position_embeddings, base,
                          is_neox_style, scaling_factor, dtype, **extra_kwargs)
-        _record_cos_sin_cache(self.cos_sin_cache)
 
     def forward_oot(
         self,
