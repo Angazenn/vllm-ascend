@@ -79,9 +79,9 @@ def verify_and_update_config(cls, vllm_config) -> None:
     # pad mamba page size for conv_blocks
     if (
         cache_config.mamba_page_size_padded is None
-        or cache_config.mamba_page_size_padded != attn_page_size + conv_block_page_size
+        or cache_config.mamba_page_size_padded != attn_page_size
     ):
-        cache_config.mamba_page_size_padded = attn_page_size + conv_block_page_size
+        cache_config.mamba_page_size_padded = attn_page_size
         mamba_padding_pct = 100 * conv_block_page_size / cache_config.mamba_page_size_padded
         logger.info(
             "Padding mamba page size by %.2f%% to ensure "
