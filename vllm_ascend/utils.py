@@ -66,6 +66,7 @@ _DYNAMIC_EPLB_BUFFER_SIZE = 100
 _IS_MOE_MODEL = None
 _IS_DRAFTER_MOE_MODEL = None
 _IS_VL_MODEL = None
+_ATNN_CALCULATION_STREAM = None
 _ENABLE_SP = None
 _HAS_LAYER_IDX = None
 _HAS_ROPE = None
@@ -77,6 +78,37 @@ _CUSTOM_OP_BASE_DIR = (
 
 def is_310p():
     return get_ascend_device_type() == AscendDeviceType._310P
+
+
+def extract_dsv4_layer_index(config: Any, layer_name: str) -> int:
+    """Extract DSV4 index for config per-layer arrays.
+
+    Runtime module names keep their original MTP namespace, e.g. ``mtp.0``.
+    When indexing config-level arrays such as ``compress_ratios``, MTP layers
+    are addressed after the main model layers.
+    """
+    from vllm.model_executor.models.utils import extract_layer_index
+
+    layer_idx = extract_layer_index(layer_name)
+    if ".mtp." in f".{layer_name}." and layer_idx < config.num_hidden_layers:
+        return config.num_hidden_layers + layer_idx
+    return layer_idx
+
+
+def get_dsv4_spec_layer_idx_from_weight_name(config: Any,
+                                             weight_name: str) -> int | None:
+    """Return local MTP layer index for DSV4 checkpoint weight names."""
+    if weight_name.startswith("mtp."):
+        return int(weight_name.split(".")[1])
+    return None
+
+
+def get_dsv4_compress_ratio(config: Any, layer_idx: int) -> int:
+    """Return DSV4 compress ratio, treating unspecified MTP layers as dense."""
+    compress_ratios = getattr(config, "compress_ratios", None)
+    if compress_ratios is None or layer_idx >= len(compress_ratios):
+        return 0
+    return compress_ratios[layer_idx]
 
 
 def _mark_op_side_effectful(op: Any) -> None:
@@ -432,6 +464,13 @@ def cp_chunkedprefill_comm_stream() -> torch.npu.Stream:
     if _CP_CHUNKEDPREFILL_COMM_STREAM is None:
         _CP_CHUNKEDPREFILL_COMM_STREAM = torch_npu.npu.Stream()
     return _CP_CHUNKEDPREFILL_COMM_STREAM
+
+
+def attention_calculation_stream() -> torch.npu.Stream:
+    global _ATNN_CALCULATION_STREAM
+    if _ATNN_CALCULATION_STREAM is None:
+        _ATNN_CALCULATION_STREAM = torch_npu.npu.Stream()
+    return _ATNN_CALCULATION_STREAM
 
 
 def adapt_patch(is_global_patch: bool = False):
@@ -818,6 +857,11 @@ def embedding_tp_enable() -> bool:
 
 def oproj_tp_enable() -> bool:
     return get_ascend_config().finegrained_tp_config.oproj_tensor_parallel_size > 0
+
+
+def olora_tp_enable() -> bool:
+    return get_ascend_config(
+    ).finegrained_tp_config.olora_tensor_parallel_size > 1
 
 
 def mlp_tp_enable() -> bool:

@@ -32,7 +32,7 @@ from vllm_ascend.ops.fused_moe.experts_selector import select_experts, zero_expe
 from vllm_ascend.ops.fused_moe.moe_runtime_args import build_fused_experts_input
 from vllm_ascend.utils import ACL_FORMAT_FRACTAL_NZ, maybe_trans_nz
 
-from .base import AscendLinearScheme, AscendMoEScheme, QuantType, get_moe_num_logical_experts
+from .base import AscendLinearScheme, AscendMoEScheme, QuantType
 from .registry import register_scheme
 
 
@@ -170,7 +170,7 @@ class AscendW8A8DynamicFusedMoEMethod(AscendMoEScheme):
         top_k: int,
         renormalize: bool,
         use_grouped_topk: bool = False,
-        num_experts: int = -1,
+        global_num_experts: int = -1,
         expert_map: torch.Tensor | None = None,
         topk_group: int | None = None,
         num_expert_group: int | None = None,
@@ -186,21 +186,12 @@ class AscendW8A8DynamicFusedMoEMethod(AscendMoEScheme):
         activation: str = "silu",
         apply_router_weight_on_input: bool = False,
         mc2_mask: torch.Tensor | None = None,
+        tid2eid: torch.Tensor | None = None,
     ) -> torch.Tensor:
         zero_expert_num = getattr(layer, "zero_expert_num", 0)
         zero_expert_type = getattr(layer, "zero_expert_type", None)
-        n_shared_experts = getattr(layer, "n_shared_experts", 0)
-        mix_placement = getattr(layer, "mix_placement", False)
-        if n_shared_experts is None:
-            n_shared_experts = 0
-        num_logical_experts = get_moe_num_logical_experts(
-            layer,
-            num_experts,
-            global_redundant_expert_num=global_redundant_expert_num,
-            num_shared_experts=n_shared_experts,
-        )
         if zero_expert_num == 0 or zero_expert_type is None:
-            assert router_logits.shape[1] == num_logical_experts, (
+            assert router_logits.shape[1] == global_num_experts - global_redundant_expert_num, (
                 "Number of global experts mismatch (excluding redundancy)"
             )
 
@@ -222,10 +213,8 @@ class AscendW8A8DynamicFusedMoEMethod(AscendMoEScheme):
                 scoring_func=scoring_func,
                 routed_scaling_factor=routed_scaling_factor,
                 e_score_correction_bias=e_score_correction_bias,
-                mix_placement=mix_placement,
-                num_logical_experts=router_logits.shape[1],
-                num_shared_experts=n_shared_experts,
-                num_experts=num_logical_experts,
+                global_num_experts=global_num_experts,
+                tid2eid=tid2eid,
             )
         assert topk_ids is not None
         assert topk_weights is not None
@@ -233,7 +222,7 @@ class AscendW8A8DynamicFusedMoEMethod(AscendMoEScheme):
             topk_ids, topk_weights, zero_expert_result = zero_experts_compute(
                 expert_indices=topk_ids,
                 expert_scales=topk_weights,
-                num_experts=num_logical_experts,
+                num_experts=global_num_experts,
                 zero_expert_type=zero_expert_type,
                 hidden_states=x,
             )
@@ -241,7 +230,9 @@ class AscendW8A8DynamicFusedMoEMethod(AscendMoEScheme):
         # to avoid accumulating too much tokens on a single rank.
         # currently it is only activated when doing profile runs.
         if enable_force_load_balance:
-            random_matrix = torch.rand(topk_ids.size(0), num_logical_experts, device=topk_ids.device)
+            random_matrix = torch.rand(
+                topk_ids.size(0), global_num_experts - global_redundant_expert_num, device=topk_ids.device
+            )
             topk_ids = torch.argsort(random_matrix, dim=1)[:, : topk_ids.size(1)].to(topk_ids.dtype)
 
         assert topk_weights is not None
@@ -262,6 +253,9 @@ class AscendW8A8DynamicFusedMoEMethod(AscendMoEScheme):
             w2 = [layer.w2_weight]
             w2_scale = [layer.fused_w2_scale] if fused_scale_flag else [layer.w2_weight_scale]
 
+        w1_scale_bias = [torch.tensor([], dtype=torch.float32)] if fused_scale_flag else None
+        w2_scale_bias = [torch.tensor([], dtype=torch.float32)] if fused_scale_flag else None
+
         final_hidden_states = moe_comm_method.fused_experts(
             fused_experts_input=build_fused_experts_input(
                 hidden_states=x,
@@ -280,6 +274,9 @@ class AscendW8A8DynamicFusedMoEMethod(AscendMoEScheme):
                 activation=activation,
                 w1_scale=w1_scale,
                 w2_scale=w2_scale,
+                w1_scale_bias=w1_scale_bias,
+                w2_scale_bias=w2_scale_bias,
+                swiglu_limit=layer.swiglu_limit,
             )
         )
         if zero_expert_num > 0 and zero_expert_type is not None:

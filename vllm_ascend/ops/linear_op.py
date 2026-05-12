@@ -663,7 +663,11 @@ def _get_row_parallel_op(
     | None
 ):
     if enable_dsa_cp_with_layer_shard() and "o_proj" in prefix:
-        return ShardedCPRowParallelOp(layer)
+        from vllm.config import get_current_vllm_config
+
+        vllm_config = get_current_vllm_config()
+        if vllm_config.model_config.hf_config.model_type not in ["glm_moe_dsa"]:
+            return ShardedCPRowParallelOp(layer)
     if "down_proj" in prefix and mlp_tp_enable() and not is_moe_layer(prefix):
         return MLPRowParallelOp(layer)
     if "o_proj" in prefix and oproj_tp_enable():
@@ -681,6 +685,7 @@ def _get_row_parallel_op(
             "out_proj",  # attn output linear of Qwen3 Next
             "down_proj",  # second MLP of most LLMs
             "attention.dense",  # attn output linear of Bailing
+            "wo_b", # attn output linear of v4
         ]
         for a_prefix in sp_row_prefixes:
             if a_prefix in prefix:

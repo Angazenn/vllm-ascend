@@ -88,7 +88,7 @@ def _build_mxfp_params(
     mxfp_per_token_scale_dtype: torch.dtype | None = None,
     mxfp_use_bf16: bool | None = None,
 ) -> _stage_params.MoEMxfpParams | None:
-    if quant_type not in [QuantType.MXFP8, QuantType.MXFP4]:
+    if quant_type != QuantType.MXFP8:
         return None
 
     has_explicit_mxfp_args = any(
@@ -102,7 +102,7 @@ def _build_mxfp_params(
         )
     )
     if not has_explicit_mxfp_args:
-        raise ValueError("primitive MXFP params are required when quant_type is an MXFP quant type.")
+        raise ValueError("primitive MXFP params are required when quant_type is QuantType.MXFP8.")
 
     return _stage_params.MoEMxfpParams(
         act_quant_type=mxfp_act_quant_type,
@@ -140,10 +140,11 @@ def build_fused_experts_input(
     mxfp_use_bf16: bool | None = None,
     w1_scale: list[torch.Tensor] | torch.Tensor | None = None,
     w2_scale: list[torch.Tensor] | torch.Tensor | None = None,
-    w1_scale_bias: torch.Tensor | None = None,
-    w2_scale_bias: torch.Tensor | None = None,
+    w1_scale_bias: list[torch.Tensor] | torch.Tensor | None = None,
+    w2_scale_bias: list[torch.Tensor] | torch.Tensor | None = None,
     w1_offset: torch.Tensor | None = None,
     w2_offset: torch.Tensor | None = None,
+    swiglu_limit: int = 0,
 ) -> MoEFusedExpertsInput:
     return MoEFusedExpertsInput(
         hidden_states=hidden_states,
@@ -184,6 +185,7 @@ def build_fused_experts_input(
                 mxfp_use_bf16=mxfp_use_bf16,
             ),
         ),
+        swiglu_limit=swiglu_limit,
     )
 
 
@@ -208,7 +210,7 @@ def build_mlp_compute_input(
     use_fusion_ops: bool,
 ) -> MoEMlpComputeInput:
     if fused_experts_input.quant.is_mxfp and fused_experts_input.quant.mxfp is None:
-        raise ValueError("fused_experts_input.quant.mxfp is required for MXFP quant types.")
+        raise ValueError("fused_experts_input.quant.mxfp is required when quant_type is QuantType.MXFP8.")
 
     return MoEMlpComputeInput(
         hidden_states=token_dispatch_output.hidden_states,
@@ -222,6 +224,7 @@ def build_mlp_compute_input(
         activation=fused_experts_input.activation,
         need_trans=fused_experts_input.need_trans,
         dynamic_eplb=fused_experts_input.dynamic_eplb,
+        swiglu_limit=fused_experts_input.swiglu_limit,
     )
 
 

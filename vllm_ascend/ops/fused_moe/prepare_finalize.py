@@ -26,6 +26,7 @@ from vllm.distributed.parallel_state import (
     get_tensor_model_parallel_rank,
     get_tensor_model_parallel_world_size,
 )
+from vllm.forward_context import get_forward_context
 from vllm.model_executor.layers.fused_moe import FusedMoEConfig
 
 from vllm_ascend.ascend_config import get_ascend_config
@@ -77,7 +78,7 @@ class PrepareAndFinalize(ABC):
             router_logits (torch.Tensor): Router outputs, shape [num_tokens, num_experts]
             enable_shared_expert_dp (bool): Skip DP communication for shared experts
             replace_allreduce (bool): Bypass default all-reduce behavior
-            quant_type: none, w8a8, w4a8, mxfp8, or mxfp4
+            quant_type: none, w8a8, w4a8 or mxfp8
 
         Returns:
             MoEPrepareOutput:
@@ -174,7 +175,21 @@ class PrepareAndFinalizeWithAll2All(PrepareAndFinalize):
             padded_hidden_states_shape=padded_hidden_states_shape,
             pertoken_scale=None,
         )
+    
+    def pad_and_split_input_ids(
+        self,
+        input_ids,
+    ):
+        if not (self.replace_allreduce or self.enable_shared_expert_dp):
+            pad_size = self.tp_size - self.num_tokens
+            if pad_size > 0:
+                input_ids = nn.functional.pad(input_ids, (0, pad_size))
 
+            if self.tp_size > 1:
+                input_ids = torch.tensor_split(input_ids, self.tp_size, dim=0)
+                input_ids = input_ids[self.tp_rank]
+        return input_ids
+    
     def finalize(
         self,
         hidden_states: torch.Tensor,
@@ -285,6 +300,22 @@ class PrepareAndFinalizeWithMC2(PrepareAndFinalizeWithAll2All):
             padded_hidden_states_shape=padded_hidden_states_shape,
             pertoken_scale=None,
         )
+    
+    def pad_and_split_input_ids(
+        self,
+        input_ids,
+    ):
+        if not self.replace_allreduce:
+            forward_context = get_forward_context()
+            target_pad_length = forward_context.padded_num_tokens
+            pad_size = target_pad_length - self.num_tokens
+            if pad_size > 0 and not self.enable_shared_expert_dp:
+                input_ids = nn.functional.pad(input_ids, (0, pad_size))
+
+            if self.tp_size > 1 and not self.enable_shared_expert_dp:
+                input_ids = torch.tensor_split(input_ids, self.tp_size, dim=0)
+                input_ids = input_ids[self.tp_rank]
+        return input_ids
 
 
 class PrepareAndFinalizeWithAllGather(PrepareAndFinalize):
@@ -339,10 +370,6 @@ class PrepareAndFinalizeWithAllGather(PrepareAndFinalize):
             # TODO(linfeng): MXFP8 with AllGather+EP currently does not pre-quantize
             # per-token activations in prepare. Keep quantization in the MoE MLP path.
             pass
-        elif quant_type == QuantType.MXFP4:
-            # MXFP4 with AllGather+EP currently does not pre-quantize
-            # per-token activations in prepare. Keep quantization in the MoE MLP path.
-            pass
 
         if self.multistream_overlap_gate:
             assert PrepareAndFinalize.quant_stream is not None
@@ -352,6 +379,10 @@ class PrepareAndFinalizeWithAllGather(PrepareAndFinalize):
         else:
             hidden_states = torch.ops.vllm.maybe_all_gather_and_maybe_unpad(hidden_states, True, True)
             router_logits = torch.ops.vllm.maybe_all_gather_and_maybe_unpad(router_logits, True, True)
+
+        # TODO(fuzhihong): To adapt to self.num_token in the all_gather_input_id_with_dp_group method,
+        #  when flashcomm1 is used and dp = N(N >=2).
+        self.num_tokens = hidden_states.shape[0]
 
         if pertoken_scale is not None:
             pertoken_scale = torch.ops.vllm.maybe_all_gather_and_maybe_unpad(pertoken_scale, True, True)
@@ -423,6 +454,17 @@ class PrepareAndFinalizeWithAllGather(PrepareAndFinalize):
             padded_hidden_states_shape=None,
             pertoken_scale=None,
         )
+
+    def all_gather_input_id_with_dp_group(
+        self, input_ids: torch.Tensor) -> torch.Tensor:
+        if self.moe_config.dp_size > 1:
+            max_tokens_across_dp = _EXTRA_CTX.max_tokens_across_dp
+            pad_size = max_tokens_across_dp - self.num_tokens
+            if pad_size > 0:
+                input_ids = nn.functional.pad(input_ids, (0, pad_size))
+    
+            input_ids = self.moe_config.dp_group.all_gather(input_ids, 0)
+        return input_ids
 
     def finalize(
         self,
