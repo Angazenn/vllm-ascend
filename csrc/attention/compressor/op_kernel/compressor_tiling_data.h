@@ -36,6 +36,7 @@ namespace optiling {
         float reciprocalD = 0;              // 1分之D
         uint32_t usedCoreNum = 0;           // 使用核数
         uint32_t nSize = 0;                 // 控制v2积攒的轮数
+        uint32_t batchedVerify = 0;         // MTP batched verification flag
     };
 
     struct CompressorPageAttentionParams {

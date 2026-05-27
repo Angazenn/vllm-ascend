@@ -128,6 +128,7 @@ struct ConstInfo {
 
     uint32_t aiCoreIdx = 0;
     uint32_t nSize = 0;
+    uint32_t batchedVerify = 0;
 };
 
 struct RunInfo {

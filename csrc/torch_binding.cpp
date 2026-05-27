@@ -972,8 +972,8 @@ compressor(
     const at::Tensor &rope_sin, const at::Tensor &rope_cos, 
     const c10::optional<at::Tensor> &kv_block_table, const c10::optional<at::Tensor> &score_block_table,
     const c10::optional<at::Tensor> &cu_seqlens, const c10::optional<at::Tensor> &seqused,
-    const c10::optional<at::Tensor> &start_pos, int64_t rope_head_dim, int64_t cmp_ratio, 
-    int64_t coff, double norm_eps, int64_t rotary_mode, bool enable_grad)
+    const c10::optional<at::Tensor> &start_pos, int64_t rope_head_dim, int64_t cmp_ratio,
+    int64_t coff, double norm_eps, int64_t rotary_mode, bool enable_grad, bool batched_verify)
 {
     constexpr int32_t DIM_1 = 1;
     constexpr int32_t DIM_2 = 2;
@@ -1001,7 +1001,7 @@ compressor(
 
     EXEC_NPU_CMD(aclnnCompressor, x, wkv, wgate, kv_state, score_state, ape, norm_weight, rope_sin, rope_cos,
                     kv_block_table, score_block_table, cu_seqlens, seqused, start_pos, rope_head_dim, cmp_ratio, 
-                    coff, norm_eps, rotary_mode, enable_grad, cmp_kv, wkv_proj, softmax_res, norm_x, norm_rstd);
+                    coff, norm_eps, rotary_mode, enable_grad, batched_verify, cmp_kv, wkv_proj, softmax_res, norm_x, norm_rstd);
 
     return std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tensor>( \
         cmp_kv, wkv_proj, softmax_res, norm_x, norm_rstd);

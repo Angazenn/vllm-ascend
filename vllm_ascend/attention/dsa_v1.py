@@ -1109,6 +1109,10 @@ class AscendDSAImpl(DSAAttentionImpl):
         self.multistream_dsa_preprocess = ascend_config.multistream_dsa_preprocess
 
         self.vllm_config = get_current_vllm_config()
+        spec_config = self.vllm_config.speculative_config
+        self.is_batched_verify = (
+            spec_config is not None and spec_config.num_speculative_tokens > 1
+        )
 
         # indexer param
         if self.indexer is not None:
@@ -1355,7 +1359,8 @@ class AscendDSAImpl(DSAAttentionImpl):
                 coff=coff,
                 norm_eps=self.compressor_norm_eps,
                 rotary_mode=2,
-                enable_grad=False)
+                enable_grad=False,
+                batched_verify=self.is_batched_verify)
 
             if compressed_kv.numel() == 0:
                 compressed_kv = None
@@ -1564,7 +1569,8 @@ class AscendDSAImpl(DSAAttentionImpl):
                 coff=coff,
                 norm_eps=self.compressor_norm_eps,
                 rotary_mode=2,
-                enable_grad=False)
+                enable_grad=False,
+                batched_verify=self.is_batched_verify)
             # kv_compress_epilog
             torch_npu.npu_scatter_nd_update_(
                 compressor_attn_cache.view(-1, compressed_kv.shape[-1]),
@@ -1705,7 +1711,8 @@ class AscendDSAImpl(DSAAttentionImpl):
             coff=coff,
             norm_eps=self.compressor_norm_eps,
             rotary_mode=2,
-            enable_grad=False)
+            enable_grad=False,
+            batched_verify=self.is_batched_verify)
 
         if kv.numel() == 0:
             kv = None

@@ -271,6 +271,7 @@ __aicore__ inline void CompressorKernel<COMP>::InitTilingData() {
     constInfo.curMm1ResSize = tilingData_->workspaceParams.curMm1ResSize;
     constInfo.nSize =  tilingData_->baseParams.nSize;
     constInfo.vec1ResSize = tilingData_->workspaceParams.vec1ResSize;
+    constInfo.batchedVerify = tilingData_->baseParams.batchedVerify;
 }
 
 template <typename COMP>

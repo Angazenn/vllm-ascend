@@ -730,7 +730,7 @@ __aicore__ inline void CompressorBlockVectorPerf<COMP>::SaveState(const LocalTen
     if constexpr (COMP::coff == COFF::OVERLAP) {
         uint32_t coff = static_cast<uint32_t>(COMP::coff);
 
-        if (sliceInfo.dealTcSize > 1) {
+        if (sliceInfo.dealTcSize > 1 && constInfo_.batchedVerify) {
             // The later state saves cover the tail-side windows only. For a
             // batched verifier call, also persist the first current block so
             // every possible accepted prefix has the same state as serial

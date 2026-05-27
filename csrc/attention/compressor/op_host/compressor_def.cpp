@@ -124,6 +124,7 @@ public:
         this->Attr("norm_eps").AttrType(OPTIONAL).Float(1e-6f);
         this->Attr("rotary_mode").AttrType(OPTIONAL).Int(ROTARY_MODE_VALUE);
         this->Attr("enable_grad").AttrType(OPTIONAL).Bool(false);
+        this->Attr("batched_verify").AttrType(OPTIONAL).Bool(false);
         OpAICoreConfig aicore_config;
         aicore_config.DynamicCompileStaticFlag(true)
             .DynamicFormatFlag(true)
