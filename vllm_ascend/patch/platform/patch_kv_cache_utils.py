@@ -4,7 +4,8 @@ import math
 from collections import defaultdict
 
 import vllm.v1.core.kv_cache_utils
-from vllm.config import VllmConfig
+from vllm.config import VllmConfig, get_current_vllm_config_or_none
+from vllm.logger import logger
 from vllm.utils.math_utils import cdiv, round_up
 from vllm.v1.core.kv_cache_utils import _approximate_gcd, may_override_num_blocks
 from vllm.v1.kv_cache_interface import (
@@ -16,9 +17,15 @@ from vllm.v1.kv_cache_interface import (
     SlidingWindowMLASpec,
     UniformTypeKVCacheSpecs,
 )
+from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.layerwise_config import (
+    get_layerwise_kv_cache_num_tensors,
+)
 
 _orig_resolve_kv_cache_block_sizes = vllm.v1.core.kv_cache_utils.resolve_kv_cache_block_sizes
 _orig_get_kv_cache_groups = vllm.v1.core.kv_cache_utils.get_kv_cache_groups
+_orig_get_kv_cache_config_from_groups = vllm.v1.core.kv_cache_utils.get_kv_cache_config_from_groups
+_orig_max_memory_usage_bytes_from_groups = vllm.v1.core.kv_cache_utils._max_memory_usage_bytes_from_groups
+_orig_pool_bytes_per_block = vllm.v1.core.kv_cache_utils._pool_bytes_per_block
 
 
 def _prefill_hybrid_groups_enabled(vllm_config: VllmConfig) -> bool:
@@ -75,6 +82,169 @@ def get_kv_cache_groups(
         if groups is not None:
             return groups
     return _orig_get_kv_cache_groups(vllm_config, kv_cache_spec)
+
+
+def _is_prefill_hybrid_kv_cache_groups(
+    vllm_config: VllmConfig,
+    kv_cache_groups: list[KVCacheGroupSpec],
+) -> bool:
+    if not _prefill_hybrid_groups_enabled(vllm_config):
+        return False
+    if len(kv_cache_groups) != 2:
+        return False
+    return (
+        all(".indexer." in name for name in kv_cache_groups[0].layer_names)
+        and all(".indexer." not in name for name in kv_cache_groups[1].layer_names)
+    )
+
+
+def _group_layer_page_sizes(group: KVCacheGroupSpec) -> list[int]:
+    spec = group.kv_cache_spec
+    if isinstance(spec, UniformTypeKVCacheSpecs):
+        return [
+            spec.kv_cache_specs[layer_name].page_size_bytes
+            for layer_name in group.layer_names
+        ]
+    return [spec.page_size_bytes for _ in group.layer_names]
+
+
+def _get_prefill_hybrid_dual_cache_bytes_per_block(
+    vllm_config: VllmConfig,
+    kv_cache_groups: list[KVCacheGroupSpec],
+) -> int | None:
+    if not _is_prefill_hybrid_kv_cache_groups(vllm_config, kv_cache_groups):
+        return None
+
+    extra_config = vllm_config.kv_transfer_config.kv_connector_extra_config
+    prefill_bytes_per_block = 0
+    for group in kv_cache_groups:
+        page_sizes = _group_layer_page_sizes(group)
+        if not page_sizes:
+            return None
+        unique_page_sizes = set(page_sizes)
+        if len(unique_page_sizes) != 1:
+            logger.warning(
+                "Prefill hybrid dual cache requires uniform page size inside "
+                "each group; falling back to native planning for group with "
+                "page sizes %s.",
+                sorted(unique_page_sizes),
+            )
+            return None
+        num_group_layers = len(page_sizes)
+        num_prefill_tensors = (
+            get_layerwise_kv_cache_num_tensors(num_group_layers, extra_config)
+            or num_group_layers
+        )
+        prefill_bytes_per_block += page_sizes[0] * num_prefill_tensors
+
+    # Decode uses normal NPU cache layout for the real attention/KV group only.
+    decode_bytes_per_block = sum(_group_layer_page_sizes(kv_cache_groups[1]))
+    return prefill_bytes_per_block + decode_bytes_per_block
+
+
+def _get_prefill_hybrid_dual_cache_blocks_needed(
+    vllm_config: VllmConfig,
+    kv_cache_groups: list[KVCacheGroupSpec],
+) -> int | None:
+    if not _is_prefill_hybrid_kv_cache_groups(vllm_config, kv_cache_groups):
+        return None
+
+    blocks_needed = 0
+    for group in kv_cache_groups:
+        spec = group.kv_cache_spec
+        if isinstance(spec, UniformTypeKVCacheSpecs):
+            specs = [spec.kv_cache_specs[name] for name in group.layer_names]
+        else:
+            specs = [spec for _ in group.layer_names]
+        for layer_spec in specs:
+            blocks_needed = max(
+                blocks_needed,
+                cdiv(
+                    layer_spec.max_memory_usage_bytes(vllm_config),
+                    layer_spec.page_size_bytes,
+                ),
+            )
+    return blocks_needed
+
+
+def get_kv_cache_config_from_groups(
+    vllm_config: VllmConfig,
+    kv_cache_groups: list[KVCacheGroupSpec],
+    available_memory: int,
+) -> KVCacheConfig:
+    bytes_per_block = _get_prefill_hybrid_dual_cache_bytes_per_block(
+        vllm_config,
+        kv_cache_groups,
+    )
+    if bytes_per_block is None:
+        return _orig_get_kv_cache_config_from_groups(
+            vllm_config,
+            kv_cache_groups,
+            available_memory,
+        )
+
+    num_blocks = available_memory // bytes_per_block
+    num_blocks = may_override_num_blocks(vllm_config, num_blocks)
+    kv_cache_tensors: list[KVCacheTensor] = []
+    for group in kv_cache_groups:
+        spec = group.kv_cache_spec
+        for layer_name in group.layer_names:
+            if isinstance(spec, UniformTypeKVCacheSpecs):
+                page_size = spec.kv_cache_specs[layer_name].page_size_bytes
+            else:
+                page_size = spec.page_size_bytes
+            kv_cache_tensors.append(
+                KVCacheTensor(
+                    size=page_size * num_blocks,
+                    shared_by=[layer_name],
+                )
+            )
+
+    logger.info(
+        "Prefill hybrid dual cache planning: num_blocks=%d, "
+        "bytes_per_block=%d, prefill_tensors=%d",
+        num_blocks,
+        bytes_per_block,
+        len(kv_cache_tensors),
+    )
+    return KVCacheConfig(
+        num_blocks=num_blocks,
+        kv_cache_tensors=kv_cache_tensors,
+        kv_cache_groups=kv_cache_groups,
+    )
+
+
+def _max_memory_usage_bytes_from_groups(
+    vllm_config: VllmConfig,
+    kv_cache_groups: list[KVCacheGroupSpec],
+) -> int:
+    bytes_per_block = _get_prefill_hybrid_dual_cache_bytes_per_block(
+        vllm_config,
+        kv_cache_groups,
+    )
+    blocks_needed = _get_prefill_hybrid_dual_cache_blocks_needed(
+        vllm_config,
+        kv_cache_groups,
+    )
+    if bytes_per_block is None or blocks_needed is None:
+        return _orig_max_memory_usage_bytes_from_groups(
+            vllm_config,
+            kv_cache_groups,
+        )
+    return bytes_per_block * blocks_needed
+
+
+def _pool_bytes_per_block(kv_cache_groups: list[KVCacheGroupSpec]) -> int:
+    vllm_config = get_current_vllm_config_or_none()
+    if vllm_config is None:
+        return _orig_pool_bytes_per_block(kv_cache_groups)
+    bytes_per_block = _get_prefill_hybrid_dual_cache_bytes_per_block(
+        vllm_config,
+        kv_cache_groups,
+    )
+    if bytes_per_block is None:
+        return _orig_pool_bytes_per_block(kv_cache_groups)
+    return bytes_per_block
 
 
 def _ascend_resolve_kv_cache_block_sizes(
@@ -306,6 +476,9 @@ def _get_kv_cache_config_deepseek_v4(
 
 vllm.v1.core.kv_cache_utils.resolve_kv_cache_block_sizes = _ascend_resolve_kv_cache_block_sizes
 vllm.v1.core.kv_cache_utils.get_kv_cache_groups = get_kv_cache_groups
+vllm.v1.core.kv_cache_utils.get_kv_cache_config_from_groups = get_kv_cache_config_from_groups
+vllm.v1.core.kv_cache_utils._max_memory_usage_bytes_from_groups = _max_memory_usage_bytes_from_groups
+vllm.v1.core.kv_cache_utils._pool_bytes_per_block = _pool_bytes_per_block
 vllm.v1.core.kv_cache_utils.group_and_unify_kv_cache_specs = group_and_unify_kv_cache_specs
 vllm.v1.core.kv_cache_utils._get_kv_cache_config_deepseek_v4 = _get_kv_cache_config_deepseek_v4
 vllm.v1.core.kv_cache_utils._get_kv_cache_groups_uniform_groups = _get_kv_cache_groups_uniform_groups

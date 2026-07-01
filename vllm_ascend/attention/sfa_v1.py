@@ -60,6 +60,10 @@ from vllm_ascend.utils import (
     maybe_trans_nz,
 )
 from vllm_ascend.worker.npu_input_batch import NPUInputBatch
+from vllm_ascend.worker.prefill_decode_kv_cache import (
+    select_kv_cache_for_metadata,
+    select_mirror_decode_kv_cache,
+)
 
 if TYPE_CHECKING:
     from vllm.v1.core.sched.output import SchedulerOutput
@@ -1292,6 +1296,12 @@ class AscendSFAImpl(MLAAttentionImpl):
                         reach_layer_for_shard_weight_series(layer)
             return output.fill_(0)
 
+        mirror_decode_kv_cache = select_mirror_decode_kv_cache(
+            kv_cache,
+            attn_metadata,
+        )
+        kv_cache = select_kv_cache_for_metadata(kv_cache, attn_metadata)
+
         cos = attn_metadata.cos
         sin = attn_metadata.sin
         slot_mapping = attn_metadata.slot_mapping
@@ -1326,6 +1336,7 @@ class AscendSFAImpl(MLAAttentionImpl):
             hidden_states = torch.ops.vllm.maybe_all_gather_and_maybe_unpad(
                 hidden_states.contiguous(), need_gather_q_kv
             )
+            mlapo_hidden_states = hidden_states
             hidden_states, ql_nope, q_pe, q_c = self._sfa_preprocess_with_mlapo(
                 hidden_states=hidden_states,
                 kv_cache=kv_cache,
@@ -1334,6 +1345,15 @@ class AscendSFAImpl(MLAAttentionImpl):
                 slot_mapping=slot_mapping,
                 num_input_tokens=num_input_tokens,
             )
+            if mirror_decode_kv_cache is not None:
+                self._sfa_preprocess_with_mlapo(
+                    hidden_states=mlapo_hidden_states,
+                    kv_cache=mirror_decode_kv_cache,
+                    cos=cos,
+                    sin=sin,
+                    slot_mapping=slot_mapping,
+                    num_input_tokens=num_input_tokens,
+                )
             if self.has_indexer:
                 k_li, k_li_scale = self.indexer_select_pre_process(
                     x=hidden_states,
@@ -1380,6 +1400,15 @@ class AscendSFAImpl(MLAAttentionImpl):
                 )
             else:
                 k_pe, k_nope = self.exec_kv(kv_no_split, cos, sin, kv_cache, slot_mapping, attn_metadata)
+                if mirror_decode_kv_cache is not None:
+                    self.exec_kv(
+                        kv_no_split,
+                        cos,
+                        sin,
+                        mirror_decode_kv_cache,
+                        slot_mapping,
+                        attn_metadata,
+                    )
 
             if self.enable_dsa_cp:
                 assert k_pe is not None
@@ -1509,6 +1538,14 @@ class AscendSFAImpl(MLAAttentionImpl):
                             slot_mapping[: attn_metadata.num_actual_tokens].view(-1, 1),
                             fused_kv_no_split[: attn_metadata.num_actual_tokens],
                         )
+                        if mirror_decode_kv_cache is not None:
+                            torch_npu.npu_scatter_nd_update_(
+                                mirror_decode_kv_cache[0].view(
+                                    -1, fused_kv_no_split.shape[-1]
+                                ),
+                                slot_mapping[: attn_metadata.num_actual_tokens].view(-1, 1),
+                                fused_kv_no_split[: attn_metadata.num_actual_tokens],
+                            )
                         k_pe = None
                         k_nope = None
                     else:
@@ -1528,6 +1565,14 @@ class AscendSFAImpl(MLAAttentionImpl):
                             value_cache=kv_cache[1],
                             slot_mapping=slot_mapping[: attn_metadata.num_actual_tokens],
                         )
+                        if mirror_decode_kv_cache is not None:
+                            DeviceOperator.reshape_and_cache(
+                                key=k_nope[: attn_metadata.num_actual_tokens],
+                                value=k_pe[: attn_metadata.num_actual_tokens],
+                                key_cache=mirror_decode_kv_cache[0],
+                                value_cache=mirror_decode_kv_cache[1],
+                                slot_mapping=slot_mapping[: attn_metadata.num_actual_tokens],
+                            )
 
             if self.has_indexer:
                 assert k_li is not None
@@ -1560,6 +1605,14 @@ class AscendSFAImpl(MLAAttentionImpl):
                     slot_mapping.view(-1, 1),
                     k_li.view(-1, k_li.shape[-1]),
                 )  # b, s, n, d
+                if mirror_decode_kv_cache is not None:
+                    torch_npu.npu_scatter_nd_update_(
+                        mirror_decode_kv_cache[dsa_k_cache_idx].view(
+                            -1, k_li.shape[-1]
+                        ),
+                        slot_mapping.view(-1, 1),
+                        k_li.view(-1, k_li.shape[-1]),
+                    )
             if self.use_sparse_c8_indexer:
                 if get_ascend_device_type() == AscendDeviceType.A5:
                     assert len(kv_cache) == 3
@@ -1581,6 +1634,14 @@ class AscendSFAImpl(MLAAttentionImpl):
                             slot_mapping.view(-1, 1),
                             k_li_scale.view(-1, k_li_scale.shape[-1]),
                         )
+                        if mirror_decode_kv_cache is not None:
+                            torch_npu.npu_scatter_nd_update_(
+                                mirror_decode_kv_cache[dsa_k_scale_cache_idx].view(
+                                    -1, k_li_scale.shape[-1]
+                                ),
+                                slot_mapping.view(-1, 1),
+                                k_li_scale.view(-1, k_li_scale.shape[-1]),
+                            )
 
             if self.is_kv_producer:
                 attn_metadata.reshape_cache_event.record()

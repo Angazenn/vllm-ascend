@@ -165,6 +165,10 @@ from vllm_ascend.utils import (
 )
 from vllm_ascend.worker.npu_input_batch import NPUInputBatch
 from vllm_ascend.worker.pcp_utils import PCPManager
+from vllm_ascend.worker.prefill_decode_kv_cache import (
+    PrefillDecodeKVCache,
+    get_prefill_kv_cache,
+)
 from vllm_ascend.worker.utils import AscendKVBlockZeroer
 
 from vllm_ascend.ascend_forward_context import (  # isort: skip
@@ -3889,9 +3893,9 @@ class NPUModelRunner(GPUModelRunner):
             return
         extra_config = kv_transfer_config.kv_connector_extra_config
         if extra_config.get("prefill_hybrid_groups", False):
-            logger.info(
-                "Layerwise KV cache reuse is disabled for experimental "
-                "prefill hybrid groups."
+            self._merge_prefill_hybrid_kv_cache_tensors_for_layer_reuse(
+                kv_cache_config,
+                extra_config,
             )
             return
         total_layers = self.model_config.get_num_layers(self.parallel_config)
@@ -3932,6 +3936,91 @@ class NPUModelRunner(GPUModelRunner):
             len(new_tensors),
             kv_cache_config.num_blocks,
         )
+
+    def _merge_prefill_hybrid_kv_cache_tensors_for_layer_reuse(
+        self,
+        kv_cache_config: KVCacheConfig,
+        extra_config: dict[str, Any],
+    ) -> None:
+        if len(kv_cache_config.kv_cache_groups) != 2:
+            return
+
+        old_tensors = kv_cache_config.kv_cache_tensors
+        if len(old_tensors) <= 1:
+            return
+
+        tensor_by_layer: dict[str, KVCacheTensor] = {}
+        unmatched_tensors: list[KVCacheTensor] = []
+        for tensor in old_tensors:
+            if len(tensor.shared_by) != 1:
+                unmatched_tensors.append(tensor)
+                continue
+            tensor_by_layer[tensor.shared_by[0]] = tensor
+
+        new_tensors: list[KVCacheTensor] = []
+        merged_old_count = 0
+        merged_new_count = 0
+        for group_id, group in enumerate(kv_cache_config.kv_cache_groups):
+            layer_names = [
+                name for name in group.layer_names if name in tensor_by_layer
+            ]
+            if len(layer_names) != len(group.layer_names):
+                logger.warning(
+                    "Prefill hybrid layer reuse: group %d has unmatched "
+                    "layers; keeping original tensors.",
+                    group_id,
+                )
+                new_tensors.extend(
+                    tensor_by_layer[name]
+                    for name in group.layer_names
+                    if name in tensor_by_layer
+                )
+                continue
+            num_layers = len(layer_names)
+            if get_layerwise_kv_cache_reuse_layers(num_layers, extra_config) is None:
+                new_tensors.extend(tensor_by_layer[name] for name in layer_names)
+                continue
+
+            group_tensors = [tensor_by_layer[name] for name in layer_names]
+            group_sizes = {tensor.size for tensor in group_tensors}
+            if len(group_sizes) != 1:
+                logger.warning(
+                    "Prefill hybrid layer reuse: group %d has non-uniform "
+                    "tensor sizes %s; keeping original tensors.",
+                    group_id,
+                    sorted(group_sizes),
+                )
+                new_tensors.extend(group_tensors)
+                continue
+
+            storage_indices = get_layerwise_storage_indices(num_layers, extra_config)
+            for slot in storage_indices:
+                slot_names = [layer_names[idx] for idx in slot]
+                new_tensors.append(
+                    KVCacheTensor(
+                        size=group_tensors[slot[0]].size,
+                        shared_by=slot_names,
+                    )
+                )
+            merged_old_count += len(group_tensors)
+            merged_new_count += len(storage_indices)
+            logger.info(
+                "Prefill hybrid layer reuse: group %d merged %d tensors -> %d "
+                "(num_blocks=%d unchanged)",
+                group_id,
+                len(group_tensors),
+                len(storage_indices),
+                kv_cache_config.num_blocks,
+            )
+
+        new_tensors.extend(unmatched_tensors)
+        if merged_new_count > 0:
+            kv_cache_config.kv_cache_tensors = new_tensors
+            logger.info(
+                "Prefill hybrid layer reuse: merged %d tensors -> %d total tensors",
+                merged_old_count,
+                len(new_tensors),
+            )
 
     def initialize_kv_cache(
         self,
@@ -3979,7 +4068,11 @@ class NPUModelRunner(GPUModelRunner):
             self.drafter.initialize_attn_backend(kv_cache_config, block_size)
 
         if has_kv_transfer_group() and not is_profiling:
-            get_kv_transfer_group().register_kv_caches(kv_caches)
+            prefill_kv_caches = {
+                layer_name: get_prefill_kv_cache(kv_cache)
+                for layer_name, kv_cache in kv_caches.items()
+            }
+            get_kv_transfer_group().register_kv_caches(prefill_kv_caches)
 
         if self.model_config.enable_return_routed_experts:
             self.init_routed_experts_capturer()
@@ -4002,6 +4095,70 @@ class NPUModelRunner(GPUModelRunner):
         offset = (aligned_addr - data_ptr) // tensor.element_size()
         return tensor[int(offset) :]
 
+    def _build_decode_kv_cache_config(
+        self,
+        kv_cache_config: KVCacheConfig,
+    ) -> KVCacheConfig | None:
+        if not self._prefill_hybrid_groups_enabled():
+            return None
+
+        decode_group = next(
+            (
+                group
+                for group in kv_cache_config.kv_cache_groups
+                if all(".indexer." not in name for name in group.layer_names)
+            ),
+            None,
+        )
+        if decode_group is None:
+            return None
+
+        tensors: list[KVCacheTensor] = []
+        group_spec = decode_group.kv_cache_spec
+        for layer_name in decode_group.layer_names:
+            if isinstance(group_spec, UniformTypeKVCacheSpecs):
+                page_size = group_spec.kv_cache_specs[layer_name].page_size_bytes
+            else:
+                page_size = group_spec.page_size_bytes
+            tensors.append(
+                KVCacheTensor(
+                    size=page_size * kv_cache_config.num_blocks,
+                    shared_by=[layer_name],
+                )
+            )
+
+        logger.info(
+            "Prefill/decode dual cache: allocating normal decode NPU cache "
+            "for %d layers, num_blocks=%d",
+            len(tensors),
+            kv_cache_config.num_blocks,
+        )
+        return KVCacheConfig(
+            num_blocks=kv_cache_config.num_blocks,
+            kv_cache_tensors=tensors,
+            kv_cache_groups=[decode_group],
+        )
+
+    def _compose_prefill_decode_kv_caches(
+        self,
+        prefill_kv_caches: dict[str, torch.Tensor],
+        decode_kv_caches: dict[str, torch.Tensor],
+    ) -> dict[str, torch.Tensor]:
+        if not decode_kv_caches:
+            return prefill_kv_caches
+
+        kv_caches = dict(prefill_kv_caches)
+        for layer_name, decode_cache in decode_kv_caches.items():
+            prefill_cache = prefill_kv_caches.get(layer_name)
+            if prefill_cache is None:
+                kv_caches[layer_name] = decode_cache
+                continue
+            kv_caches[layer_name] = PrefillDecodeKVCache(
+                prefill=prefill_cache,
+                decode=decode_cache,
+            )
+        return kv_caches
+
     def initialize_kv_cache_tensors(self, kv_cache_config: KVCacheConfig) -> dict[str, torch.Tensor]:
         """
         Initialize the memory buffer for KV cache.
@@ -4016,6 +4173,18 @@ class NPUModelRunner(GPUModelRunner):
         kv_cache_raw_tensors = self._allocate_kv_cache_tensors(kv_cache_config)
         # Change the memory buffer to the desired shape
         kv_caches = self._reshape_kv_cache_tensors(kv_cache_config, kv_cache_raw_tensors)
+
+        decode_kv_cache_config = self._build_decode_kv_cache_config(kv_cache_config)
+        if decode_kv_cache_config is not None:
+            decode_raw_tensors = self._allocate_kv_cache_tensors(decode_kv_cache_config)
+            decode_kv_caches = self._reshape_kv_cache_tensors(
+                decode_kv_cache_config,
+                decode_raw_tensors,
+            )
+            kv_caches = self._compose_prefill_decode_kv_caches(
+                kv_caches,
+                decode_kv_caches,
+            )
 
         # Set up cross-layer KV cache sharing
         for layer_name, target_layer_name in self.shared_kv_cache_layers.items():
