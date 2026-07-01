@@ -322,6 +322,7 @@ class NPUModelRunner(GPUModelRunner):
 
         self.sampler = AscendSampler()
         self.attn_state: AscendAttentionState | None = None
+        self.kv_cache_group_id_to_attn_group_index: dict[int, int] = {}
 
         # Ascend-specific configurations
         self.ascend_config = get_ascend_config()
@@ -3291,6 +3292,11 @@ class NPUModelRunner(GPUModelRunner):
         common_ratio_to_sas_metadata: dict[Any, Any] = {}
         spec_decode_common_attn_metadata = None
         for kv_cache_gid, kv_cache_group in enumerate(self.kv_cache_config.kv_cache_groups):
+            attn_group_index = self.kv_cache_group_id_to_attn_group_index.get(
+                kv_cache_gid
+            )
+            if attn_group_index is None:
+                continue
             cm = copy(cm_base)  # shallow copy
             # Basically only the encoder seq_lens, block_table and slot_mapping change
             # for each kv_cache_group.
@@ -3305,7 +3311,7 @@ class NPUModelRunner(GPUModelRunner):
             # gdn_query_start_loc is an unpadded version of query_start_loc.
             # TODO delete it if fia's check is removed.
             if self._has_gdn:
-                attn_group = self.attn_groups[kv_cache_gid][0]
+                attn_group = self.attn_groups[attn_group_index][0]
                 builder = attn_group.get_metadata_builder(0)
                 if isinstance(builder, GDNAttentionMetadataBuilder):
                     cm.query_start_loc_cpu = self.gdn_query_start_loc.cpu[: num_reqs_padded + 1]
@@ -3323,9 +3329,9 @@ class NPUModelRunner(GPUModelRunner):
             if self.enable_hamming_sparse is True:
                 from vllm_ascend.attention.kvcomp_attn.attention_utils import build_kvcomp_metadata
                 build_kvcomp_metadata(self.kvcomp_meta_data, cm)
-            for attn_gid in range(len(self.attn_groups[kv_cache_gid])):
+            for attn_gid in range(len(self.attn_groups[attn_group_index])):
                 _build_attn_group_metadata(
-                    kv_cache_gid, attn_gid, cm, num_reqs_actual,
+                    attn_group_index, attn_gid, cm, num_reqs_actual,
                     prefill_ratio_to_sas_metadata, decode_ratio_to_sas_metadata,
                     common_ratio_to_sas_metadata)
         if self.is_mm_prefix_lm:
@@ -3356,6 +3362,44 @@ class NPUModelRunner(GPUModelRunner):
             # padded attention metadata.
             spec_decode_common_attn_metadata = spec_decode_common_attn_metadata.unpadded(num_tokens, num_reqs)
         return attn_metadata, spec_decode_common_attn_metadata
+
+    def _compute_cascade_attn_prefix_lens(
+        self,
+        num_scheduled_tokens: np.ndarray,
+        num_computed_tokens: np.ndarray,
+        num_common_prefix_blocks: list[int],
+    ) -> list[list[int]] | None:
+        use_cascade_attn = False
+        attn_group_index_to_kv_cache_gid = {
+            attn_group_index: kv_cache_gid
+            for kv_cache_gid, attn_group_index in
+            self.kv_cache_group_id_to_attn_group_index.items()
+        }
+        cascade_attn_prefix_lens: list[list[int]] = [
+            [] for _ in range(len(self.attn_groups))
+        ]
+
+        for attn_group_index, attn_groups in enumerate(self.attn_groups):
+            kv_cache_gid = attn_group_index_to_kv_cache_gid.get(
+                attn_group_index, attn_group_index
+            )
+            for attn_group in attn_groups:
+                if isinstance(attn_group.kv_cache_spec, EncoderOnlyAttentionSpec):
+                    cascade_attn_prefix_len = 0
+                else:
+                    cascade_attn_prefix_len = self._compute_cascade_attn_prefix_len(
+                        num_scheduled_tokens,
+                        num_computed_tokens,
+                        num_common_prefix_blocks[kv_cache_gid],
+                        attn_group.kv_cache_spec,
+                        attn_group.get_metadata_builder(),
+                    )
+                cascade_attn_prefix_lens[attn_group_index].append(
+                    cascade_attn_prefix_len
+                )
+                use_cascade_attn |= cascade_attn_prefix_len > 0
+
+        return cascade_attn_prefix_lens if use_cascade_attn else None
 
     def _should_build_dummy_attn_metadata(
         self,
@@ -3844,6 +3888,12 @@ class NPUModelRunner(GPUModelRunner):
         if kv_transfer_config is None:
             return
         extra_config = kv_transfer_config.kv_connector_extra_config
+        if extra_config.get("prefill_hybrid_groups", False):
+            logger.info(
+                "Layerwise KV cache reuse is disabled for experimental "
+                "prefill hybrid groups."
+            )
+            return
         total_layers = self.model_config.get_num_layers(self.parallel_config)
         if get_layerwise_kv_cache_reuse_layers(total_layers, extra_config) is None:
             return
@@ -4730,7 +4780,15 @@ class NPUModelRunner(GPUModelRunner):
                 # This is an attention backend that supports virtual
                 # block splitting. Get the supported block sizes from
                 # the backend.
-                attn_groups = self.attn_groups[kv_cache_group_id]
+                attn_group_index = self.kv_cache_group_id_to_attn_group_index.get(
+                    kv_cache_group_id
+                )
+                if attn_group_index is None:
+                    self.kernel_block_sizes.append(
+                        [kv_cache_group.kv_cache_spec.block_size]
+                    )
+                    continue
+                attn_groups = self.attn_groups[attn_group_index]
                 backends = [attn_group.backend for attn_group in attn_groups]
                 kv_manager_block_size = kv_cache_group.kv_cache_spec.block_size
                 selected_kernel_size = select_common_block_size(
@@ -4850,19 +4908,36 @@ class NPUModelRunner(GPUModelRunner):
 
         attention_backend_maps = []
         attention_backend_list = []
-        for kv_cache_group_spec in kv_cache_config.kv_cache_groups:
+        attention_backend_group_ids = []
+        self.kv_cache_group_id_to_attn_group_index = {}
+        use_prefill_hybrid_groups = self._prefill_hybrid_groups_enabled()
+        for kv_cache_group_id, kv_cache_group_spec in enumerate(kv_cache_config.kv_cache_groups):
+            if use_prefill_hybrid_groups and all(
+                ".indexer." in layer_name
+                for layer_name in kv_cache_group_spec.layer_names
+            ):
+                continue
             attn_backends = get_attn_backends_for_group(kv_cache_group_spec)
             attention_backend_maps.append(attn_backends[0])
             attention_backend_list.append(attn_backends[1])
+            attention_backend_group_ids.append(kv_cache_group_id)
 
         self._check_and_update_cudagraph_mode(
             attention_backend_list,
-            kv_cache_config.kv_cache_groups,
+            [
+                kv_cache_config.kv_cache_groups[group_id]
+                for group_id in attention_backend_group_ids
+            ],
             is_profiling=is_profiling,
         )
 
-        for i, attn_backend_map in enumerate(attention_backend_maps):
-            self.attn_groups.append(create_attn_groups(attn_backend_map, i))
+        for attn_group_index, (attn_backend_map, kv_cache_group_id) in enumerate(
+            zip(attention_backend_maps, attention_backend_group_ids)
+        ):
+            self.kv_cache_group_id_to_attn_group_index[kv_cache_group_id] = attn_group_index
+            self.attn_groups.append(
+                create_attn_groups(attn_backend_map, kv_cache_group_id)
+            )
 
         # Calculate reorder batch threshold (if needed)
         self.calculate_reorder_batch_threshold()
@@ -4908,7 +4983,32 @@ class NPUModelRunner(GPUModelRunner):
         # ordering expected by graph parameter update logic in attention backends.
         mamba_layers: dict[str, MambaBase] = {}
         attn_layer_names = set()
+        use_prefill_hybrid_groups = self._prefill_hybrid_groups_enabled()
+        if self.use_sparse and use_prefill_hybrid_groups:
+            indexer_template_name = next(
+                (name for name in attn_layers if ".indexer." in name),
+                None,
+            )
+            if indexer_template_name is not None:
+                indexer_module = attn_layers[indexer_template_name]
+                num_layers = self.vllm_config.model_config.hf_config.num_hidden_layers
+                for layer_id in range(num_layers):
+                    indexer_name = f"model.layers.{layer_id}.self_attn.indexer.k_cache"
+                    if indexer_name not in attn_layers:
+                        attn_layers[indexer_name] = deepcopy(indexer_module)
         for layer_name, attn_module in attn_layers.items():
+            if self.use_sparse and use_prefill_hybrid_groups and ".indexer." in layer_name:
+                kv_cache_spec[layer_name] = AscendMLAAttentionSpec(
+                    block_size=self.block_size,
+                    num_kv_heads=1,
+                    head_size=sum(self.sparse_head_dim),
+                    sparse_head_dim=self.sparse_head_dim,
+                    dtype=self.kv_cache_dtype,
+                    cache_dtype_str=self.vllm_config.cache_config.cache_dtype,
+                    cache_sparse_c8=self.ascend_config.is_sparse_c8_layer(layer_name),
+                )
+                continue
+
             if (isinstance(attn_module, Attention)
                     and (kv_tgt_layer := attn_module.kv_sharing_target_layer_name) is not None):
                 # The layer doesn't need its own KV cache and will use that of
@@ -5057,6 +5157,16 @@ class NPUModelRunner(GPUModelRunner):
             set_graph_params(capture_sizes)
             if self.speculative_config:
                 set_draft_graph_params(capture_sizes)
+
+    def _prefill_hybrid_groups_enabled(self) -> bool:
+        kv_transfer_config = self.vllm_config.kv_transfer_config
+        if kv_transfer_config is None:
+            return False
+        return bool(
+            kv_transfer_config.kv_connector_extra_config.get(
+                "prefill_hybrid_groups", False
+            )
+        )
 
     def profile_cudagraph_memory(self) -> int:
         parent_module_name = _get_gpu_model_runner_module_name(self)

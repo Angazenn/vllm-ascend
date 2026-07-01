@@ -615,6 +615,12 @@ class NPUWorker(WorkerBase):
         if kv_transfer_config is None:
             return available
         extra_config = kv_transfer_config.kv_connector_extra_config
+        if extra_config.get("prefill_hybrid_groups", False):
+            logger.info(
+                "Layerwise KV cache memory inflation is disabled for "
+                "experimental prefill hybrid groups."
+            )
+            return available
         total_layers = self.model_config.get_num_layers(self.parallel_config)
         num_tensors = get_layerwise_kv_cache_num_tensors(total_layers, extra_config)
         if num_tensors is not None and num_tensors < total_layers:

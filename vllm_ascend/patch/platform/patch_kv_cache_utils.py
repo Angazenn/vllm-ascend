@@ -18,6 +18,63 @@ from vllm.v1.kv_cache_interface import (
 )
 
 _orig_resolve_kv_cache_block_sizes = vllm.v1.core.kv_cache_utils.resolve_kv_cache_block_sizes
+_orig_get_kv_cache_groups = vllm.v1.core.kv_cache_utils.get_kv_cache_groups
+
+
+def _prefill_hybrid_groups_enabled(vllm_config: VllmConfig) -> bool:
+    kv_transfer_config = getattr(vllm_config, "kv_transfer_config", None)
+    if kv_transfer_config is None:
+        return False
+    return bool(
+        kv_transfer_config.kv_connector_extra_config.get(
+            "prefill_hybrid_groups", False
+        )
+    )
+
+
+def _get_prefill_hybrid_kv_cache_groups(
+    kv_cache_spec: dict[str, KVCacheSpec],
+) -> list[KVCacheGroupSpec] | None:
+    indexer_specs = {
+        name: spec for name, spec in kv_cache_spec.items() if ".indexer." in name
+    }
+    if not indexer_specs:
+        return None
+
+    kv_specs = {
+        name: spec for name, spec in kv_cache_spec.items() if ".indexer." not in name
+    }
+    if not kv_specs:
+        return None
+
+    indexer_uniform_spec = UniformTypeKVCacheSpecs.from_specs(indexer_specs)
+    kv_uniform_spec = UniformTypeKVCacheSpecs.from_specs(kv_specs)
+    if indexer_uniform_spec is None or kv_uniform_spec is None:
+        return None
+
+    # Keep the experimental ordering stable: group 0 is indexer, group 1 is
+    # the normal attention KV cache.
+    return [
+        KVCacheGroupSpec(
+            layer_names=list(indexer_specs.keys()),
+            kv_cache_spec=indexer_uniform_spec,
+        ),
+        KVCacheGroupSpec(
+            layer_names=list(kv_specs.keys()),
+            kv_cache_spec=kv_uniform_spec,
+        ),
+    ]
+
+
+def get_kv_cache_groups(
+    vllm_config: VllmConfig,
+    kv_cache_spec: dict[str, KVCacheSpec],
+) -> list[KVCacheGroupSpec]:
+    if _prefill_hybrid_groups_enabled(vllm_config):
+        groups = _get_prefill_hybrid_kv_cache_groups(kv_cache_spec)
+        if groups is not None:
+            return groups
+    return _orig_get_kv_cache_groups(vllm_config, kv_cache_spec)
 
 
 def _ascend_resolve_kv_cache_block_sizes(
@@ -248,6 +305,7 @@ def _get_kv_cache_config_deepseek_v4(
 
 
 vllm.v1.core.kv_cache_utils.resolve_kv_cache_block_sizes = _ascend_resolve_kv_cache_block_sizes
+vllm.v1.core.kv_cache_utils.get_kv_cache_groups = get_kv_cache_groups
 vllm.v1.core.kv_cache_utils.group_and_unify_kv_cache_specs = group_and_unify_kv_cache_specs
 vllm.v1.core.kv_cache_utils._get_kv_cache_config_deepseek_v4 = _get_kv_cache_config_deepseek_v4
 vllm.v1.core.kv_cache_utils._get_kv_cache_groups_uniform_groups = _get_kv_cache_groups_uniform_groups
