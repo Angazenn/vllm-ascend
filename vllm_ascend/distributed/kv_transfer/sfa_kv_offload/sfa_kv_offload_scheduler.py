@@ -107,6 +107,22 @@ class SFAKVOffloadlScheduler:
             return list(block_ids[group_id])
         return list(block_ids)
 
+    def _get_num_prompt_tokens(self, req_id: str, request_data: Any | None = None) -> int:
+        req_tuple = self._unfinished_requests.get(req_id)
+        if req_tuple is not None:
+            return req_tuple[0].num_prompt_tokens
+
+        if request_data is not None:
+            prompt_token_ids = getattr(request_data, "prompt_token_ids", None)
+            if prompt_token_ids is not None:
+                return len(prompt_token_ids)
+
+            prompt_embeds = getattr(request_data, "prompt_embeds", None)
+            if prompt_embeds is not None:
+                return len(prompt_embeds)
+
+        raise ValueError(f"Cannot infer num_prompt_tokens for request {req_id}")
+
     def update_state_after_alloc(self, request: "Request", blocks: "KVCacheBlocks", num_external_tokens: int):
         """
         """
@@ -150,7 +166,10 @@ class SFAKVOffloadlScheduler:
             req_meta = ReqMeta.from_request_tracker(
                 request_tracker,
                 num_new_offload_blocks=num_new_offload_blocks,
-                num_prompt_blocks=request.num_prompt_tokens // self._block_size,
+                num_prompt_blocks=(
+                    self._get_num_prompt_tokens(request.req_id, request)
+                    // self._block_size
+                ),
             )
             if req_meta is not None:
                 meta.add_request(req_meta)
@@ -185,7 +204,9 @@ class SFAKVOffloadlScheduler:
                 req_meta = ReqMeta.from_request_tracker(
                     request_tracker,
                     num_new_offload_blocks=num_new_offload_blocks,
-                    num_prompt_blocks=request.num_prompt_tokens // self._block_size,
+                    num_prompt_blocks=(
+                        self._get_num_prompt_tokens(req_id) // self._block_size
+                    ),
                 )
             if req_meta is not None:
                 meta.add_request(req_meta)
