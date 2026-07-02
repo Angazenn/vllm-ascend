@@ -17,7 +17,8 @@ vllm serve /path/to/model \
     "use_offload": true,
     "lru_resident_cache_config": {
       "buffer_size": 2048,
-      "topk": 2048
+      "topk": 2048,
+      "decode_blocks_per_req": 2
     }
   }' \
   --kv-transfer-config '{
@@ -87,6 +88,10 @@ cache, while decode offload reads the decode cache.
   the model cache block size.
 - `topk`: number of sparse indices considered for resident loading. It must be
   positive and no larger than `buffer_size`.
+- `decode_blocks_per_req`: compact decode HBM blocks reserved for each active
+  request. Logical scheduler block ids are remapped into this smaller physical
+  decode cache, so this can be much smaller than the prefill/scheduler block
+  count.
 
 The decode connector only offloads the real KV group. Indexer cache remains
 allocated on HBM for decode so top-k selection can run before sparse KV loading.

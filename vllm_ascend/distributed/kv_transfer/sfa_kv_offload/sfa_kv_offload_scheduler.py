@@ -150,6 +150,7 @@ class SFAKVOffloadlScheduler:
             req_meta = ReqMeta.from_request_tracker(
                 request_tracker,
                 num_new_offload_blocks=num_new_offload_blocks,
+                num_prompt_blocks=request.num_prompt_tokens // self._block_size,
             )
             if req_meta is not None:
                 meta.add_request(req_meta)
@@ -184,6 +185,7 @@ class SFAKVOffloadlScheduler:
                 req_meta = ReqMeta.from_request_tracker(
                     request_tracker,
                     num_new_offload_blocks=num_new_offload_blocks,
+                    num_prompt_blocks=request.num_prompt_tokens // self._block_size,
                 )
             if req_meta is not None:
                 meta.add_request(req_meta)

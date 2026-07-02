@@ -18,7 +18,6 @@ from vllm.v1.request import Request
 
 from vllm_ascend.distributed.kv_transfer.sfa_kv_offload.sfa_kv_offload_scheduler import SFAKVOffloadlScheduler
 from vllm_ascend.distributed.kv_transfer.sfa_kv_offload.sfa_kv_offload_worker import SFAKVOffloadWorker
-from vllm_ascend.worker.prefill_decode_kv_cache import get_decode_kv_cache
 
 
 def _normalize_group_id(group_id: int, num_groups: int) -> int:
@@ -159,13 +158,10 @@ class SFAKVOffloadConnector(KVConnectorBase_V1, SupportsHMA):
     def _filter_decode_kv_caches(self, kv_caches: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
         local_config = self._local_kv_cache_config
         if local_config is None:
-            return {
-                layer_name: get_decode_kv_cache(cache)
-                for layer_name, cache in kv_caches.items()
-            }
+            return dict(kv_caches)
         layer_names = set(local_config.kv_cache_groups[0].layer_names)
         return {
-            layer_name: get_decode_kv_cache(cache)
+            layer_name: cache
             for layer_name, cache in kv_caches.items()
             if layer_name in layer_names
         }
@@ -216,4 +212,6 @@ class SFAKVOffloadConnector(KVConnectorBase_V1, SupportsHMA):
 
     def get_finished(self, finished_req_ids: set[str]) -> tuple[set[str], set[str]]:
         # In sfa kv offload, we don't need delay free, thus no need to return finished_send/recv too.
+        if self.connector_worker is not None:
+            self.connector_worker.release_decode_slots(finished_req_ids)
         return (set(), set())

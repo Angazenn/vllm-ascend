@@ -231,6 +231,8 @@ class AscendSFAMetadata:
     group_key_cache_idx: torch.Tensor | None = None
     indexer_block_table_tensor: torch.Tensor | None = None
     indexer_slot_mapping: torch.Tensor | None = None
+    decode_block_table_tensor: torch.Tensor | None = None
+    decode_slot_mapping: torch.Tensor | None = None
     num_offloaded_blocks: torch.Tensor | None = None
     req_ids_tensor: torch.Tensor | None = None
 
@@ -350,6 +352,16 @@ class AscendSFAMetadataBuilder(MLACommonMetadataBuilder[AscendSFAMetadata]):
         indexer_slot_mapping = (
             common_attn_metadata.indexer_slot_mapping[:num_input_tokens]
             if self.use_offload and common_attn_metadata.indexer_slot_mapping is not None
+            else None
+        )
+        decode_block_table_tensor = (
+            common_attn_metadata.decode_block_table_tensor[:num_reqs]
+            if self.use_offload and common_attn_metadata.decode_block_table_tensor is not None
+            else None
+        )
+        decode_slot_mapping = (
+            common_attn_metadata.decode_slot_mapping[:num_input_tokens]
+            if self.use_offload and common_attn_metadata.decode_slot_mapping is not None
             else None
         )
         num_offloaded_blocks = common_attn_metadata.num_offloaded_blocks
@@ -501,6 +513,8 @@ class AscendSFAMetadataBuilder(MLACommonMetadataBuilder[AscendSFAMetadata]):
             num_prefills=num_prefills,
             indexer_block_table_tensor=indexer_block_table_tensor,
             indexer_slot_mapping=indexer_slot_mapping,
+            decode_block_table_tensor=decode_block_table_tensor,
+            decode_slot_mapping=decode_slot_mapping,
             num_offloaded_blocks=num_offloaded_blocks,
             req_ids_tensor=req_ids_tensor,
         )
@@ -1329,8 +1343,15 @@ class AscendSFAImpl(MLAAttentionImpl):
             q_li_scale = q_li_scale.to(self.c8_k_scale_cache_dtype)  # [b*s,]
 
         indexer_block_table = (
-            attn_metadata.indexer_block_table_tensor
-            if self.use_offload and attn_metadata.indexer_block_table_tensor is not None
+            attn_metadata.decode_block_table_tensor
+            if (
+                self.use_offload
+                and attn_metadata.num_prefills == 0
+                and attn_metadata.decode_block_table_tensor is not None
+            )
+            else attn_metadata.indexer_block_table_tensor
+            if self.use_offload
+            and attn_metadata.indexer_block_table_tensor is not None
             else attn_metadata.block_table
         )
         return DeviceOperator.indexer_select_post_process(
@@ -1530,6 +1551,20 @@ class AscendSFAImpl(MLAAttentionImpl):
         cos = attn_metadata.cos
         sin = attn_metadata.sin
         slot_mapping = attn_metadata.slot_mapping
+        decode_slot_mapping = (
+            attn_metadata.decode_slot_mapping
+            if self.use_offload and attn_metadata.decode_slot_mapping is not None
+            else slot_mapping
+        )
+        primary_uses_decode_cache = (
+            self.use_offload
+            and mirror_decode_kv_cache is None
+            and attn_metadata.num_prefills == 0
+            and attn_metadata.decode_slot_mapping is not None
+        )
+        primary_slot_mapping = (
+            decode_slot_mapping if primary_uses_decode_cache else slot_mapping
+        )
         slot_mapping_cp = None
         if self.enable_dsa_cp:
             assert attn_metadata.dsa_cp_context is not None
@@ -1567,7 +1602,7 @@ class AscendSFAImpl(MLAAttentionImpl):
                 kv_cache=kv_cache,
                 cos=cos,
                 sin=sin,
-                slot_mapping=slot_mapping,
+                slot_mapping=primary_slot_mapping,
                 num_input_tokens=num_input_tokens,
             )
             if mirror_decode_kv_cache is not None:
@@ -1576,7 +1611,7 @@ class AscendSFAImpl(MLAAttentionImpl):
                     kv_cache=mirror_decode_kv_cache,
                     cos=cos,
                     sin=sin,
-                    slot_mapping=slot_mapping,
+                    slot_mapping=decode_slot_mapping,
                     num_input_tokens=num_input_tokens,
                 )
             if self.has_indexer:
@@ -1624,14 +1659,21 @@ class AscendSFAImpl(MLAAttentionImpl):
                     kv_no_split, cos, sin, kv_cache, slot_mapping_cp, attn_metadata
                 )
             else:
-                k_pe, k_nope = self.exec_kv(kv_no_split, cos, sin, kv_cache, slot_mapping, attn_metadata)
+                k_pe, k_nope = self.exec_kv(
+                    kv_no_split,
+                    cos,
+                    sin,
+                    kv_cache,
+                    primary_slot_mapping,
+                    attn_metadata,
+                )
                 if mirror_decode_kv_cache is not None:
                     self.exec_kv(
                         kv_no_split,
                         cos,
                         sin,
                         mirror_decode_kv_cache,
-                        slot_mapping,
+                        decode_slot_mapping,
                         attn_metadata,
                     )
 
@@ -1760,7 +1802,7 @@ class AscendSFAImpl(MLAAttentionImpl):
                     elif self.use_a5_sparse_c8_indexer:
                         torch_npu.npu_scatter_nd_update_(
                             kv_cache[0].view(-1, fused_kv_no_split.shape[-1]),
-                            slot_mapping[: attn_metadata.num_actual_tokens].view(-1, 1),
+                            primary_slot_mapping[: attn_metadata.num_actual_tokens].view(-1, 1),
                             fused_kv_no_split[: attn_metadata.num_actual_tokens],
                         )
                         if mirror_decode_kv_cache is not None:
@@ -1768,7 +1810,7 @@ class AscendSFAImpl(MLAAttentionImpl):
                                 mirror_decode_kv_cache[0].view(
                                     -1, fused_kv_no_split.shape[-1]
                                 ),
-                                slot_mapping[: attn_metadata.num_actual_tokens].view(-1, 1),
+                                decode_slot_mapping[: attn_metadata.num_actual_tokens].view(-1, 1),
                                 fused_kv_no_split[: attn_metadata.num_actual_tokens],
                             )
                         k_pe = None
@@ -1788,7 +1830,7 @@ class AscendSFAImpl(MLAAttentionImpl):
                             value=k_pe[: attn_metadata.num_actual_tokens],
                             key_cache=kv_cache[0],
                             value_cache=kv_cache[1],
-                            slot_mapping=slot_mapping[: attn_metadata.num_actual_tokens],
+                            slot_mapping=primary_slot_mapping[: attn_metadata.num_actual_tokens],
                         )
                         if mirror_decode_kv_cache is not None:
                             DeviceOperator.reshape_and_cache(
@@ -1796,7 +1838,7 @@ class AscendSFAImpl(MLAAttentionImpl):
                                 value=k_pe[: attn_metadata.num_actual_tokens],
                                 key_cache=mirror_decode_kv_cache[0],
                                 value_cache=mirror_decode_kv_cache[1],
-                                slot_mapping=slot_mapping[: attn_metadata.num_actual_tokens],
+                                slot_mapping=decode_slot_mapping[: attn_metadata.num_actual_tokens],
                             )
 
             if self.has_indexer:
@@ -1812,6 +1854,9 @@ class AscendSFAImpl(MLAAttentionImpl):
                 attn_metadata.indexer_slot_mapping
                 if self.use_offload and attn_metadata.indexer_slot_mapping is not None
                 else slot_mapping
+            )
+            primary_indexer_slot_mapping = (
+                decode_slot_mapping if primary_uses_decode_cache else indexer_slot_mapping
             )
             if self.use_sparse_c8_indexer and get_ascend_device_type() == AscendDeviceType.A5:
                 dsa_k_cache_idx = 1
@@ -1832,7 +1877,7 @@ class AscendSFAImpl(MLAAttentionImpl):
             else:
                 torch_npu.npu_scatter_nd_update_(
                     kv_cache[dsa_k_cache_idx].view(-1, k_li.shape[-1]),
-                    indexer_slot_mapping.view(-1, 1),
+                    primary_indexer_slot_mapping.view(-1, 1),
                     k_li.view(-1, k_li.shape[-1]),
                 )  # b, s, n, d
                 if mirror_decode_kv_cache is not None:
@@ -1840,7 +1885,7 @@ class AscendSFAImpl(MLAAttentionImpl):
                         mirror_decode_kv_cache[dsa_k_cache_idx].view(
                             -1, k_li.shape[-1]
                         ),
-                        indexer_slot_mapping.view(-1, 1),
+                        decode_slot_mapping.view(-1, 1),
                         k_li.view(-1, k_li.shape[-1]),
                     )
             if self.use_sparse_c8_indexer:
@@ -1861,7 +1906,7 @@ class AscendSFAImpl(MLAAttentionImpl):
                     else:
                         torch_npu.npu_scatter_nd_update_(
                             kv_cache[dsa_k_scale_cache_idx].view(-1, k_li_scale.shape[-1]),
-                            indexer_slot_mapping.view(-1, 1),
+                            primary_indexer_slot_mapping.view(-1, 1),
                             k_li_scale.view(-1, k_li_scale.shape[-1]),
                         )
                         if mirror_decode_kv_cache is not None:
@@ -1869,7 +1914,7 @@ class AscendSFAImpl(MLAAttentionImpl):
                                 mirror_decode_kv_cache[dsa_k_scale_cache_idx].view(
                                     -1, k_li_scale.shape[-1]
                                 ),
-                                indexer_slot_mapping.view(-1, 1),
+                                decode_slot_mapping.view(-1, 1),
                                 k_li_scale.view(-1, k_li_scale.shape[-1]),
                             )
 
@@ -1965,7 +2010,12 @@ class AscendSFAImpl(MLAAttentionImpl):
             torch.npu.current_stream().wait_event(side_compute_event)
             npu_mask = (topk_indices >= offload_thresholds) & valid_mask
             npu_token_indices = torch.where(npu_mask, topk_indices, -1)
-            block_table = attn_metadata.block_table[:num_reqs]
+            block_table_source = (
+                attn_metadata.decode_block_table_tensor
+                if attn_metadata.decode_block_table_tensor is not None
+                else attn_metadata.block_table
+            )
+            block_table = block_table_source[:num_reqs]
             seq_len_kv = attn_metadata.seq_lens[:num_reqs]
             seq_len_q = attn_metadata.cum_query_lens[:num_reqs]
             attn_out_npu, softmax_max, softmax_sum = torch.ops._C_ascend.npu_sparse_flash_attention(

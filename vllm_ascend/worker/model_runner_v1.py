@@ -164,11 +164,11 @@ from vllm_ascend.utils import (
     set_weight_prefetch_method,
     should_skip_allreduce_across_dp_group,
 )
+from vllm_ascend.worker.block_table import BlockTable
 from vllm_ascend.worker.npu_input_batch import NPUInputBatch
 from vllm_ascend.worker.pcp_utils import PCPManager
 from vllm_ascend.worker.prefill_decode_kv_cache import (
     PrefillDecodeKVCache,
-    get_prefill_kv_cache,
 )
 from vllm_ascend.worker.utils import AscendKVBlockZeroer
 
@@ -212,6 +212,104 @@ SEQ_LEN_WITH_MAX_PA_WORKSPACE = 6144
 @dataclass
 class GraphCaptureContext:
     stream: torch.npu.Stream
+
+
+class DecodeKVCacheRemapper:
+    """Compact per-request block-table namespace for decode-side KV cache."""
+
+    def __init__(
+        self,
+        *,
+        max_num_reqs: int,
+        max_model_len: int,
+        max_num_batched_tokens: int,
+        block_size: int,
+        blocks_per_req: int,
+        pin_memory: bool,
+        device: torch.device,
+        kv_cache_group: KVCacheGroupSpec,
+    ) -> None:
+        self.blocks_per_req = blocks_per_req
+        self.req_to_slot: dict[str, int] = {}
+        self.free_slots = list(range(max_num_reqs))
+        max_num_blocks_per_req = cdiv(
+            max_model_len,
+            block_size * get_total_cp_world_size(),
+        )
+        self.block_table = BlockTable(
+            block_size,
+            max_num_reqs,
+            max_num_blocks_per_req,
+            max_num_batched_tokens,
+            pin_memory,
+            device,
+            kernel_sizes=[0],
+            kv_cache_group=kv_cache_group,
+        )
+
+    @property
+    def num_blocks(self) -> int:
+        return (len(self.req_to_slot) + len(self.free_slots)) * self.blocks_per_req
+
+    def sync_active_requests(self, req_ids: list[str]) -> None:
+        active = set(req_ids)
+        for req_id, slot in list(self.req_to_slot.items()):
+            if req_id not in active:
+                self.req_to_slot.pop(req_id)
+                self.free_slots.append(slot)
+        self.free_slots.sort()
+        for req_id in req_ids:
+            self._slot_for_req(req_id)
+
+    def _slot_for_req(self, req_id: str) -> int:
+        slot = self.req_to_slot.get(req_id)
+        if slot is not None:
+            return slot
+        if not self.free_slots:
+            raise RuntimeError(
+                "No free decode KV remap slots. Increase max_num_seqs or "
+                "reduce active requests."
+            )
+        slot = self.free_slots.pop(0)
+        self.req_to_slot[req_id] = slot
+        return slot
+
+    def physical_block_id(self, req_id: str, logical_block_position: int) -> int:
+        slot = self._slot_for_req(req_id)
+        return slot * self.blocks_per_req + (
+            logical_block_position % self.blocks_per_req
+        )
+
+    def rebuild(
+        self,
+        req_ids: list[str],
+        logical_block_rows: list[list[int]],
+        num_reqs: int,
+        num_reqs_padded: int,
+        query_start_loc: torch.Tensor,
+        positions: torch.Tensor,
+        num_tokens_padded: int,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        self.sync_active_requests(req_ids[:num_reqs])
+        for row_idx, req_id in enumerate(req_ids[:num_reqs]):
+            logical_blocks = logical_block_rows[row_idx]
+            remapped_blocks = [
+                self.physical_block_id(req_id, block_pos)
+                for block_pos in range(len(logical_blocks))
+            ]
+            self.block_table.add_row(remapped_blocks, row_idx)
+        for row_idx in range(num_reqs, num_reqs_padded):
+            self.block_table.clear_row(row_idx)
+        self.block_table.commit_block_table(num_reqs_padded)
+        self.block_table.compute_slot_mapping(num_reqs, query_start_loc, positions)
+        if positions.shape[0] < num_tokens_padded:
+            self.block_table.slot_mapping.gpu[
+                positions.shape[0]:num_tokens_padded
+            ].fill_(-1)
+        return (
+            self.block_table.get_device_tensor()[:num_reqs_padded],
+            self.block_table.slot_mapping.gpu[:num_tokens_padded],
+        )
 
 
 @contextmanager
@@ -603,6 +701,7 @@ class NPUModelRunner(GPUModelRunner):
                 parallel_config=self.parallel_config, dtype=self.dtype)
         self.num_offloaded_blocks = self._make_buffer(self.max_num_reqs, dtype=torch.int32)
         self.req_ids_tensor = self._make_buffer(self.max_num_reqs, dtype=torch.int64)
+        self.decode_kv_cache_remapper: DecodeKVCacheRemapper | None = None
 
     @property
     def use_cp(self) -> bool:
@@ -3195,6 +3294,42 @@ class NPUModelRunner(GPUModelRunner):
         block_table_gid_0, slot_mapping_gid_0 = _get_block_table_and_slot_mapping(
             0, total_num_scheduled_tokens_compressed_list)  # type: ignore[arg-type]
         self.long_seq_metadata, block_table_gid_0 = _get_pcp_metadata(block_table_gid_0)
+        decode_block_table_tensor = None
+        decode_slot_mapping = None
+        if self.use_offload and self.decode_kv_cache_remapper is not None:
+            decode_kv_cache_gid = next(
+                (
+                    group_id
+                    for group_id, group in enumerate(kv_cache_groups)
+                    if all(".indexer." not in name for name in group.layer_names)
+                ),
+                None,
+            )
+            if decode_kv_cache_gid is not None:
+                decode_logical_block_table = self.input_batch.block_table[
+                    decode_kv_cache_gid
+                ]
+                logical_block_rows = []
+                for row_idx in range(num_reqs):
+                    num_blocks = decode_logical_block_table.num_blocks_per_row[
+                        row_idx
+                    ]
+                    logical_block_rows.append(
+                        decode_logical_block_table.block_table.np[
+                            row_idx, :num_blocks
+                        ].tolist()
+                    )
+                decode_block_table_tensor, decode_slot_mapping = (
+                    self.decode_kv_cache_remapper.rebuild(
+                        self.input_batch.req_ids[:num_reqs],
+                        logical_block_rows,
+                        num_reqs,
+                        num_reqs_padded,
+                        self.query_start_loc.gpu[: num_reqs + 1],
+                        self.positions[:total_num_scheduled_tokens],
+                        num_tokens_padded,
+                    )
+                )
         num_computed_tokens_cpu = self.input_batch.num_computed_tokens_cpu_tensor[
             :num_reqs_padded
         ]
@@ -3372,6 +3507,8 @@ class NPUModelRunner(GPUModelRunner):
                 )
                 cm.indexer_block_table_tensor = indexer_block_table_tensor
                 cm.indexer_slot_mapping = indexer_slot_mapping
+                cm.decode_block_table_tensor = decode_block_table_tensor
+                cm.decode_slot_mapping = decode_slot_mapping
                 cm.num_offloaded_blocks = self.num_offloaded_blocks.gpu[:num_reqs]
                 cm.req_ids_tensor = self.req_ids_tensor.gpu[:num_reqs]
             for attn_gid in range(len(self.attn_groups[attn_group_index])):
@@ -4109,11 +4246,7 @@ class NPUModelRunner(GPUModelRunner):
             self.drafter.initialize_attn_backend(kv_cache_config, block_size)
 
         if has_kv_transfer_group() and not is_profiling:
-            prefill_kv_caches = {
-                layer_name: get_prefill_kv_cache(kv_cache)
-                for layer_name, kv_cache in kv_caches.items()
-            }
-            get_kv_transfer_group().register_kv_caches(prefill_kv_caches)
+            get_kv_transfer_group().register_kv_caches(kv_caches)
 
         if self.model_config.enable_return_routed_experts:
             self.init_routed_experts_capturer()
@@ -4156,6 +4289,25 @@ class NPUModelRunner(GPUModelRunner):
 
         tensors: list[KVCacheTensor] = []
         group_spec = decode_group.kv_cache_spec
+        if self.use_offload:
+            decode_blocks_per_req = (
+                self.ascend_config.lru_resident_cache_config.decode_blocks_per_req
+            )
+            decode_num_blocks = self.max_num_reqs * decode_blocks_per_req
+            self.decode_kv_cache_remapper = DecodeKVCacheRemapper(
+                max_num_reqs=self.max_num_reqs,
+                max_model_len=self.model_config.max_model_len,
+                max_num_batched_tokens=self.max_num_tokens,
+                block_size=self.block_size,
+                blocks_per_req=decode_blocks_per_req,
+                pin_memory=self.pin_memory,
+                device=self.device,
+                kv_cache_group=decode_group,
+            )
+        else:
+            decode_blocks_per_req = 0
+            decode_num_blocks = kv_cache_config.num_blocks
+            self.decode_kv_cache_remapper = None
         for layer_name in decode_group.layer_names:
             if isinstance(group_spec, UniformTypeKVCacheSpecs):
                 page_size = group_spec.kv_cache_specs[layer_name].page_size_bytes
@@ -4163,19 +4315,22 @@ class NPUModelRunner(GPUModelRunner):
                 page_size = group_spec.page_size_bytes
             tensors.append(
                 KVCacheTensor(
-                    size=page_size * kv_cache_config.num_blocks,
+                    size=page_size * decode_num_blocks,
                     shared_by=[layer_name],
                 )
             )
 
         logger.info(
-            "Prefill/decode dual cache: allocating normal decode NPU cache "
-            "for %d layers, num_blocks=%d",
+            "Prefill/decode dual cache: allocating compact decode NPU cache "
+            "for %d layers, logical_num_blocks=%d, decode_num_blocks=%d, "
+            "decode_blocks_per_req=%d",
             len(tensors),
             kv_cache_config.num_blocks,
+            decode_num_blocks,
+            decode_blocks_per_req,
         )
         return KVCacheConfig(
-            num_blocks=kv_cache_config.num_blocks,
+            num_blocks=decode_num_blocks,
             kv_cache_tensors=tensors,
             kv_cache_groups=[decode_group],
         )

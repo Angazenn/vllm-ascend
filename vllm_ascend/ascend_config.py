@@ -34,11 +34,16 @@ class LRUResidentCacheConfig:
         self.enabled = bool(config.get("enabled", False))
         self.buffer_size = int(config.get("buffer_size", 2048))
         self.topk = int(config.get("topk", 2048))
+        self.decode_blocks_per_req = int(config.get("decode_blocks_per_req", 2))
 
         if self.buffer_size <= 0:
             raise ValueError("lru_resident_cache_config.buffer_size must be positive")
         if self.topk <= 0:
             raise ValueError("lru_resident_cache_config.topk must be positive")
+        if self.decode_blocks_per_req <= 0:
+            raise ValueError(
+                "lru_resident_cache_config.decode_blocks_per_req must be positive"
+            )
         if self.buffer_size < self.topk:
             raise ValueError(
                 "lru_resident_cache_config.buffer_size must be >= topk, "

@@ -233,6 +233,8 @@ class AscendCommonAttentionMetadata(CommonAttentionMetadata):
     kvcomp_metadata: KVCompMetaData | None = None
     indexer_block_table_tensor: torch.Tensor | None = None
     indexer_slot_mapping: torch.Tensor | None = None
+    decode_block_table_tensor: torch.Tensor | None = None
+    decode_slot_mapping: torch.Tensor | None = None
     num_offloaded_blocks: torch.Tensor | None = None
     req_ids_tensor: torch.Tensor | None = None
 
@@ -290,6 +292,8 @@ class AscendCommonAttentionMetadata(CommonAttentionMetadata):
             num_logits_indices=self.num_logits_indices,
             indexer_block_table_tensor=self.indexer_block_table_tensor,
             indexer_slot_mapping=self.indexer_slot_mapping,
+            decode_block_table_tensor=self.decode_block_table_tensor,
+            decode_slot_mapping=self.decode_slot_mapping,
             num_offloaded_blocks=_slice_reqs(self.num_offloaded_blocks),
             req_ids_tensor=_slice_reqs(self.req_ids_tensor),
         )

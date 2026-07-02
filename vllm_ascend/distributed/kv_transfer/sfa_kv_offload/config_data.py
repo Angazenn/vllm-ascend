@@ -28,11 +28,13 @@ class ReqMeta:
     block_ids_npu: list[int]
     block_ids_cpu: list[int]
     num_new_offload_blocks: int = 0
+    num_prompt_blocks: int = 0
 
     @staticmethod
     def from_request_tracker(
         tracker: RequestTracker,
         num_new_offload_blocks: int = 0,
+        num_prompt_blocks: int = 0,
     ) -> ReqMeta | None:
         """Create the request metadata from a request tracker."""
         return ReqMeta(
@@ -40,6 +42,7 @@ class ReqMeta:
             block_ids_npu=tracker.allocated_block_ids_npu,
             block_ids_cpu=tracker.allocated_block_ids_cpu,
             num_new_offload_blocks=num_new_offload_blocks,
+            num_prompt_blocks=num_prompt_blocks,
         )
 
 

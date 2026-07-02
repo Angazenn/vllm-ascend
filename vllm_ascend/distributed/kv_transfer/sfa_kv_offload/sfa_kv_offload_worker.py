@@ -34,6 +34,10 @@ from vllm_ascend.distributed.kv_transfer.sfa_kv_offload.kv_transfer import (
     KVCacheStoreLayerSendingThread,
     KVTransferThread,
 )
+from vllm_ascend.worker.prefill_decode_kv_cache import (
+    get_decode_kv_cache,
+    get_prefill_kv_cache,
+)
 
 _SUBSCRIBED_COMPUTE_STREAMS = set()
 def get_subscribed_compute_streams() -> set:
@@ -151,6 +155,9 @@ class SFAKVOffloadWorker:
         lru_resident_config = ascend_config.lru_resident_cache_config
         self.sfa_sparse_topk = lru_resident_config.topk
         self.lru_resident_capacity = lru_resident_config.buffer_size
+        self.decode_blocks_per_req = lru_resident_config.decode_blocks_per_req
+        self.decode_req_to_slot: dict[str, int] = {}
+        self.decode_free_slots = list(range(self.max_num_reqs))
 
         # TODO get from config
         head_num = 1
@@ -230,14 +237,21 @@ class SFAKVOffloadWorker:
         if self.use_sparse and self.use_offload:
             self.k_caches_npu: list[torch.Tensor] = []
             self.v_caches_npu: list[torch.Tensor] = []
+            self.k_caches_decode_npu: list[torch.Tensor] = []
+            self.v_caches_decode_npu: list[torch.Tensor] = []
             self.topk_buffers_k: list[torch.Tensor] = []
             self.topk_buffers_v: list[torch.Tensor] = []
             for cache_or_caches in kv_caches.values():
-                assert len(cache_or_caches) == 5
-                self.k_caches_npu.append(cache_or_caches[0])
-                self.v_caches_npu.append(cache_or_caches[1])
-                self.topk_buffers_k.append(cache_or_caches[3])
-                self.topk_buffers_v.append(cache_or_caches[4])
+                prefill_cache = get_prefill_kv_cache(cache_or_caches)
+                decode_cache = get_decode_kv_cache(cache_or_caches)
+                assert len(prefill_cache) >= 2
+                assert len(decode_cache) == 5
+                self.k_caches_npu.append(prefill_cache[0])
+                self.v_caches_npu.append(prefill_cache[1])
+                self.k_caches_decode_npu.append(decode_cache[0])
+                self.v_caches_decode_npu.append(decode_cache[1])
+                self.topk_buffers_k.append(decode_cache[3])
+                self.topk_buffers_v.append(decode_cache[4])
 
             npu_block_num = self.num_blocks
             # we need 4 * npu_blocks of cpu_blocks to fully store all offload blocks (dskv32, 512/128)
@@ -442,6 +456,47 @@ class SFAKVOffloadWorker:
 
     def set_req_ids(self, req_ids: list):
         self.req_ids = req_ids
+        self._sync_decode_active_requests(req_ids)
+
+    def _sync_decode_active_requests(self, req_ids: list[str]) -> None:
+        active = set(req_ids)
+        for req_id, slot in list(self.decode_req_to_slot.items()):
+            if req_id not in active:
+                self.decode_req_to_slot.pop(req_id)
+                self.decode_free_slots.append(slot)
+        self.decode_free_slots.sort()
+        for req_id in req_ids:
+            self._decode_slot_for_req(req_id)
+
+    def _decode_slot_for_req(self, req_id: str) -> int:
+        slot = self.decode_req_to_slot.get(req_id)
+        if slot is not None:
+            return slot
+        if not self.decode_free_slots:
+            raise RuntimeError(
+                "No free decode KV offload slots. Increase max_num_seqs or "
+                "reduce active requests."
+            )
+        slot = self.decode_free_slots.pop(0)
+        self.decode_req_to_slot[req_id] = slot
+        return slot
+
+    def _decode_physical_block_id(
+        self,
+        req_id: str,
+        logical_block_position: int,
+    ) -> int:
+        slot = self._decode_slot_for_req(req_id)
+        return slot * self.decode_blocks_per_req + (
+            logical_block_position % self.decode_blocks_per_req
+        )
+
+    def release_decode_slots(self, req_ids: set[str]) -> None:
+        for req_id in req_ids:
+            slot = self.decode_req_to_slot.pop(req_id, None)
+            if slot is not None:
+                self.decode_free_slots.append(slot)
+        self.decode_free_slots.sort()
 
     def prepare_lru_resident_and_load_cpu(self, args):
         (
@@ -630,16 +685,59 @@ class SFAKVOffloadWorker:
             # in most cases block_ids_npu has one more unfull block, remove it
             block_ids_npu = block_ids_npu[:-1]
         assert len(block_ids_npu) == len(block_ids_cpu)
-        block_ids_npu = block_ids_npu[-num_new_offload_blocks:]
-        block_ids_cpu = block_ids_cpu[-num_new_offload_blocks:]
+        start_block_pos = len(block_ids_cpu) - num_new_offload_blocks
+        block_ids_npu = block_ids_npu[start_block_pos:]
+        block_ids_cpu = block_ids_cpu[start_block_pos:]
+        prefill_pairs: list[tuple[int, int]] = []
+        decode_pairs: list[tuple[int, int]] = []
+        for offset, (block_id_npu, block_id_cpu) in enumerate(
+            zip(block_ids_npu, block_ids_cpu)
+        ):
+            block_pos = start_block_pos + offset
+            if block_pos < request.num_prompt_blocks:
+                prefill_pairs.append((block_id_npu, block_id_cpu))
+            else:
+                decode_pairs.append(
+                    (
+                        self._decode_physical_block_id(request.req_id, block_pos),
+                        block_id_cpu,
+                    )
+                )
 
         for layer_id in range(self.num_layers):
-            req_meta_save = LayerMultiBlockReqMeta(
-                request.req_id,
-                layer_id,
-                block_ids_npu=block_ids_npu,
-                block_ids_cpu=block_ids_cpu,
-                cache_npu=(self.k_caches_npu[layer_id], self.v_caches_npu[layer_id]),
-                cache_cpu=(self.k_caches_cpu[layer_id], self.v_caches_cpu[layer_id]),
-            )
-            self.layer_save_tasks[layer_id].append(req_meta_save)
+            if prefill_pairs:
+                prefill_block_ids_npu, prefill_block_ids_cpu = zip(*prefill_pairs)
+                self.layer_save_tasks[layer_id].append(
+                    LayerMultiBlockReqMeta(
+                        request.req_id,
+                        layer_id,
+                        block_ids_npu=list(prefill_block_ids_npu),
+                        block_ids_cpu=list(prefill_block_ids_cpu),
+                        cache_npu=(
+                            self.k_caches_npu[layer_id],
+                            self.v_caches_npu[layer_id],
+                        ),
+                        cache_cpu=(
+                            self.k_caches_cpu[layer_id],
+                            self.v_caches_cpu[layer_id],
+                        ),
+                    )
+                )
+            if decode_pairs:
+                decode_block_ids_npu, decode_block_ids_cpu = zip(*decode_pairs)
+                self.layer_save_tasks[layer_id].append(
+                    LayerMultiBlockReqMeta(
+                        request.req_id,
+                        layer_id,
+                        block_ids_npu=list(decode_block_ids_npu),
+                        block_ids_cpu=list(decode_block_ids_cpu),
+                        cache_npu=(
+                            self.k_caches_decode_npu[layer_id],
+                            self.v_caches_decode_npu[layer_id],
+                        ),
+                        cache_cpu=(
+                            self.k_caches_cpu[layer_id],
+                            self.v_caches_cpu[layer_id],
+                        ),
+                    )
+                )

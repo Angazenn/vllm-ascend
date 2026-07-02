@@ -34,6 +34,7 @@ from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.pool_scheduler imp
     get_zmq_rpc_path_lookup,
 )
 from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.pool_worker import KVPoolWorker
+from vllm_ascend.worker.prefill_decode_kv_cache import get_prefill_kv_cache
 
 
 def _select_ascend_store_group_id(
@@ -265,6 +266,10 @@ class AscendStoreConnector(KVConnectorBase_V1, SupportsHMA):
     # Worker Side Methods
     ############################################################
     def _filter_kv_caches(self, kv_caches: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
+        kv_caches = {
+            layer_name: get_prefill_kv_cache(cache)
+            for layer_name, cache in kv_caches.items()
+        }
         if self._local_kv_cache_config is None or self._selected_kv_cache_group_id is None:
             return kv_caches
         layer_names = set(self._local_kv_cache_config.kv_cache_groups[0].layer_names)
