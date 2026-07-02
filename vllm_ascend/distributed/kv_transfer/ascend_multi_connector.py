@@ -6,6 +6,7 @@ from vllm.distributed.kv_transfer.kv_connector.v1.base import (
     supports_hma,
 )
 from vllm.distributed.kv_transfer.kv_connector.v1.multi_connector import MultiConnector
+from vllm.logger import logger
 
 from vllm_ascend.distributed.kv_transfer.kv_p2p.mooncake_layerwise_connector import MooncakeLayerwiseConnector
 
@@ -135,3 +136,24 @@ class AscendMultiConnector(MultiConnector, SupportsHMA):
                     )
                 ) or prepared
         return prepared
+
+    def save_kv_layer(
+        self,
+        layer_name: str,
+        kv_layer,
+        attn_metadata,
+        **kwargs,
+    ) -> None:
+        for c in self._connectors:
+            try:
+                kv_layer_len = len(kv_layer)
+            except TypeError:
+                kv_layer_len = -1
+            logger.info(
+                "SFA_DIAG AscendMultiConnector.save_kv_layer dispatch "
+                "layer=%s connector=%s kv_layer_len=%s",
+                layer_name,
+                c.__class__.__name__,
+                kv_layer_len,
+            )
+            c.save_kv_layer(layer_name, kv_layer, attn_metadata, **kwargs)

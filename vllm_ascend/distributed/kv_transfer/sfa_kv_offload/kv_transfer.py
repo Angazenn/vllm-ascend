@@ -78,6 +78,12 @@ class KVCacheStoreLayerSendingThread(KVTransferThread):
             return
 
         layer_id = req_metas[0].layer_id
+        if self.tp_rank == 0:
+            logger.info(
+                "SFA_DIAG send_thread enter layer=%d task_count=%d",
+                layer_id,
+                len(req_metas),
+            )
 
         try:
             with torch_npu.npu.stream(self.save_stream):
@@ -95,7 +101,21 @@ class KVCacheStoreLayerSendingThread(KVTransferThread):
                         )
                     ready_event = req_meta.ready_event
                     if ready_event is not None:
+                        if self.tp_rank == 0:
+                            logger.info(
+                                "SFA_DIAG send_thread wait_event begin "
+                                "layer=%d req=%s",
+                                layer_id,
+                                req_id,
+                            )
                         self.save_stream.wait_event(ready_event)
+                        if self.tp_rank == 0:
+                            logger.info(
+                                "SFA_DIAG send_thread wait_event end "
+                                "layer=%d req=%s",
+                                layer_id,
+                                req_id,
+                            )
                     (k_cache_npu, v_cache_npu) = req_meta.cache_npu
                     (k_cache_cpu, v_cache_cpu) = req_meta.cache_cpu
                     if len(block_ids_npu) != len(block_ids_cpu):
@@ -106,16 +126,39 @@ class KVCacheStoreLayerSendingThread(KVTransferThread):
                         )
                     if self.tp_rank == 0 and layer_id == 0:
                         logger.info(f'>>>>> kv sending thread offload {len(block_ids_npu)} blocks of req {req_id}')
+                    if self.tp_rank == 0:
+                        logger.info(
+                            "SFA_DIAG send_thread copy begin layer=%d req=%s "
+                            "npu_blocks=%s cpu_blocks=%s npu_shape=%s cpu_shape=%s",
+                            layer_id,
+                            req_id,
+                            block_ids_npu,
+                            block_ids_cpu,
+                            tuple(k_cache_npu.shape),
+                            tuple(k_cache_cpu.shape),
+                        )
                     if len(block_ids_npu) > 1:
                         k_cache_cpu[block_ids_cpu] = k_cache_npu[block_ids_npu].to('cpu')
                         v_cache_cpu[block_ids_cpu] = v_cache_npu[block_ids_npu].to('cpu')
                     else:
                         k_cache_cpu[block_ids_cpu[0]].copy_(k_cache_npu[block_ids_npu[0]])
                         v_cache_cpu[block_ids_cpu[0]].copy_(v_cache_npu[block_ids_npu[0]])
+                    if self.tp_rank == 0:
+                        logger.info(
+                            "SFA_DIAG send_thread copy end layer=%d req=%s",
+                            layer_id,
+                            req_id,
+                        )
+            if self.tp_rank == 0:
+                logger.info("SFA_DIAG send_thread sync begin layer=%d", layer_id)
             self.save_stream.synchronize()
+            if self.tp_rank == 0:
+                logger.info("SFA_DIAG send_thread sync end layer=%d", layer_id)
         except Exception:
             logger.exception("Error in SFA layer save thread for layer %s", layer_id)
         finally:
             req_metas.clear()
             self.request_queue.task_done()
             self.layer_save_finished_events[layer_id].set()
+            if self.tp_rank == 0:
+                logger.info("SFA_DIAG send_thread event set layer=%d", layer_id)

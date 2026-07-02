@@ -449,8 +449,16 @@ class SFAKVOffloadWorker:
         layer_id = self.current_layer_save
         layer_save_tasks = self.layer_save_tasks[layer_id]
         if layer_save_tasks:
+            if self.tp_rank == 0:
+                logger.info(
+                    "SFA_DIAG save_cpu enqueue layer=%d task_count=%d",
+                    layer_id,
+                    len(layer_save_tasks),
+                )
             self.kv_send_thread.add_request(layer_save_tasks)
         else:
+            if self.tp_rank == 0:
+                logger.info("SFA_DIAG save_cpu empty layer=%d", layer_id)
             self.layer_save_finished_events[layer_id].set()
         self.current_layer_save += 1
         if self.current_layer_save == self.num_layers:
@@ -515,6 +523,21 @@ class SFAKVOffloadWorker:
         kv_layer: list[torch.Tensor] | tuple[torch.Tensor, ...] | None = None,
     ) -> None:
         layer_id = self.current_layer_save
+        layer_save_tasks = self.layer_save_tasks[layer_id]
+        callback_task_count = sum(
+            1 for task in layer_save_tasks if task.use_callback_cache
+        )
+        if self.tp_rank == 0:
+            logger.info(
+                "SFA_DIAG worker.save_kv_layer layer=%d "
+                "save_tasks=%d tail_tasks=%d callback_tasks=%d "
+                "kv_layer_len=%s",
+                layer_id,
+                len(layer_save_tasks),
+                len(self.layer_tail_copy_tasks[layer_id]),
+                callback_task_count,
+                -1 if kv_layer is None else len(kv_layer),
+            )
         self._copy_prompt_tail_to_decode_cache(layer_id, kv_layer)
         self._prepare_callback_cache_save_tasks(layer_id, kv_layer)
         self.save_cpu()
