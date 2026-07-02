@@ -3325,7 +3325,7 @@ class NPUModelRunner(GPUModelRunner):
                         num_reqs,
                         num_reqs_padded,
                         self.query_start_loc.gpu[: num_reqs + 1],
-                        self.positions[:total_num_scheduled_tokens],
+                        self.positions[:num_tokens],
                         num_tokens_padded,
                     )
                 )
