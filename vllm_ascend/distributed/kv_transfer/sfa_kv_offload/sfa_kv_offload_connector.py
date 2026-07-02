@@ -184,7 +184,7 @@ class SFAKVOffloadConnector(KVConnectorBase_V1, SupportsHMA):
     def save_kv_layer(
         self, layer_name: str, kv_layer: torch.Tensor, attn_metadata: "AttentionMetadata", **kwargs
     ) -> None:
-        self.connector_worker.save_kv_layer()
+        self.connector_worker.save_kv_layer(kv_layer)
 
     def wait_for_save(self):
         self.connector_worker.wait_for_save()

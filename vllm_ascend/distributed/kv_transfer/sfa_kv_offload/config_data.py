@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from typing import Any
 
 import torch
 from vllm.distributed.kv_transfer.kv_connector.v1.base import KVConnectorMetadata
@@ -11,6 +12,7 @@ class RequestTracker:
     req_id: str
     allocated_block_ids_npu: list[int]
     allocated_block_ids_cpu: list[int]
+    prompt_handoff_done: bool = False
 
     def update(
         self,
@@ -29,12 +31,16 @@ class ReqMeta:
     block_ids_cpu: list[int]
     num_new_offload_blocks: int = 0
     num_prompt_blocks: int = 0
+    num_transition_prompt_blocks: int = 0
+    copy_prompt_tail_to_decode: bool = False
 
     @staticmethod
     def from_request_tracker(
         tracker: RequestTracker,
         num_new_offload_blocks: int = 0,
         num_prompt_blocks: int = 0,
+        num_transition_prompt_blocks: int = 0,
+        copy_prompt_tail_to_decode: bool = False,
     ) -> ReqMeta | None:
         """Create the request metadata from a request tracker."""
         return ReqMeta(
@@ -43,6 +49,8 @@ class ReqMeta:
             block_ids_cpu=tracker.allocated_block_ids_cpu,
             num_new_offload_blocks=num_new_offload_blocks,
             num_prompt_blocks=num_prompt_blocks,
+            num_transition_prompt_blocks=num_transition_prompt_blocks,
+            copy_prompt_tail_to_decode=copy_prompt_tail_to_decode,
         )
 
 
@@ -68,3 +76,13 @@ class LayerMultiBlockReqMeta:
     block_ids_cpu: list[int] | None = None
     cache_npu: tuple[torch.Tensor, torch.Tensor] | None = None
     cache_cpu: tuple[torch.Tensor, torch.Tensor] | None = None
+    use_callback_cache: bool = False
+    ready_event: Any | None = None
+
+
+@dataclass
+class LayerPromptTailReqMeta:
+    req_id: str
+    layer_id: int
+    block_id_npu: int
+    block_id_decode: int

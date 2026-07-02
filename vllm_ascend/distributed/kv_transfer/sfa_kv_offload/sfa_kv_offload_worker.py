@@ -28,6 +28,7 @@ from vllm_ascend.ascend_config import get_ascend_config
 from vllm_ascend.distributed.kv_transfer.sfa_kv_offload.config_data import (
     SFAKVOffloadConnectorMetadata,
     LayerMultiBlockReqMeta,
+    LayerPromptTailReqMeta,
     ReqMeta,
 )
 from vllm_ascend.distributed.kv_transfer.sfa_kv_offload.kv_transfer import (
@@ -151,6 +152,7 @@ class SFAKVOffloadWorker:
         self.kv_send_thread: KVTransferThread | None = None
 
         self.layer_save_tasks = [[] for _ in range(self.num_layers)]
+        self.layer_tail_copy_tasks = [[] for _ in range(self.num_layers)]
         self.max_num_reqs = vllm_config.scheduler_config.max_num_seqs
         lru_resident_config = ascend_config.lru_resident_cache_config
         self.sfa_sparse_topk = lru_resident_config.topk
@@ -413,11 +415,19 @@ class SFAKVOffloadWorker:
         self.current_layer_save = 0
         self.current_layer_load = 0
         req_id_to_block_ids: dict[str, list[int]] = {}
-        for layer_save_task in self.layer_save_tasks:
+        for layer_save_task, layer_tail_copy_task in zip(
+            self.layer_save_tasks,
+            self.layer_tail_copy_tasks,
+        ):
             layer_save_task.clear()
+            layer_tail_copy_task.clear()
         for request in metadata.requests:
             req_id_to_block_ids[request.req_id] = request.block_ids_cpu
-            if request.num_new_offload_blocks <= 0:
+            if (
+                request.num_new_offload_blocks <= 0
+                and request.num_transition_prompt_blocks <= 0
+                and not request.copy_prompt_tail_to_decode
+            ):
                 continue # no new blocks to save
             self.process_layer_data(request)
         self.num_save_tasks = len(self.layer_save_tasks[0])
@@ -436,12 +446,77 @@ class SFAKVOffloadWorker:
         self.cpu_block_table.copy_to_gpu(num_reqs)
 
     def save_cpu(self):
-        self.kv_send_thread.add_request(self.layer_save_tasks[self.current_layer_save])
+        layer_id = self.current_layer_save
+        layer_save_tasks = self.layer_save_tasks[layer_id]
+        if layer_save_tasks:
+            self.kv_send_thread.add_request(layer_save_tasks)
+        else:
+            self.layer_save_finished_events[layer_id].set()
         self.current_layer_save += 1
         if self.current_layer_save == self.num_layers:
             self.current_layer_save = 0
 
-    def save_kv_layer(self) -> None:
+    def _copy_prompt_tail_to_decode_cache(
+        self,
+        layer_id: int,
+        kv_layer: list[torch.Tensor] | tuple[torch.Tensor, ...] | None,
+    ) -> None:
+        tail_copy_tasks = self.layer_tail_copy_tasks[layer_id]
+        if not tail_copy_tasks:
+            return
+        if kv_layer is None or len(kv_layer) < 2:
+            raise ValueError("Prompt tail handoff requires live prefill KV layer")
+
+        k_cache_npu = kv_layer[0]
+        v_cache_npu = kv_layer[1]
+        k_cache_decode_npu = self.k_caches_decode_npu[layer_id]
+        v_cache_decode_npu = self.v_caches_decode_npu[layer_id]
+        for task in tail_copy_tasks:
+            k_cache_decode_npu[task.block_id_decode].copy_(
+                k_cache_npu[task.block_id_npu]
+            )
+            v_cache_decode_npu[task.block_id_decode].copy_(
+                v_cache_npu[task.block_id_npu]
+            )
+            if self.tp_rank == 0 and layer_id == 0:
+                logger.info(
+                    ">>>>> prompt tail handoff req=%s npu_block=%d decode_block=%d",
+                    task.req_id,
+                    task.block_id_npu,
+                    task.block_id_decode,
+                )
+
+    def _prepare_callback_cache_save_tasks(
+        self,
+        layer_id: int,
+        kv_layer: list[torch.Tensor] | tuple[torch.Tensor, ...] | None,
+    ) -> None:
+        layer_save_tasks = self.layer_save_tasks[layer_id]
+        if not layer_save_tasks:
+            return
+
+        need_callback_cache = any(
+            task.use_callback_cache for task in layer_save_tasks
+        )
+        if need_callback_cache:
+            if kv_layer is None or len(kv_layer) < 2:
+                raise ValueError("Prompt handoff requires live prefill KV layer")
+            for task in layer_save_tasks:
+                if task.use_callback_cache:
+                    task.cache_npu = (kv_layer[0], kv_layer[1])
+
+        ready_event = torch.npu.Event()
+        ready_event.record()
+        for task in layer_save_tasks:
+            task.ready_event = ready_event
+
+    def save_kv_layer(
+        self,
+        kv_layer: list[torch.Tensor] | tuple[torch.Tensor, ...] | None = None,
+    ) -> None:
+        layer_id = self.current_layer_save
+        self._copy_prompt_tail_to_decode_cache(layer_id, kv_layer)
+        self._prepare_callback_cache_save_tasks(layer_id, kv_layer)
         self.save_cpu()
 
     def wait_for_save(self):
@@ -680,24 +755,31 @@ class SFAKVOffloadWorker:
         Generate kv offload related metadata.
         """
         num_new_offload_blocks = request.num_new_offload_blocks
-        block_ids_npu = request.block_ids_npu
+        all_block_ids_npu = request.block_ids_npu
         block_ids_cpu = request.block_ids_cpu
+        block_ids_npu = all_block_ids_npu
         if len(block_ids_npu) > len(block_ids_cpu):
             # in most cases block_ids_npu has one more unfull block, remove it
             block_ids_npu = block_ids_npu[:-1]
         assert len(block_ids_npu) == len(block_ids_cpu)
-        start_block_pos = len(block_ids_cpu) - num_new_offload_blocks
-        block_ids_npu = block_ids_npu[start_block_pos:]
-        block_ids_cpu = block_ids_cpu[start_block_pos:]
-        prefill_pairs: list[tuple[int, int]] = []
+
+        transition_prompt_pairs: list[tuple[int, int]] = []
+        if request.num_transition_prompt_blocks > 0:
+            transition_prompt_pairs = list(
+                zip(
+                    block_ids_npu[:request.num_transition_prompt_blocks],
+                    block_ids_cpu[:request.num_transition_prompt_blocks],
+                )
+            )
+
         decode_pairs: list[tuple[int, int]] = []
-        for offset, (block_id_npu, block_id_cpu) in enumerate(
-            zip(block_ids_npu, block_ids_cpu)
-        ):
-            block_pos = start_block_pos + offset
-            if block_pos < request.num_prompt_blocks:
-                prefill_pairs.append((block_id_npu, block_id_cpu))
-            else:
+        if num_new_offload_blocks > 0:
+            start_block_pos = len(block_ids_cpu) - num_new_offload_blocks
+            new_block_ids_cpu = block_ids_cpu[start_block_pos:]
+            for offset, block_id_cpu in enumerate(new_block_ids_cpu):
+                block_pos = start_block_pos + offset
+                if block_pos < request.num_prompt_blocks:
+                    continue
                 decode_pairs.append(
                     (
                         self._decode_physical_block_id(request.req_id, block_pos),
@@ -705,25 +787,50 @@ class SFAKVOffloadWorker:
                     )
                 )
 
+        tail_pair: tuple[int, int] | None = None
+        if request.copy_prompt_tail_to_decode:
+            tail_block_pos = request.num_prompt_blocks
+            if tail_block_pos < len(all_block_ids_npu):
+                tail_pair = (
+                    all_block_ids_npu[tail_block_pos],
+                    self._decode_physical_block_id(
+                        request.req_id,
+                        tail_block_pos,
+                    ),
+                )
+            else:
+                logger.warning(
+                    "Prompt tail handoff skipped for req %s: tail block pos %d "
+                    "not found in npu block ids %s",
+                    request.req_id,
+                    tail_block_pos,
+                    all_block_ids_npu,
+                )
+
         for layer_id in range(self.num_layers):
-            if prefill_pairs:
-                prefill_block_ids_npu, prefill_block_ids_cpu = zip(*prefill_pairs)
+            if transition_prompt_pairs:
+                prefill_block_ids_npu, prefill_block_ids_cpu = zip(
+                    *transition_prompt_pairs
+                )
                 self.layer_save_tasks[layer_id].append(
                     LayerMultiBlockReqMeta(
                         request.req_id,
                         layer_id,
                         block_ids_npu=list(prefill_block_ids_npu),
                         block_ids_cpu=list(prefill_block_ids_cpu),
-                        cache_npu=(
-                            self.k_caches_npu[layer_id],
-                            self.v_caches_npu[layer_id],
-                        ),
                         cache_cpu=(
                             self.k_caches_cpu[layer_id],
                             self.v_caches_cpu[layer_id],
                         ),
+                        use_callback_cache=True,
                     )
                 )
+                if self.tp_rank == 0 and layer_id == 0:
+                    logger.info(
+                        ">>>>> prompt handoff req=%s full_blocks=%d",
+                        request.req_id,
+                        len(transition_prompt_pairs),
+                    )
             if decode_pairs:
                 decode_block_ids_npu, decode_block_ids_cpu = zip(*decode_pairs)
                 self.layer_save_tasks[layer_id].append(
@@ -740,5 +847,15 @@ class SFAKVOffloadWorker:
                             self.k_caches_cpu[layer_id],
                             self.v_caches_cpu[layer_id],
                         ),
+                    )
+                )
+            if tail_pair is not None:
+                block_id_npu, block_id_decode = tail_pair
+                self.layer_tail_copy_tasks[layer_id].append(
+                    LayerPromptTailReqMeta(
+                        request.req_id,
+                        layer_id,
+                        block_id_npu=block_id_npu,
+                        block_id_decode=block_id_decode,
                     )
                 )

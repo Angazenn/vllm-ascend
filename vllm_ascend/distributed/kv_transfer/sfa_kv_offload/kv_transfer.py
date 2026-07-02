@@ -74,33 +74,48 @@ class KVCacheStoreLayerSendingThread(KVTransferThread):
     ):
         # logger.info(f'>>>>> handle request, req_metas = {len(req_metas)}')
         if len(req_metas) == 0:
+            self.request_queue.task_done()
             return
 
         layer_id = req_metas[0].layer_id
 
-        with torch_npu.npu.stream(self.save_stream):
-            for req_meta in req_metas:
-                req_id = req_meta.req_id
-                block_ids_npu = req_meta.block_ids_npu
-                block_ids_cpu = req_meta.block_ids_cpu
-                (k_cache_npu, v_cache_npu) = req_meta.cache_npu
-                (k_cache_cpu, v_cache_cpu) = req_meta.cache_cpu
-                if len(block_ids_npu) != len(block_ids_cpu):
-                    logger.error(
-                        f'Offload req {req_id} fail! '
-                        f'npu block num ({len(block_ids_npu)}) '
-                        f'cpu block num ({len(block_ids_cpu)}) size mismatch'
-                    )
-                if self.tp_rank == 0 and layer_id == 0:
-                    logger.info(f'>>>>> kv sending thread offload {len(block_ids_npu)} blocks of req {req_id}')
-                if len(block_ids_npu) > 1:
-                    k_cache_cpu[block_ids_cpu] = k_cache_npu[block_ids_npu].to('cpu')
-                    v_cache_cpu[block_ids_cpu] = v_cache_npu[block_ids_npu].to('cpu')
-                else:
-                    k_cache_cpu[block_ids_cpu[0]].copy_(k_cache_npu[block_ids_npu[0]])
-                    v_cache_cpu[block_ids_cpu[0]].copy_(v_cache_npu[block_ids_npu[0]])
-        self.save_stream.synchronize()
-
-        req_metas.clear()
-        self.request_queue.task_done()
-        self.layer_save_finished_events[layer_id].set()
+        try:
+            with torch_npu.npu.stream(self.save_stream):
+                for req_meta in req_metas:
+                    req_id = req_meta.req_id
+                    block_ids_npu = req_meta.block_ids_npu
+                    block_ids_cpu = req_meta.block_ids_cpu
+                    if block_ids_npu is None or block_ids_cpu is None:
+                        raise ValueError(
+                            f"Offload req {req_id} has empty block ids"
+                        )
+                    if req_meta.cache_npu is None or req_meta.cache_cpu is None:
+                        raise ValueError(
+                            f"Offload req {req_id} has empty cache tensors"
+                        )
+                    ready_event = req_meta.ready_event
+                    if ready_event is not None:
+                        self.save_stream.wait_event(ready_event)
+                    (k_cache_npu, v_cache_npu) = req_meta.cache_npu
+                    (k_cache_cpu, v_cache_cpu) = req_meta.cache_cpu
+                    if len(block_ids_npu) != len(block_ids_cpu):
+                        logger.error(
+                            f'Offload req {req_id} fail! '
+                            f'npu block num ({len(block_ids_npu)}) '
+                            f'cpu block num ({len(block_ids_cpu)}) size mismatch'
+                        )
+                    if self.tp_rank == 0 and layer_id == 0:
+                        logger.info(f'>>>>> kv sending thread offload {len(block_ids_npu)} blocks of req {req_id}')
+                    if len(block_ids_npu) > 1:
+                        k_cache_cpu[block_ids_cpu] = k_cache_npu[block_ids_npu].to('cpu')
+                        v_cache_cpu[block_ids_cpu] = v_cache_npu[block_ids_npu].to('cpu')
+                    else:
+                        k_cache_cpu[block_ids_cpu[0]].copy_(k_cache_npu[block_ids_npu[0]])
+                        v_cache_cpu[block_ids_cpu[0]].copy_(v_cache_npu[block_ids_npu[0]])
+            self.save_stream.synchronize()
+        except Exception:
+            logger.exception("Error in SFA layer save thread for layer %s", layer_id)
+        finally:
+            req_metas.clear()
+            self.request_queue.task_done()
+            self.layer_save_finished_events[layer_id].set()

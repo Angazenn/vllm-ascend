@@ -123,6 +123,30 @@ class SFAKVOffloadlScheduler:
 
         raise ValueError(f"Cannot infer num_prompt_tokens for request {req_id}")
 
+    def _get_transition_handoff(
+        self,
+        request_tracker: RequestTracker,
+        num_computed_tokens_before: int,
+        num_tokens_after_step: int,
+        num_prompt_tokens: int,
+    ) -> tuple[int, bool]:
+        if request_tracker.prompt_handoff_done:
+            return 0, False
+        if num_prompt_tokens <= 0:
+            request_tracker.prompt_handoff_done = True
+            return 0, False
+        if not (
+            num_computed_tokens_before < num_prompt_tokens
+            and num_tokens_after_step >= num_prompt_tokens
+        ):
+            return 0, False
+
+        request_tracker.prompt_handoff_done = True
+        return (
+            num_prompt_tokens // self._block_size,
+            num_prompt_tokens % self._block_size != 0,
+        )
+
     def update_state_after_alloc(self, request: "Request", blocks: "KVCacheBlocks", num_external_tokens: int):
         """
         """
@@ -162,14 +186,26 @@ class SFAKVOffloadlScheduler:
                 allocated_block_ids_cpu=block_ids_cpu,
             )
             self._request_trackers[request.req_id] = request_tracker
+            num_prompt_tokens = self._get_num_prompt_tokens(
+                request.req_id,
+                request,
+            )
+            (
+                num_transition_prompt_blocks,
+                copy_prompt_tail_to_decode,
+            ) = self._get_transition_handoff(
+                request_tracker,
+                request.num_computed_tokens,
+                num_tokens_to_compute,
+                num_prompt_tokens,
+            )
 
             req_meta = ReqMeta.from_request_tracker(
                 request_tracker,
                 num_new_offload_blocks=num_new_offload_blocks,
-                num_prompt_blocks=(
-                    self._get_num_prompt_tokens(request.req_id, request)
-                    // self._block_size
-                ),
+                num_prompt_blocks=num_prompt_tokens // self._block_size,
+                num_transition_prompt_blocks=num_transition_prompt_blocks,
+                copy_prompt_tail_to_decode=copy_prompt_tail_to_decode,
             )
             if req_meta is not None:
                 meta.add_request(req_meta)
@@ -200,13 +236,23 @@ class SFAKVOffloadlScheduler:
                 num_new_offload_blocks = num_blocks_after_step - num_offloaded_blocks
                 new_block_ids_cpu = self.cpu_block_manager.allocate_block(num_new_offload_blocks)
                 request_tracker.update(new_block_ids_npu, new_block_ids_cpu)
+                num_prompt_tokens = self._get_num_prompt_tokens(req_id)
+                (
+                    num_transition_prompt_blocks,
+                    copy_prompt_tail_to_decode,
+                ) = self._get_transition_handoff(
+                    request_tracker,
+                    num_computed_token,
+                    num_tokens_after_step,
+                    num_prompt_tokens,
+                )
 
                 req_meta = ReqMeta.from_request_tracker(
                     request_tracker,
                     num_new_offload_blocks=num_new_offload_blocks,
-                    num_prompt_blocks=(
-                        self._get_num_prompt_tokens(req_id) // self._block_size
-                    ),
+                    num_prompt_blocks=num_prompt_tokens // self._block_size,
+                    num_transition_prompt_blocks=num_transition_prompt_blocks,
+                    copy_prompt_tail_to_decode=copy_prompt_tail_to_decode,
                 )
             if req_meta is not None:
                 meta.add_request(req_meta)
