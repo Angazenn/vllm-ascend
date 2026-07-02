@@ -198,6 +198,7 @@ class SFAKVOffloadWorker:
 
     @staticmethod
     def _as_cache_tuple(cache_or_caches) -> tuple[torch.Tensor, ...]:
+        cache_or_caches = get_decode_kv_cache(cache_or_caches)
         if isinstance(cache_or_caches, torch.Tensor):
             return (cache_or_caches,)
         return tuple(cache_or_caches)
