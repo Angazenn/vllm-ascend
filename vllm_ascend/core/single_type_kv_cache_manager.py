@@ -357,9 +357,9 @@ class OffloadMLAAttentionManager(FullAttentionManager):
             # prefill blocks are still being produced and saved.
             num_to_free_blocks = 0
         else:
-            # Decode step: all full blocks except the latest full block can be
-            # served from CPU after the connector save path has run.
-            num_offloaded_blocks = max(num_allocated_tokens // self.block_size - 1, 0)
+            # Decode step: all full blocks can be served from CPU after the
+            # connector save path has run.
+            num_offloaded_blocks = num_allocated_tokens // self.block_size
             num_to_free_blocks = num_offloaded_blocks - len(req_freed_blocks)
 
         to_free_blocks: list[KVCacheBlock] = []

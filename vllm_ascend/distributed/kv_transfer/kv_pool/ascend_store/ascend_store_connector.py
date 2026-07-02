@@ -37,6 +37,13 @@ from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.pool_worker import
 from vllm_ascend.worker.prefill_decode_kv_cache import get_prefill_kv_cache
 
 
+def _filter_ascend_store_cache_tensors(cache: Any) -> Any:
+    cache = get_prefill_kv_cache(cache)
+    if isinstance(cache, tuple) and len(cache) >= 5:
+        return cache[:3]
+    return cache
+
+
 def _select_ascend_store_group_id(
     kv_cache_config: KVCacheConfig | None,
     extra_config: dict[str, Any],
@@ -265,9 +272,9 @@ class AscendStoreConnector(KVConnectorBase_V1, SupportsHMA):
     ############################################################
     # Worker Side Methods
     ############################################################
-    def _filter_kv_caches(self, kv_caches: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
+    def _filter_kv_caches(self, kv_caches: dict[str, torch.Tensor]) -> dict[str, Any]:
         kv_caches = {
-            layer_name: get_prefill_kv_cache(cache)
+            layer_name: _filter_ascend_store_cache_tensors(cache)
             for layer_name, cache in kv_caches.items()
         }
         if self._local_kv_cache_config is None or self._selected_kv_cache_group_id is None:

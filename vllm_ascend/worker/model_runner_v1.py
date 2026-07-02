@@ -1467,9 +1467,8 @@ class NPUModelRunner(GPUModelRunner):
             )
 
         if self.use_offload:
-            num_offloaded_blocks = np.maximum(
-                self.input_batch.num_computed_tokens_cpu[:num_reqs] // self.block_size - 1,
-                0,
+            num_offloaded_blocks = (
+                self.input_batch.num_computed_tokens_cpu[:num_reqs] // self.block_size
             )
             # Chunk prefill and speculative extension should not consult CPU
             # offload storage for the newly produced prompt blocks.
