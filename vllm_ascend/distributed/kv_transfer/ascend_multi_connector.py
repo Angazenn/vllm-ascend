@@ -33,7 +33,11 @@ class AscendMultiConnector(MultiConnector, SupportsHMA):
         chosen_connector = self._requests_to_connector.get(request.request_id, -1)
         empty_blocks = blocks.new_empty()
         for i, c in enumerate(self._connectors):
-            if i == chosen_connector or isinstance(c, MooncakeLayerwiseConnector):
+            if (
+                i == chosen_connector
+                or isinstance(c, MooncakeLayerwiseConnector)
+                or c.__class__.__name__ == "SFAKVOffloadConnector"
+            ):
                 # Forward call to the chosen connector (if any).
                 c.update_state_after_alloc(request, blocks, num_external_tokens)
             else:
@@ -100,3 +104,34 @@ class AscendMultiConnector(MultiConnector, SupportsHMA):
         self._requests_to_connector.pop(request.request_id, None)
 
         return async_saves > 0, kv_txfer_params
+
+    def set_req_ids(self, req_ids: list) -> None:
+        for c in self._connectors:
+            hook = getattr(c, "set_req_ids", None)
+            if hook is not None:
+                hook(req_ids)
+
+    def prepare_lru_resident_and_load(
+        self,
+        layer_name: str,
+        num_reqs: int,
+        topk_indices,
+        current_slots,
+        req_ids,
+        capturing: bool = False,
+    ) -> bool:
+        prepared = False
+        for c in self._connectors:
+            hook = getattr(c, "prepare_lru_resident_and_load", None)
+            if hook is not None:
+                prepared = bool(
+                    hook(
+                        layer_name,
+                        num_reqs,
+                        topk_indices,
+                        current_slots,
+                        req_ids,
+                        capturing,
+                    )
+                ) or prepared
+        return prepared

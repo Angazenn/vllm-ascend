@@ -231,6 +231,10 @@ class AscendCommonAttentionMetadata(CommonAttentionMetadata):
     # Metadata for Prefill Context Parallelism (PCP) operations.
     prefill_context_parallel_metadata: AscendPrefillContextParallelMetadata | None = None
     kvcomp_metadata: KVCompMetaData | None = None
+    indexer_block_table_tensor: torch.Tensor | None = None
+    indexer_slot_mapping: torch.Tensor | None = None
+    num_offloaded_blocks: torch.Tensor | None = None
+    req_ids_tensor: torch.Tensor | None = None
 
     # TODO: Remove it when vLLM no longer uses this function.
     def unpadded(self, num_actual_tokens: int, num_actual_reqs: int) -> "AscendCommonAttentionMetadata":
@@ -284,6 +288,10 @@ class AscendCommonAttentionMetadata(CommonAttentionMetadata):
             encoder_seq_lens_cpu=_slice_reqs(self.encoder_seq_lens_cpu),
             logits_indices_padded=self.logits_indices_padded,
             num_logits_indices=self.num_logits_indices,
+            indexer_block_table_tensor=self.indexer_block_table_tensor,
+            indexer_slot_mapping=self.indexer_slot_mapping,
+            num_offloaded_blocks=_slice_reqs(self.num_offloaded_blocks),
+            req_ids_tensor=_slice_reqs(self.req_ids_tensor),
         )
 
 
@@ -432,6 +440,40 @@ def maybe_save_kv_layer_to_connector(
         return
     # TODO: assert ascendMetadata
     connector.save_kv_layer(layer_name, kv_cache_layer, attn_metadata)
+
+
+def set_connector_req_ids(req_ids):
+    if not has_kv_transfer_group() or not is_v1_kv_transfer_group():
+        return
+    connector = get_kv_transfer_group()
+    if not hasattr(connector, "set_req_ids"):
+        return
+    connector.set_req_ids(req_ids)
+
+
+def maybe_prepare_lru_resident_and_load_graph(
+    layer_name: str,
+    num_reqs: int,
+    topk_indices: torch.Tensor,
+    current_slots: torch.Tensor,
+    req_ids: torch.Tensor,
+    capturing: bool = False,
+) -> bool:
+    if not has_kv_transfer_group() or not is_v1_kv_transfer_group():
+        return False
+    connector = get_kv_transfer_group()
+    if not hasattr(connector, "prepare_lru_resident_and_load"):
+        raise RuntimeError(
+            "LRU resident cache requires prepare_lru_resident_and_load connector method"
+        )
+    return connector.prepare_lru_resident_and_load(
+        layer_name,
+        num_reqs,
+        topk_indices,
+        current_slots,
+        req_ids,
+        capturing,
+    )
 
 
 def round_up(val: int, align: int) -> int:

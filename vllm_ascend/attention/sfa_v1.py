@@ -8,6 +8,7 @@ import vllm.envs as envs_vllm
 from torch import nn
 from vllm.config import VllmConfig, get_current_vllm_config
 from vllm.distributed import get_tensor_model_parallel_world_size, get_tp_group
+from vllm.forward_context import ForwardContext, get_forward_context
 from vllm.logger import logger
 from vllm.model_executor.layers.attention.mla_attention import MLACommonMetadataBuilder
 from vllm.model_executor.layers.linear import UnquantizedLinearMethod
@@ -29,7 +30,9 @@ from vllm_ascend.attention.utils import (
     AscendCommonAttentionMetadata,
     ascend_chunked_prefill_workspace_size,
     enable_cp,
+    maybe_prepare_lru_resident_and_load_graph,
     maybe_save_kv_layer_to_connector,
+    split_decodes_and_prefills,
     trans_rope_weight,
     transdata,
     wait_for_kv_layer_from_connector,
@@ -70,6 +73,35 @@ if TYPE_CHECKING:
 
 # token count limits within bmm_transpose operator
 BMM_TRANS_MAX_SUPPORTED_TOKENS = 1024
+
+_SIDE_COMPUTE_STREAM = None
+
+
+def get_side_compute_stream() -> torch.npu.Stream:
+    global _SIDE_COMPUTE_STREAM
+    if _SIDE_COMPUTE_STREAM is None:
+        _SIDE_COMPUTE_STREAM = torch_npu.npu.Stream()
+    return _SIDE_COMPUTE_STREAM
+
+
+def _normalize_sfa_lse(
+    softmax_max: torch.Tensor,
+    softmax_sum: torch.Tensor,
+    *,
+    num_tokens: int,
+    num_heads: int,
+) -> torch.Tensor:
+    lse = torch.log(softmax_sum.to(torch.float32)) + softmax_max.to(torch.float32)
+    if lse.shape == (1, num_tokens, num_heads):
+        return lse.squeeze(0)
+    if lse.numel() == num_tokens * num_heads:
+        return lse.reshape(num_tokens, num_heads)
+    raise RuntimeError(
+        "unexpected SFA LSE stats shape: "
+        f"max={tuple(softmax_max.shape)} sum={tuple(softmax_sum.shape)} "
+        f"num_tokens={num_tokens} num_heads={num_heads}"
+    )
+
 
 O_PROJ_ACLNN_INPUT_PARAMS = (
     "aclnn_input_scale",
@@ -141,7 +173,7 @@ class AscendSFABackend(AttentionBackend):
 
     @staticmethod
     def get_supported_kernel_block_sizes() -> list[int]:
-        return [128]
+        return [512, 128]
 
 
 @dataclass
@@ -197,6 +229,10 @@ class AscendSFAMetadata:
     group_len: torch.Tensor | None = None
     group_key_idx: torch.Tensor | None = None
     group_key_cache_idx: torch.Tensor | None = None
+    indexer_block_table_tensor: torch.Tensor | None = None
+    indexer_slot_mapping: torch.Tensor | None = None
+    num_offloaded_blocks: torch.Tensor | None = None
+    req_ids_tensor: torch.Tensor | None = None
 
 
 M = TypeVar("M", bound=AscendSFAMetadata)
@@ -226,6 +262,8 @@ class AscendSFAMetadataBuilder(MLACommonMetadataBuilder[AscendSFAMetadata]):
             supports_dcp_with_varlen,
         )
 
+        ascend_config = get_ascend_config()
+        self.use_offload = ascend_config.use_offload
         self.block_size = vllm_config.cache_config.block_size
         self.max_blocks = (vllm_config.model_config.max_model_len + self.block_size - 1) // self.block_size
 
@@ -304,6 +342,18 @@ class AscendSFAMetadataBuilder(MLACommonMetadataBuilder[AscendSFAMetadata]):
 
         block_table = common_attn_metadata.block_table_tensor[:num_reqs]
         slot_mapping = common_attn_metadata.slot_mapping[:num_input_tokens]
+        indexer_block_table_tensor = (
+            common_attn_metadata.indexer_block_table_tensor[:num_reqs]
+            if self.use_offload and common_attn_metadata.indexer_block_table_tensor is not None
+            else None
+        )
+        indexer_slot_mapping = (
+            common_attn_metadata.indexer_slot_mapping[:num_input_tokens]
+            if self.use_offload and common_attn_metadata.indexer_slot_mapping is not None
+            else None
+        )
+        num_offloaded_blocks = common_attn_metadata.num_offloaded_blocks
+        req_ids_tensor = common_attn_metadata.req_ids_tensor
         input_positions = common_attn_metadata.positions[:num_input_tokens].long()
 
         block_size = 128
@@ -323,6 +373,15 @@ class AscendSFAMetadataBuilder(MLACommonMetadataBuilder[AscendSFAMetadata]):
             seq_lens_cpu = common_attn_metadata.seq_lens[:num_reqs].to("cpu")
 
         cos, sin = get_cos_and_sin_mla(input_positions, use_cache=(draft_index is None))
+
+        num_decodes, num_prefills, num_decode_tokens, num_prefill_tokens = (
+            split_decodes_and_prefills(
+                common_attn_metadata,
+                decode_threshold=self.decode_threshold,
+            )
+        )
+        assert num_decodes + num_prefills == num_reqs
+        assert num_decode_tokens + num_prefill_tokens == common_attn_metadata.num_actual_tokens
 
         dsa_cp_context = None
         if self.enable_dsa_cp:
@@ -437,6 +496,13 @@ class AscendSFAMetadataBuilder(MLACommonMetadataBuilder[AscendSFAMetadata]):
             group_len=group_len,
             group_key_idx=group_key_idx,
             group_key_cache_idx=group_key_cache_idx,
+            num_decodes=num_decodes,
+            num_decode_tokens=num_decode_tokens,
+            num_prefills=num_prefills,
+            indexer_block_table_tensor=indexer_block_table_tensor,
+            indexer_slot_mapping=indexer_slot_mapping,
+            num_offloaded_blocks=num_offloaded_blocks,
+            req_ids_tensor=req_ids_tensor,
         )
 
     def build_for_graph_capture(
@@ -513,7 +579,9 @@ class AscendSFAImpl(MLAAttentionImpl):
         self.topk_indices_buffer = kwargs.get("topk_indices_buffer")
 
         ascend_config = get_ascend_config()
+        self.use_offload = ascend_config.use_offload
         self.enable_shared_expert_dp = ascend_config.enable_shared_expert_dp
+        self.lru_resident_cache_config = ascend_config.lru_resident_cache_config
 
         # The MLAPO operator fuses the pre-processing steps on Q/K/V in MLA into a single operator
         # NOTE: it imposes a limit on the number of input tokens and conflicts with FlashComm
@@ -602,6 +670,36 @@ class AscendSFAImpl(MLAAttentionImpl):
                             f"Check layer_sharding config and model layer names."
                         )
                 register_all_layers_to_shard_weight_series(self.layer_sharding_kwargs)
+
+        # SFA decode offload resident-cache metadata. The large resident K/V
+        # buffers are allocated in model_runner and passed through kv_cache.
+        self.block_size = self.vllm_config.cache_config.block_size
+        max_num_reqs = self.vllm_config.scheduler_config.max_num_seqs
+        self.sfa_sparse_topk = self.lru_resident_cache_config.topk
+        self.lru_resident_capacity = self.lru_resident_cache_config.buffer_size
+        if self.lru_resident_capacity % self.block_size != 0:
+            raise ValueError(
+                "lru_resident_cache_config.buffer_size must be divisible by "
+                f"cache block_size ({self.block_size}); got {self.lru_resident_capacity}"
+            )
+        self.sparse_block_table = torch.arange(
+            0,
+            max_num_reqs * self.lru_resident_capacity // self.block_size,
+            dtype=torch.int32,
+            device="npu",
+        ).reshape([max_num_reqs, -1])
+        self.sparse_seq_len_kv = torch.full(
+            [max_num_reqs],
+            self.lru_resident_capacity,
+            dtype=torch.int32,
+            device="npu",
+        )
+        self.lru_current_slots = torch.full(
+            [max_num_reqs, self.sfa_sparse_topk],
+            -1,
+            dtype=torch.int32,
+            device="npu",
+        )
 
     @staticmethod
     def update_graph_params(
@@ -1230,6 +1328,11 @@ class AscendSFAImpl(MLAAttentionImpl):
             q_li, q_li_scale = torch_npu.npu_dynamic_quant(q_li.view(-1, self.head_dim), dst_type=self.c8_k_cache_dtype)
             q_li_scale = q_li_scale.to(self.c8_k_scale_cache_dtype)  # [b*s,]
 
+        indexer_block_table = (
+            attn_metadata.indexer_block_table_tensor
+            if self.use_offload and attn_metadata.indexer_block_table_tensor is not None
+            else attn_metadata.block_table
+        )
         return DeviceOperator.indexer_select_post_process(
             self,
             q_li,
@@ -1237,7 +1340,7 @@ class AscendSFAImpl(MLAAttentionImpl):
             q_li_shape_ori,
             weights,
             kv_cache,
-            attn_metadata,
+            indexer_block_table,
             actual_seq_lengths_query,
             actual_seq_lengths_key,
             self.use_sparse_c8_indexer,
@@ -1265,8 +1368,130 @@ class AscendSFAImpl(MLAAttentionImpl):
         topk_indices_buffer.copy_(topk_indices_to_cache)
 
     def _execute_sparse_flash_attention_process(
-        self, ql_nope, q_pe, kv_cache, topk_indices, attn_metadata, actual_seq_lengths_query, actual_seq_lengths_key
+        self,
+        ql_nope,
+        q_pe,
+        kv_cache,
+        decode_kv_cache,
+        topk_indices,
+        attn_metadata,
+        actual_seq_lengths_query,
+        actual_seq_lengths_key,
+        layer_name="",
     ):
+        decode_attention_kv_cache = decode_kv_cache if decode_kv_cache is not None else kv_cache
+        if (
+            self.use_offload
+            and len(decode_attention_kv_cache) >= 5
+            and attn_metadata.num_offloaded_blocks is not None
+            and attn_metadata.req_ids_tensor is not None
+        ):
+            num_decodes = attn_metadata.num_decodes
+            num_prefills = attn_metadata.num_prefills
+            num_decode_tokens = attn_metadata.num_decode_tokens
+
+            ql_nope_decode = ql_nope[:num_decode_tokens]
+            ql_nope_prefill = ql_nope[num_decode_tokens:]
+            q_pe_decode = q_pe[:num_decode_tokens]
+            q_pe_prefill = q_pe[num_decode_tokens:]
+            topk_indices_decode = topk_indices[:num_decode_tokens]
+            topk_indices_prefill = topk_indices[num_decode_tokens:]
+            actual_seq_lengths_query_decode = actual_seq_lengths_query[:num_decodes]
+            actual_seq_lengths_query_prefill = actual_seq_lengths_query[num_decodes:]
+            actual_seq_lengths_key_decode = actual_seq_lengths_key[:num_decodes]
+            actual_seq_lengths_key_prefill = actual_seq_lengths_key[num_decodes:]
+            block_table = attn_metadata.block_table
+            block_table_prefill = block_table[num_decodes:]
+
+            attn_output_decode = None
+            attn_output_prefill = None
+            if num_decodes > 0:
+                (
+                    topk_buffer,
+                    sparse_topk_indices,
+                    sparse_block_table,
+                    sparse_seq_len_kv,
+                    cpu_mask,
+                    attn_output_decode_npu,
+                    softmax_lse_decode_npu,
+                ) = self._get_topk_buffer(
+                    ql_nope_decode,
+                    q_pe_decode,
+                    topk_indices_decode,
+                    decode_attention_kv_cache,
+                    attn_metadata,
+                    layer_name,
+                )
+                attn_output_decode_cpu, softmax_max, softmax_sum = torch.ops._C_ascend.npu_sparse_flash_attention(
+                    query=ql_nope_decode,
+                    key=topk_buffer[0],
+                    value=topk_buffer[0],
+                    sparse_indices=sparse_topk_indices,
+                    scale_value=self.scale,
+                    sparse_block_size=1,
+                    block_table=sparse_block_table,
+                    actual_seq_lengths_query=actual_seq_lengths_query_decode,
+                    actual_seq_lengths_kv=sparse_seq_len_kv,
+                    query_rope=q_pe_decode,
+                    key_rope=topk_buffer[1],
+                    layout_query="TND",
+                    layout_kv="PA_BSND",
+                    sparse_mode=3,
+                    attention_mode=2,
+                    return_softmax_lse=True,
+                    sparse_indices_discrete=True,
+                )
+                softmax_lse_decode_cpu = _normalize_sfa_lse(
+                    softmax_max,
+                    softmax_sum,
+                    num_tokens=num_decode_tokens,
+                    num_heads=self.local_num_heads,
+                )
+                attn_output_decode, _ = torch_npu.npu_attention_update(
+                    [
+                        softmax_lse_decode_npu.reshape([num_decode_tokens * self.local_num_heads]),
+                        softmax_lse_decode_cpu.reshape([num_decode_tokens * self.local_num_heads]),
+                    ],
+                    [
+                        attn_output_decode_npu.reshape([num_decode_tokens * self.local_num_heads, -1]).to(torch.float32),
+                        attn_output_decode_cpu.reshape([num_decode_tokens * self.local_num_heads, -1]).to(torch.float32),
+                    ],
+                    update_type=0,
+                )
+                attn_output_decode = attn_output_decode.reshape(
+                    [num_decode_tokens, self.local_num_heads, -1]
+                ).to(torch.bfloat16)
+
+            if num_prefills > 0:
+                if actual_seq_lengths_query_decode is not None and actual_seq_lengths_query_decode.numel() != 0:
+                    actual_seq_lengths_query_prefill = (
+                        actual_seq_lengths_query_prefill
+                        - actual_seq_lengths_query_decode[-1]
+                    )
+                attn_output_prefill, _, _ = torch.ops._C_ascend.npu_sparse_flash_attention(
+                    query=ql_nope_prefill,
+                    key=kv_cache[0],
+                    value=kv_cache[0],
+                    sparse_indices=topk_indices_prefill,
+                    scale_value=self.scale,
+                    sparse_block_size=1,
+                    block_table=block_table_prefill,
+                    actual_seq_lengths_query=actual_seq_lengths_query_prefill,
+                    actual_seq_lengths_kv=actual_seq_lengths_key_prefill,
+                    query_rope=q_pe_prefill,
+                    key_rope=kv_cache[1],
+                    layout_query="TND",
+                    layout_kv="PA_BSND",
+                    sparse_mode=3,
+                    attention_mode=2,
+                )
+
+            if num_decodes <= 0:
+                return attn_output_prefill
+            if num_prefills <= 0:
+                return attn_output_decode
+            return torch.cat([attn_output_decode, attn_output_prefill], dim=0).contiguous()
+
         return DeviceOperator.execute_sparse_flash_attention_process(
             self,
             ql_nope,
@@ -1583,6 +1808,11 @@ class AscendSFAImpl(MLAAttentionImpl):
 
         if kv_cache is not None and self.has_indexer:
             assert k_li is not None
+            indexer_slot_mapping = (
+                attn_metadata.indexer_slot_mapping
+                if self.use_offload and attn_metadata.indexer_slot_mapping is not None
+                else slot_mapping
+            )
             if self.use_sparse_c8_indexer and get_ascend_device_type() == AscendDeviceType.A5:
                 dsa_k_cache_idx = 1
                 dsa_k_scale_cache_idx = 2
@@ -1602,7 +1832,7 @@ class AscendSFAImpl(MLAAttentionImpl):
             else:
                 torch_npu.npu_scatter_nd_update_(
                     kv_cache[dsa_k_cache_idx].view(-1, k_li.shape[-1]),
-                    slot_mapping.view(-1, 1),
+                    indexer_slot_mapping.view(-1, 1),
                     k_li.view(-1, k_li.shape[-1]),
                 )  # b, s, n, d
                 if mirror_decode_kv_cache is not None:
@@ -1610,7 +1840,7 @@ class AscendSFAImpl(MLAAttentionImpl):
                         mirror_decode_kv_cache[dsa_k_cache_idx].view(
                             -1, k_li.shape[-1]
                         ),
-                        slot_mapping.view(-1, 1),
+                        indexer_slot_mapping.view(-1, 1),
                         k_li.view(-1, k_li.shape[-1]),
                     )
             if self.use_sparse_c8_indexer:
@@ -1631,7 +1861,7 @@ class AscendSFAImpl(MLAAttentionImpl):
                     else:
                         torch_npu.npu_scatter_nd_update_(
                             kv_cache[dsa_k_scale_cache_idx].view(-1, k_li_scale.shape[-1]),
-                            slot_mapping.view(-1, 1),
+                            indexer_slot_mapping.view(-1, 1),
                             k_li_scale.view(-1, k_li_scale.shape[-1]),
                         )
                         if mirror_decode_kv_cache is not None:
@@ -1639,7 +1869,7 @@ class AscendSFAImpl(MLAAttentionImpl):
                                 mirror_decode_kv_cache[dsa_k_scale_cache_idx].view(
                                     -1, k_li_scale.shape[-1]
                                 ),
-                                slot_mapping.view(-1, 1),
+                                indexer_slot_mapping.view(-1, 1),
                                 k_li_scale.view(-1, k_li_scale.shape[-1]),
                             )
 
@@ -1669,7 +1899,15 @@ class AscendSFAImpl(MLAAttentionImpl):
                 self._update_indexcache_topk_indices(topk_indices)
 
         attn_output = self._execute_sparse_flash_attention_process(
-            ql_nope, q_pe, kv_cache, topk_indices, attn_metadata, actual_seq_lengths_query, actual_seq_lengths_key
+            ql_nope,
+            q_pe,
+            kv_cache,
+            mirror_decode_kv_cache,
+            topk_indices,
+            attn_metadata,
+            actual_seq_lengths_query,
+            actual_seq_lengths_key,
+            layer_name,
         )
 
         attn_output = self._v_up_proj(attn_output)
@@ -1701,6 +1939,88 @@ class AscendSFAImpl(MLAAttentionImpl):
         maybe_save_kv_layer_to_connector(layer_name, list(kv_cache))
 
         return output_padded
+
+    def _get_topk_buffer(
+        self,
+        ql_nope_decode: torch.Tensor,
+        q_pe_decode: torch.Tensor,
+        topk_indices: torch.Tensor,
+        kv_cache: tuple[torch.Tensor, ...],
+        attn_metadata: M,
+        layer_name: str,
+    ):
+        forward_context: ForwardContext = get_forward_context()
+        num_reqs = topk_indices.shape[0]
+        topk_buffer_k = kv_cache[3][:num_reqs]
+        topk_buffer_v = kv_cache[4][:num_reqs]
+        topk_indices = topk_indices.squeeze(1)
+
+        valid_mask = topk_indices >= 0
+        num_offloaded_blocks = attn_metadata.num_offloaded_blocks[:num_reqs].unsqueeze(1)
+        offload_thresholds = num_offloaded_blocks * self.block_size
+
+        side_compute_stream = get_side_compute_stream()
+        side_compute_event = torch.npu.current_stream().record_event()
+        with torch_npu.npu.stream(side_compute_stream):
+            torch.npu.current_stream().wait_event(side_compute_event)
+            npu_mask = (topk_indices >= offload_thresholds) & valid_mask
+            npu_token_indices = torch.where(npu_mask, topk_indices, -1)
+            block_table = attn_metadata.block_table[:num_reqs]
+            seq_len_kv = attn_metadata.seq_lens[:num_reqs]
+            seq_len_q = attn_metadata.cum_query_lens[:num_reqs]
+            attn_out_npu, softmax_max, softmax_sum = torch.ops._C_ascend.npu_sparse_flash_attention(
+                query=ql_nope_decode,
+                key=kv_cache[0],
+                value=kv_cache[0],
+                sparse_indices=npu_token_indices.unsqueeze(1),
+                scale_value=self.scale,
+                sparse_block_size=1,
+                block_table=block_table,
+                actual_seq_lengths_query=seq_len_q,
+                actual_seq_lengths_kv=seq_len_kv,
+                query_rope=q_pe_decode,
+                key_rope=kv_cache[1],
+                layout_query="TND",
+                layout_kv="PA_BSND",
+                sparse_mode=3,
+                attention_mode=2,
+                return_softmax_lse=True,
+                sparse_indices_discrete=True,
+            )
+            softmax_lse_npu = _normalize_sfa_lse(
+                softmax_max,
+                softmax_sum,
+                num_tokens=num_reqs,
+                num_heads=self.local_num_heads,
+            )
+
+        cpu_mask = (topk_indices < offload_thresholds) & valid_mask
+        cpu_token_indices = torch.where(cpu_mask, topk_indices, -1)
+        maybe_prepare_lru_resident_and_load_graph(
+            layer_name,
+            num_reqs,
+            cpu_token_indices,
+            self.lru_current_slots[:num_reqs],
+            attn_metadata.req_ids_tensor[:num_reqs],
+            forward_context.capturing,
+        )
+
+        topk_buffer_k = topk_buffer_k.reshape([-1, self.block_size, 1, self.kv_lora_rank])
+        topk_buffer_v = topk_buffer_v.reshape([-1, self.block_size, 1, self.qk_rope_head_dim])
+        sparse_block_table = self.sparse_block_table[:num_reqs]
+        sparse_seq_len_kv = self.sparse_seq_len_kv[:num_reqs]
+        sparse_topk_indices = self.lru_current_slots[:num_reqs].unsqueeze(1)
+
+        torch_npu.npu.current_stream().wait_stream(side_compute_stream)
+        return (
+            (topk_buffer_k, topk_buffer_v),
+            sparse_topk_indices,
+            sparse_block_table,
+            sparse_seq_len_kv,
+            cpu_mask,
+            attn_out_npu,
+            softmax_lse_npu,
+        )
 
 
 def custom_kv_rmsnorm_rope(
