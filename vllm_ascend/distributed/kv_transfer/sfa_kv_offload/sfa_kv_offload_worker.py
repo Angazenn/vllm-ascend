@@ -22,7 +22,7 @@ from vllm.v1.kv_cache_interface import (
     UniformTypeKVCacheSpecs,
 )
 from vllm.v1.utils import CpuGpuBuffer
-from zbal import zbal_init, zbal_uninit, empty_tensor, batch_copy, zbal_h2d_init
+from memfabric_hybrid import h2d
 
 from vllm_ascend.ascend_config import get_ascend_config
 from vllm_ascend.distributed.kv_transfer.sfa_kv_offload.config_data import (
@@ -183,8 +183,8 @@ class SFAKVOffloadWorker:
         self.save_stream = None
         self.side_compute_stream = torch_npu.npu.Stream()
         self.kv_cache_config.num_blocks
-        self.allocate_dram_size = 10 * 1024 * 1024 * 1024 # 64GB, TODO get from config
-        zbal_h2d_init(self.allocate_dram_size, self.max_num_reqs * self.sfa_sparse_topk * 2)
+        self.allocate_dram_size = 10 * 1024 * 1024 * 1024 # TODO get from config
+        h2d.initialize(self.tp_rank, self.allocate_dram_size)
 
     def _infer_group_block_sizes(
         self,
@@ -271,8 +271,8 @@ class SFAKVOffloadWorker:
                     f"available cpu memory ({self.allocate_dram_size / 1024 / 1024 / 1024} GB/rank), "
                     "try to decrease gpu_memory_utilization or allocate more cpu memory during init."
                 )
-            self.k_caches_cpu: list[torch.Tensor] = [empty_tensor([cpu_block_num, self.block_size, 1, 512], dtype=torch.bfloat16, pin_memory=True) for _ in range(self.num_layers)]
-            self.v_caches_cpu: list[torch.Tensor] = [empty_tensor([cpu_block_num, self.block_size, 1, 64], dtype=torch.bfloat16, pin_memory=True) for _ in range(self.num_layers)]
+            self.k_caches_cpu: list[torch.Tensor] = [h2d.empty([cpu_block_num, self.block_size, 1, 512], dtype=torch.bfloat16, pin_memory=True) for _ in range(self.num_layers)]
+            self.v_caches_cpu: list[torch.Tensor] = [h2d.empty([cpu_block_num, self.block_size, 1, 64], dtype=torch.bfloat16, pin_memory=True) for _ in range(self.num_layers)]
 
             # topk cache reuse related
             self.lru_workspace_threads = 8
@@ -744,7 +744,7 @@ class SFAKVOffloadWorker:
             self.prepare_lru_resident_and_load_cpu(args)
 
         self.batch_copy_args_buffer_npu.copy_(self.batch_copy_args_buffer_cpu, non_blocking=capturing)
-        batch_copy(
+        h2d.batch_copy(
             self.gvas_buffer_npu,
             self.addr_buffer_npu,
             self.size_buffer_npu,
