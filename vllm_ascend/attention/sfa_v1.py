@@ -1508,10 +1508,24 @@ class AscendSFAImpl(MLAAttentionImpl):
                 )
 
             if num_decodes <= 0:
-                return attn_output_prefill
-            if num_prefills <= 0:
-                return attn_output_decode
-            return torch.cat([attn_output_decode, attn_output_prefill], dim=0).contiguous()
+                attn_output = attn_output_prefill
+            elif num_prefills <= 0:
+                attn_output = attn_output_decode
+            else:
+                attn_output = torch.cat([attn_output_decode, attn_output_prefill], dim=0).contiguous()
+
+            # Align with the non-offload path, which runs sparse attention over
+            # the full padded input (ql_nope.shape[0] == num_input_tokens). The
+            # offload path only computes real tokens, so under graph-replay
+            # padding (e.g. MTP draft) the result is shorter than the input.
+            # Pad the trailing rows so the downstream `output[...] = o_proj(...)`
+            # assignment matches the non-offload output shape.
+            if attn_output.shape[0] < ql_nope.shape[0]:
+                padded = attn_output.new_zeros(ql_nope.shape[0], *attn_output.shape[1:])
+                padded[: attn_output.shape[0]] = attn_output
+                attn_output = padded
+
+            return attn_output
 
         return DeviceOperator.execute_sparse_flash_attention_process(
             self,
