@@ -160,6 +160,7 @@ class SFAKVOffloadWorker:
         self.decode_blocks_per_req = lru_resident_config.decode_blocks_per_req
         self.decode_req_to_slot: dict[str, int] = {}
         self.decode_free_slots = list(range(self.max_num_reqs))
+        self.req_id_to_block_ids_cpu: dict[str, list[int]] = {}
 
         # TODO get from config
         head_num = 1
@@ -414,7 +415,8 @@ class SFAKVOffloadWorker:
         # return
         self.current_layer_save = 0
         self.current_layer_load = 0
-        req_id_to_block_ids: dict[str, list[int]] = {}
+        for req_id in metadata.preempted_req_ids or ():
+            self.req_id_to_block_ids_cpu.pop(req_id, None)
         for layer_save_task, layer_tail_copy_task in zip(
             self.layer_save_tasks,
             self.layer_tail_copy_tasks,
@@ -422,7 +424,7 @@ class SFAKVOffloadWorker:
             layer_save_task.clear()
             layer_tail_copy_task.clear()
         for request in metadata.requests:
-            req_id_to_block_ids[request.req_id] = request.block_ids_cpu
+            self.req_id_to_block_ids_cpu[request.req_id] = request.block_ids_cpu
             if (
                 request.num_new_offload_blocks <= 0
                 and request.num_transition_prompt_blocks <= 0
@@ -441,7 +443,15 @@ class SFAKVOffloadWorker:
         cpu_block_table_np = self.cpu_block_table.np[:num_reqs]
         cpu_block_table_np.fill(0)
         for i, req_id in enumerate(self.req_ids[:num_reqs]):
-            cpu_block_ids = req_id_to_block_ids[req_id]
+            cpu_block_ids = self.req_id_to_block_ids_cpu.get(req_id)
+            if cpu_block_ids is None:
+                if self.tp_rank == 0:
+                    logger.warning(
+                        "SFA KV offload has no CPU block table entry for "
+                        "active req %s; using an empty row.",
+                        req_id,
+                    )
+                continue
             cpu_block_table_np[i][:len(cpu_block_ids)] = np.array([cpu_block_ids], dtype=np.int32)
         self.cpu_block_table.copy_to_gpu(num_reqs)
 
@@ -569,6 +579,7 @@ class SFAKVOffloadWorker:
 
     def release_decode_slots(self, req_ids: set[str]) -> None:
         for req_id in req_ids:
+            self.req_id_to_block_ids_cpu.pop(req_id, None)
             slot = self.decode_req_to_slot.pop(req_id, None)
             if slot is not None:
                 self.decode_free_slots.append(slot)
