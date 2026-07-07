@@ -593,8 +593,11 @@ class NPUModelRunner(GPUModelRunner):
                 parallel_config=self.parallel_config, dtype=self.dtype)
         self.num_offloaded_blocks = self._make_buffer(self.max_num_reqs, dtype=torch.int32)
         self.req_ids_tensor = self._make_buffer(self.max_num_reqs, dtype=torch.int64)
+        self.tail_req_indices = self._make_buffer(self.max_num_reqs, dtype=torch.int32)
         self.token_to_req = self._make_buffer(self.max_num_tokens, dtype=torch.int32)
         self.tokens_per_req = self._make_buffer(self.max_num_reqs, dtype=torch.int32)
+        self._sfa_tail_req_slots: dict[str, int] = {}
+        self._sfa_free_tail_slots: list[int] = list(range(self.max_num_reqs))
 
     @property
     def use_cp(self) -> bool:
@@ -1454,16 +1457,23 @@ class NPUModelRunner(GPUModelRunner):
                 :total_num_scheduled_tokens
             ]
             self.token_to_req.copy_to_gpu(total_num_scheduled_tokens)
+            req_ids = self.input_batch.req_ids[:num_reqs]
+            tail_req_indices = self._update_sfa_tail_req_indices(req_ids)
+            self.tail_req_indices.np[:num_reqs] = np.array(
+                tail_req_indices,
+                dtype=np.int32,
+            )
+            self.tail_req_indices.copy_to_gpu(num_reqs)
             req_ids_uint32 = [
                 zlib.adler32(req_id.encode("utf-8"))
-                for req_id in self.input_batch.req_ids[:num_reqs]
+                for req_id in req_ids
             ]
             self.req_ids_tensor.np[:num_reqs] = np.array(
                 req_ids_uint32,
                 dtype=np.int64,
             )
             self.req_ids_tensor.copy_to_gpu(num_reqs)
-            set_connector_req_ids(self.input_batch.req_ids[:num_reqs])
+            set_connector_req_ids(req_ids, tail_req_indices)
 
         return (
             logits_indices,
@@ -1471,6 +1481,30 @@ class NPUModelRunner(GPUModelRunner):
             total_num_scheduled_tokens,
             num_scheduled_tokens_compressed_list
         )
+
+    def _update_sfa_tail_req_indices(self, req_ids: list[str]) -> list[int]:
+        active_req_ids = set(req_ids)
+        stale_req_ids = [
+            req_id for req_id in self._sfa_tail_req_slots
+            if req_id not in active_req_ids
+        ]
+        for req_id in stale_req_ids:
+            self._sfa_free_tail_slots.append(self._sfa_tail_req_slots.pop(req_id))
+        self._sfa_free_tail_slots.sort()
+
+        tail_indices: list[int] = []
+        for req_id in req_ids:
+            tail_index = self._sfa_tail_req_slots.get(req_id)
+            if tail_index is None:
+                if not self._sfa_free_tail_slots:
+                    raise RuntimeError(
+                        "No free SFA tail cache request slots; "
+                        f"max_num_reqs={self.max_num_reqs}"
+                    )
+                tail_index = self._sfa_free_tail_slots.pop(0)
+                self._sfa_tail_req_slots[req_id] = tail_index
+            tail_indices.append(tail_index)
+        return tail_indices
 
     def _rebuild_input_ids_with_corrected_positions(
         self,
@@ -3336,6 +3370,9 @@ class NPUModelRunner(GPUModelRunner):
             if self.ascend_config.use_offload
             else None,
             req_ids_tensor=self.req_ids_tensor.gpu[:num_reqs]
+            if self.ascend_config.use_offload
+            else None,
+            tail_req_indices=self.tail_req_indices.gpu[:num_reqs]
             if self.ascend_config.use_offload
             else None,
             token_to_req=self.token_to_req.gpu[:num_tokens]

@@ -295,11 +295,15 @@ class AscendMultiConnector(MultiConnector, SupportsHMA):
             ) or handled
         return handled
 
-    def set_req_ids(self, req_ids: list[str]) -> None:
+    def set_req_ids(
+        self,
+        req_ids: list[str],
+        tail_req_indices: list[int] | None = None,
+    ) -> None:
         for c in self._connectors:
             hook = getattr(c, "set_req_ids", None)
             if hook is not None:
-                hook(req_ids)
+                hook(req_ids, tail_req_indices)
 
     def get_num_new_matched_tokens(
         self,

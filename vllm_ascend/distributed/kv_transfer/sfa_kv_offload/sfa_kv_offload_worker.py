@@ -190,6 +190,7 @@ class SFAKVOffloadWorker:
         )
         self.actual_seq_len_q = torch.arange(self.max_num_reqs, dtype=torch.int32, device='cpu', pin_memory=True) + 1
         self.req_ids = []
+        self.req_id_to_tail_index: dict[str, int] = {}
 
         self.cpu_sparse_attn = cpu_sparse_attn
 
@@ -597,8 +598,18 @@ class SFAKVOffloadWorker:
         self.pending_save_layer_ids.clear()
         self.submitted_save_layer_ids.clear()
 
-    def set_req_ids(self, req_ids: list):
+    def set_req_ids(
+        self,
+        req_ids: list,
+        tail_req_indices: list[int] | None = None,
+    ):
         self.req_ids = req_ids
+        if tail_req_indices is None:
+            tail_req_indices = list(range(len(req_ids)))
+        self.req_id_to_tail_index = {
+            req_id: int(tail_req_index)
+            for req_id, tail_req_index in zip(req_ids, tail_req_indices)
+        }
 
     def prepare_lru_resident_and_load_cpu(self, args):
         (
@@ -793,10 +804,7 @@ class SFAKVOffloadWorker:
         return True
 
     def _get_tail_req_index(self, req_id: str) -> int | None:
-        try:
-            return self.req_ids.index(req_id)
-        except ValueError:
-            return None
+        return self.req_id_to_tail_index.get(req_id)
 
     def process_layer_data(self, request: ReqMeta) -> Generator[
         Optional[torch.Tensor], None, None]:

@@ -235,6 +235,7 @@ class AscendCommonAttentionMetadata(CommonAttentionMetadata):
     slot_mappings_by_group: list[torch.Tensor] | None = None
     num_offloaded_blocks: torch.Tensor | None = None
     req_ids_tensor: torch.Tensor | None = None
+    tail_req_indices: torch.Tensor | None = None
     token_to_req: torch.Tensor | None = None
     tokens_per_req: torch.Tensor | None = None
 
@@ -294,6 +295,7 @@ class AscendCommonAttentionMetadata(CommonAttentionMetadata):
             slot_mappings_by_group=self.slot_mappings_by_group,
             num_offloaded_blocks=_slice_reqs(self.num_offloaded_blocks),
             req_ids_tensor=_slice_reqs(self.req_ids_tensor),
+            tail_req_indices=_slice_reqs(self.tail_req_indices),
             token_to_req=self.token_to_req[:num_actual_tokens]
             if self.token_to_req is not None
             else None,
@@ -448,14 +450,17 @@ def maybe_save_kv_layer_to_connector(
     connector.save_kv_layer(layer_name, kv_cache_layer, attn_metadata)
 
 
-def set_connector_req_ids(req_ids):
+def set_connector_req_ids(
+    req_ids,
+    tail_req_indices: list[int] | None = None,
+):
     if not has_kv_transfer_group() or not is_v1_kv_transfer_group():
         return
 
     connector = get_kv_transfer_group()
     hook = getattr(connector, "set_req_ids", None)
     if hook is not None:
-        hook(req_ids)
+        hook(req_ids, tail_req_indices)
 
 
 def maybe_prepare_lru_resident_and_load_graph(

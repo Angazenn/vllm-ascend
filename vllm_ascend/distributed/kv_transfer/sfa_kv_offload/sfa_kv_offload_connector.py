@@ -123,8 +123,12 @@ class SFAKVOffloadConnector(KVConnectorBase_V1, SupportsHMA):
             capturing,
         )
 
-    def set_req_ids(self, req_ids: list):
-        return self.connector_worker.set_req_ids(req_ids)
+    def set_req_ids(
+        self,
+        req_ids: list,
+        tail_req_indices: list[int] | None = None,
+    ):
+        return self.connector_worker.set_req_ids(req_ids, tail_req_indices)
 
     def get_finished(self, finished_req_ids: set[str]) -> tuple[set[str], set[str]]:
         # In sfa kv offload, we don't need delay free, thus no need to return finished_send/recv too.

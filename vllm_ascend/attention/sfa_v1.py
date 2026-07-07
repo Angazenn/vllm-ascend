@@ -232,6 +232,7 @@ class AscendSFAMetadata:
     slot_mappings_by_group: list[torch.Tensor] | None = None
     num_offloaded_blocks: torch.Tensor | None = None
     req_ids_tensor: torch.Tensor | None = None
+    tail_req_indices: torch.Tensor | None = None
     token_to_req: torch.Tensor | None = None
     tokens_per_req: torch.Tensor | None = None
 
@@ -518,6 +519,7 @@ class AscendSFAMetadataBuilder(MLACommonMetadataBuilder[AscendSFAMetadata]):
             num_prefills=num_prefills,
             num_offloaded_blocks=common_attn_metadata.num_offloaded_blocks,
             req_ids_tensor=common_attn_metadata.req_ids_tensor,
+            tail_req_indices=common_attn_metadata.tail_req_indices,
             token_to_req=common_attn_metadata.token_to_req,
             tokens_per_req=common_attn_metadata.tokens_per_req,
         )
@@ -1511,9 +1513,14 @@ class AscendSFAImpl(MLAAttentionImpl):
         ].to(torch.int64)
         positions = attn_metadata.positions[:num_tokens].to(torch.int64)
         token_to_req = attn_metadata.token_to_req[:num_tokens].to(torch.int64)
+        if attn_metadata.tail_req_indices is not None:
+            tail_req_indices = attn_metadata.tail_req_indices.to(torch.int64)
+            tail_req_index = tail_req_indices[token_to_req]
+        else:
+            tail_req_index = token_to_req
 
         tail_block_ids = (
-            token_to_req * self.tail_window_blocks
+            tail_req_index * self.tail_window_blocks
             + torch.div(
                 positions,
                 self.block_size,
@@ -1576,6 +1583,15 @@ class AscendSFAImpl(MLAAttentionImpl):
         token_to_req_index = token_to_req.long()
 
         seq_lens = attn_metadata.seq_lens[:num_reqs]
+        tail_req_indices = (
+            attn_metadata.tail_req_indices[:num_reqs].to(torch.int32)
+            if attn_metadata.tail_req_indices is not None
+            else torch.arange(
+                num_reqs,
+                dtype=torch.int32,
+                device=topk_indices.device,
+            )
+        )
         logical_blocks = torch.div(
             seq_lens + self.block_size - 1,
             self.block_size,
@@ -1609,7 +1625,7 @@ class AscendSFAImpl(MLAAttentionImpl):
                 seq_lens[:num_reqs] - tail_start_tokens[:num_reqs]
             ).to(torch.int32)
             tail_block_table = (
-                self.tail_block_table[:num_reqs, :1]
+                tail_req_indices.unsqueeze(1) * self.tail_window_blocks
                 + (
                     tail_start_blocks[:num_reqs].to(torch.int32).unsqueeze(1)
                     + self.tail_block_offsets
