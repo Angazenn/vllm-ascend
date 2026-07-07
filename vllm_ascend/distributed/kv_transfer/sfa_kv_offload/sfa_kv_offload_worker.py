@@ -284,17 +284,26 @@ class SFAKVOffloadWorker:
             self.v_caches_npu: list[torch.Tensor] = []
             self.topk_buffers_k: list[torch.Tensor] = []
             self.topk_buffers_v: list[torch.Tensor] = []
+            self.tail_k_caches_npu: list[torch.Tensor | None] = []
+            self.tail_v_caches_npu: list[torch.Tensor | None] = []
+            self.tail_window_blocks = 2
             for layer_name in self.offload_layer_names:
                 cache_or_caches = self._as_cache_tuple(kv_caches[layer_name])
-                # SFA offload tuple: CPU saves currently read normal KV
-                # [0:2], decode LRU loads fill top-k buffers [3:5].
-                # Tail buffers [5:7] are the source for the planned
-                # full-block tail-window offload fix.
+                # SFA offload tuple: CPU saves read normal KV [0:2] for
+                # ordinary/prefill blocks and tail buffers [5:7] for decode
+                # blocks that just became full. Decode LRU loads fill top-k
+                # buffers [3:5].
                 assert len(cache_or_caches) >= 5
                 self.k_caches_npu.append(cache_or_caches[0])
                 self.v_caches_npu.append(cache_or_caches[1])
                 self.topk_buffers_k.append(cache_or_caches[3])
                 self.topk_buffers_v.append(cache_or_caches[4])
+                if len(cache_or_caches) >= 7:
+                    self.tail_k_caches_npu.append(cache_or_caches[5])
+                    self.tail_v_caches_npu.append(cache_or_caches[6])
+                else:
+                    self.tail_k_caches_npu.append(None)
+                    self.tail_v_caches_npu.append(None)
 
             if self.use_layerwise:
                 ready_event = threading.Event()
@@ -783,28 +792,86 @@ class SFAKVOffloadWorker:
         current_slots_npu[:num_tokens].copy_(current_slots_cpu, non_blocking=capturing)
         return True
 
+    def _get_tail_req_index(self, req_id: str) -> int | None:
+        try:
+            return self.req_ids.index(req_id)
+        except ValueError:
+            return None
+
     def process_layer_data(self, request: ReqMeta) -> Generator[
         Optional[torch.Tensor], None, None]:
         """
         Generate kv offload related metadata.
         """
         num_new_offload_blocks = request.num_new_offload_blocks
+        untrimmed_num_npu_blocks = len(request.block_ids_npu)
         block_ids_npu = request.block_ids_npu
         block_ids_cpu = request.block_ids_cpu
         if len(block_ids_npu) > len(block_ids_cpu):
             # in most cases block_ids_npu has one more unfull block, remove it
             block_ids_npu = block_ids_npu[:-1]
         assert len(block_ids_npu) == len(block_ids_cpu)
+        first_new_logical_block = len(block_ids_cpu) - num_new_offload_blocks
+        new_logical_blocks = list(
+            range(first_new_logical_block, len(block_ids_cpu))
+        )
         block_ids_npu = block_ids_npu[-num_new_offload_blocks:]
         block_ids_cpu = block_ids_cpu[-num_new_offload_blocks:]
+        tail_start_logical_block = max(
+            untrimmed_num_npu_blocks - self.tail_window_blocks,
+            0,
+        )
+        tail_req_index = self._get_tail_req_index(request.req_id)
 
         for layer_id in range(self.num_layers):
-            req_meta_save = LayerMultiBlockReqMeta(
-                request.req_id,
-                layer_id,
-                block_ids_npu=block_ids_npu,
-                block_ids_cpu=block_ids_cpu,
-                cache_npu=(self.k_caches_npu[layer_id], self.v_caches_npu[layer_id]),
-                cache_cpu=(self.k_caches_cpu[layer_id], self.v_caches_cpu[layer_id]),
-            )
-            self.layer_save_tasks[layer_id].append(req_meta_save)
+            normal_block_ids_npu: list[int] = []
+            normal_block_ids_cpu: list[int] = []
+            tail_block_ids_npu: list[int] = []
+            tail_block_ids_cpu: list[int] = []
+            tail_k_cache = self.tail_k_caches_npu[layer_id]
+            tail_v_cache = self.tail_v_caches_npu[layer_id]
+
+            for logical_block_id, npu_block_id, cpu_block_id in zip(
+                new_logical_blocks,
+                block_ids_npu,
+                block_ids_cpu,
+            ):
+                use_tail_source = (
+                    tail_req_index is not None
+                    and tail_k_cache is not None
+                    and tail_v_cache is not None
+                    and logical_block_id >= tail_start_logical_block
+                )
+                if use_tail_source:
+                    tail_block_id = (
+                        tail_req_index * self.tail_window_blocks
+                        + logical_block_id % self.tail_window_blocks
+                    )
+                    tail_block_ids_npu.append(tail_block_id)
+                    tail_block_ids_cpu.append(cpu_block_id)
+                else:
+                    normal_block_ids_npu.append(npu_block_id)
+                    normal_block_ids_cpu.append(cpu_block_id)
+
+            if normal_block_ids_cpu:
+                req_meta_save = LayerMultiBlockReqMeta(
+                    request.req_id,
+                    layer_id,
+                    block_ids_npu=normal_block_ids_npu,
+                    block_ids_cpu=normal_block_ids_cpu,
+                    cache_npu=(self.k_caches_npu[layer_id], self.v_caches_npu[layer_id]),
+                    cache_cpu=(self.k_caches_cpu[layer_id], self.v_caches_cpu[layer_id]),
+                )
+                self.layer_save_tasks[layer_id].append(req_meta_save)
+            if tail_block_ids_cpu:
+                assert tail_k_cache is not None
+                assert tail_v_cache is not None
+                req_meta_save = LayerMultiBlockReqMeta(
+                    request.req_id,
+                    layer_id,
+                    block_ids_npu=tail_block_ids_npu,
+                    block_ids_cpu=tail_block_ids_cpu,
+                    cache_npu=(tail_k_cache, tail_v_cache),
+                    cache_cpu=(self.k_caches_cpu[layer_id], self.v_caches_cpu[layer_id]),
+                )
+                self.layer_save_tasks[layer_id].append(req_meta_save)
