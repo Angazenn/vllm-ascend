@@ -3,7 +3,6 @@
 
 from types import SimpleNamespace
 
-import pytest
 import torch
 
 from vllm_ascend.core.kv_cache_interface import (
@@ -97,11 +96,76 @@ def test_sfa_hybrid_config_keeps_alias_layers_on_shared_physical_tensors():
     ]
 
 
-def test_sfa_hybrid_indexer_residue_layout_must_cover_all_groups():
+def test_sfa_hybrid_groups_allow_sparse_real_indexer_layer_ids():
     vllm_config = _make_config()
 
-    with pytest.raises(ValueError, match="cover every layer_id"):
-        _ascend_get_kv_cache_groups(
-            vllm_config,
-            _make_specs(indexer_layer_ids=(0, 2)),
-        )
+    groups = _ascend_get_kv_cache_groups(
+        vllm_config,
+        _make_specs(indexer_layer_ids=(0, 2)),
+    )
+
+    assert len(groups) == 3
+    assert [group.layer_names for group in groups[:2]] == [
+        ["model.layers.0.self_attn.indexer.k_cache"],
+        ["model.layers.2.self_attn.indexer.k_cache"],
+    ]
+
+
+def test_sfa_hybrid_groups_support_glm52_shared_indexer_pattern():
+    indexer_layer_ids = (
+        0,
+        1,
+        2,
+        6,
+        10,
+        14,
+        18,
+        22,
+        26,
+        30,
+        34,
+        38,
+        42,
+        46,
+        50,
+        54,
+        58,
+        62,
+        66,
+        70,
+        74,
+    )
+    vllm_config = _make_config(num_layers=80)
+
+    groups = _ascend_get_kv_cache_groups(
+        vllm_config,
+        _make_specs(num_layers=80, indexer_layer_ids=indexer_layer_ids),
+    )
+
+    assert len(groups) == len(indexer_layer_ids) + 1
+    assert [group.layer_names[0] for group in groups[:-1]] == [
+        f"model.layers.{layer_id}.self_attn.indexer.k_cache"
+        for layer_id in indexer_layer_ids
+    ]
+    assert groups[-1].layer_names == [
+        f"model.layers.{layer_id}.self_attn" for layer_id in range(80)
+    ]
+
+    config = _get_sfa_hybrid_kv_cache_config_from_groups(
+        vllm_config,
+        groups,
+        available_memory=48 * 80 * 3,
+    )
+
+    assert config is not None
+    assert len(config.kv_cache_groups) == len(indexer_layer_ids) + 1
+    assert len(config.kv_cache_tensors) == 4
+    assert "model.layers.6.self_attn.indexer.k_cache" in (
+        config.kv_cache_tensors[0].shared_by
+    )
+    assert "model.layers.22.self_attn.indexer.k_cache" in (
+        config.kv_cache_tensors[1].shared_by
+    )
+    assert "model.layers.74.self_attn.indexer.k_cache" in (
+        config.kv_cache_tensors[3].shared_by
+    )

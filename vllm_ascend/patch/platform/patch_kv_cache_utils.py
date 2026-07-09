@@ -202,20 +202,24 @@ def _get_sfa_indexer_group_count(indexer_layers_by_id: dict[int, str]) -> int:
     return len(indexer_layers_by_id)
 
 
-def _validate_sfa_indexer_residue_layout(
+def _get_sfa_indexer_group_layer_ids(
     indexer_layers_by_id: dict[int, str],
-    indexer_group_count: int,
-) -> None:
-    residues = {layer_id % indexer_group_count for layer_id in indexer_layers_by_id}
-    expected = set(range(indexer_group_count))
-    if residues != expected:
-        raise ValueError(
-            "SFA hybrid cache layout expected real indexer cache layers to "
-            "cover every layer_id % indexer_group_count residue. "
-            f"indexer_group_count={indexer_group_count}, "
-            f"indexer_layer_ids={sorted(indexer_layers_by_id)}, "
-            f"residues={sorted(residues)}, expected={sorted(expected)}."
-        )
+) -> list[int]:
+    return sorted(indexer_layers_by_id)
+
+
+def _validate_sfa_indexer_groups(
+    indexer_groups: list[KVCacheGroupSpec],
+) -> bool:
+    for indexer_group in indexer_groups:
+        if len(indexer_group.layer_names) != 1:
+            logger.warning(
+                "SFA hybrid cache layout expected each real indexer cache "
+                "group to contain exactly one layer, got %s.",
+                indexer_group.layer_names,
+            )
+            return False
+    return True
 
 
 def _ascend_get_kv_cache_groups(
@@ -231,26 +235,13 @@ def _ascend_get_kv_cache_groups(
 
     total_layers, kv_layers_by_id, indexer_layers_by_id = split_layers
     indexer_group_count = _get_sfa_indexer_group_count(indexer_layers_by_id)
-    _validate_sfa_indexer_residue_layout(
-        indexer_layers_by_id,
-        indexer_group_count,
-    )
 
     grouped_layer_names: list[list[str]] = []
-    for group_id in range(indexer_group_count):
-        group_layer_names = [
-            indexer_layers_by_id[layer_id]
-            for layer_id in sorted(indexer_layers_by_id)
-            if layer_id % indexer_group_count == group_id
-        ]
-        if not group_layer_names:
-            logger.warning(
-                "SFA hybrid cache layout expected indexer group %d to have "
-                "at least one layer; falling back to vLLM cache grouping.",
-                group_id,
-            )
-            return _orig_get_kv_cache_groups(vllm_config, kv_cache_spec)
-        grouped_layer_names.append(group_layer_names)
+    indexer_group_layer_ids = _get_sfa_indexer_group_layer_ids(
+        indexer_layers_by_id
+    )
+    for layer_id in indexer_group_layer_ids:
+        grouped_layer_names.append([indexer_layers_by_id[layer_id]])
 
     grouped_layer_names.append(
         [kv_layers_by_id[layer_id] for layer_id in sorted(kv_layers_by_id)]
@@ -263,7 +254,7 @@ def _ascend_get_kv_cache_groups(
         "(%d layers, real indexer layers=%s)",
         indexer_group_count,
         total_layers,
-        sorted(indexer_layers_by_id),
+        indexer_group_layer_ids,
     )
     return kv_cache_groups
 
@@ -289,6 +280,8 @@ def _get_sfa_hybrid_kv_cache_config_from_groups(
     ]
     if not indexer_groups or len(kv_groups) != 1:
         return None
+    if not _validate_sfa_indexer_groups(indexer_groups):
+        return None
 
     kv_group = kv_groups[0]
     kv_layers_by_id = {
@@ -310,10 +303,6 @@ def _get_sfa_hybrid_kv_cache_config_from_groups(
         vllm_config, set(kv_layers_by_id) | set(indexer_layers_by_id)
     )
     indexer_group_count = _get_sfa_indexer_group_count(indexer_layers_by_id)
-    _validate_sfa_indexer_residue_layout(
-        indexer_layers_by_id,
-        indexer_group_count,
-    )
     if len(indexer_groups) != indexer_group_count:
         return None
 
