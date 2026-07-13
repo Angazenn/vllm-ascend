@@ -568,7 +568,6 @@ class BaseDeviceAdaptor:
         use_offload = getattr(sfa_impl, "use_offload", False)
         if use_offload:
             indexer_cache_idx = 2
-            indexer_scale_cache_idx = 5
         elif packed_kv_cache:
             indexer_cache_idx = 1
             indexer_scale_cache_idx = 2
@@ -577,11 +576,8 @@ class BaseDeviceAdaptor:
             indexer_scale_cache_idx = 3
 
         if use_sparse_c8_indexer:
-            # NOTE: use_sparse_c8_indexer is a global flag. Under offload the
-            # per-layer C8 layout (six-tuple) is enforced uniform across all
-            # sparse layers by SFAKVOffloadWorker._register_offload_layers
-            # (mixed 5/6 tuples raise there), so this global gate is safe.
-            assert len(kv_cache) == (6 if use_offload else (3 if packed_kv_cache else 4))
+            assert not use_offload
+            assert len(kv_cache) == (3 if packed_kv_cache else 4)
             assert q_li_scale is not None
             assert q_li_shape_ori is not None
             weights = weights.to(torch.float16)
@@ -1763,7 +1759,6 @@ class A5DeviceAdaptor(BaseDeviceAdaptor):
         use_offload = getattr(sfa_impl, "use_offload", False)
         if use_offload:
             indexer_cache_idx = 2
-            indexer_scale_cache_idx = 5
         elif packed_kv_cache:
             indexer_cache_idx = 1
             indexer_scale_cache_idx = 2
@@ -1772,11 +1767,8 @@ class A5DeviceAdaptor(BaseDeviceAdaptor):
             indexer_scale_cache_idx = 3
 
         if use_sparse_c8_indexer:
-            # NOTE: use_sparse_c8_indexer is a global flag. Under offload the
-            # per-layer C8 layout (six-tuple) is enforced uniform across all
-            # sparse layers by SFAKVOffloadWorker._register_offload_layers
-            # (mixed 5/6 tuples raise there), so this global gate is safe.
-            assert len(kv_cache) == (6 if use_offload else (3 if packed_kv_cache else 4))
+            assert not use_offload
+            assert len(kv_cache) == (3 if packed_kv_cache else 4)
             assert q_li_shape_ori is not None
 
             if q_li_scale is not None:

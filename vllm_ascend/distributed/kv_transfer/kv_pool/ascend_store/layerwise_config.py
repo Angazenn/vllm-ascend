@@ -2,6 +2,8 @@ from collections.abc import Iterable
 from dataclasses import dataclass
 from typing import Any
 
+from vllm.utils.math_utils import cdiv
+
 _EXTRA_CONFIG_KEY_NUM_SHARED_BUFFERS = "layerwise_num_shared_buffers"
 _EXTRA_CONFIG_KEY_PREFETCH_LAYERS = "layerwise_prefetch_layers"
 _EXTRA_CONFIG_KEY_INDEPENDENT_LAYERS = "layerwise_independent_layers"
@@ -10,6 +12,36 @@ _EXTRA_CONFIG_KEY_INDEPENDENT_LAYERS = "layerwise_independent_layers"
 # load gates on its mate num_shared_buffers layers back). Capped so a very large
 # num_shared_buffers doesn't burst-submit too many loads at layer 0.
 _DEFAULT_MAX_PREFETCH_LAYERS = 8
+
+
+def get_sfa_indexer_groups(
+    indexer_layer_names: list[str], num_physical_pools: int
+) -> list[list[str]]:
+    """Compact active indexers into groups no wider than the pool count."""
+    if num_physical_pools < 1:
+        raise ValueError("num_physical_pools must be at least one")
+    if not indexer_layer_names:
+        return []
+    num_groups = cdiv(len(indexer_layer_names), num_physical_pools)
+    return [indexer_layer_names[i::num_groups] for i in range(num_groups)]
+
+
+def merge_sfa_physical_pool_owners(
+    main_layer_names: list[str],
+    main_storage_indices: list[list[int]],
+    indexer_groups: list[list[str]],
+) -> list[list[str]]:
+    """Add each indexer group's positional owners to the main KV pools."""
+    pools = [
+        [main_layer_names[layer_idx] for layer_idx in slot]
+        for slot in main_storage_indices
+    ]
+    for group in indexer_groups:
+        if len(group) > len(pools):
+            raise ValueError("SFA indexer group is wider than the physical pool")
+        for pool_idx, layer_name in enumerate(group):
+            pools[pool_idx].append(layer_name)
+    return pools
 
 
 @dataclass(frozen=True)

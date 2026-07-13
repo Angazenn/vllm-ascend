@@ -1,3 +1,4 @@
+from dataclasses import dataclass
 from typing import Any
 
 import torch
@@ -5,6 +6,7 @@ from vllm.config import VllmConfig
 from vllm.v1.attention.backend import (
     AttentionBackend,
     AttentionCGSupport,
+    AttentionMetadata,
     AttentionMetadataBuilder,
     CommonAttentionMetadata,
 )
@@ -83,3 +85,43 @@ class AscendSFAIndexerMetadataBuilder(AttentionMetadataBuilder[Any]):
         fast_build: bool = False,
     ) -> None:
         return None
+
+
+@dataclass
+class AscendSFALayerwiseIndexerMetadata(AttentionMetadata):
+    block_table_tensor: torch.Tensor
+    slot_mapping: torch.Tensor
+
+
+class AscendSFALayerwiseIndexerMetadataBuilder(
+    AscendSFAIndexerMetadataBuilder
+):
+    """Expose addressing from the indexer's own layerwise cache group."""
+
+    def build(
+        self,
+        common_prefix_len: int,
+        common_attn_metadata: CommonAttentionMetadata,
+        fast_build: bool = False,
+        **kwargs,
+    ) -> AscendSFALayerwiseIndexerMetadata:
+        num_reqs = common_attn_metadata.num_reqs
+        num_tokens = getattr(
+            common_attn_metadata,
+            "num_input_tokens",
+            common_attn_metadata.num_actual_tokens,
+        )
+        return AscendSFALayerwiseIndexerMetadata(
+            block_table_tensor=common_attn_metadata.block_table_tensor[:num_reqs],
+            slot_mapping=common_attn_metadata.slot_mapping[:num_tokens],
+        )
+
+
+class AscendSFALayerwiseIndexerBackend(AscendSFAIndexerBackend):
+    @staticmethod
+    def get_name() -> str:
+        return "ASCEND_SFA_LAYERWISE_INDEXER"
+
+    @staticmethod
+    def get_builder_cls():
+        return AscendSFALayerwiseIndexerMetadataBuilder

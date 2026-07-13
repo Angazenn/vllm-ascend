@@ -20,6 +20,94 @@ from vllm.v1.kv_cache_interface import (
 from vllm_ascend.utils import vllm_version_is
 
 _orig_resolve_kv_cache_block_sizes = vllm.v1.core.kv_cache_utils.resolve_kv_cache_block_sizes
+_orig_get_kv_cache_groups = vllm.v1.core.kv_cache_utils.get_kv_cache_groups
+
+
+def _get_glm_sfa_layerwise_kv_cache_groups(
+    vllm_config: VllmConfig,
+    kv_cache_spec: dict[str, KVCacheSpec],
+) -> list[KVCacheGroupSpec] | None:
+    """Build BF16 GLM SFA groups for layerwise AscendStore reuse."""
+    from vllm_ascend.core.kv_cache_interface import (
+        AscendMLAAttentionSpec,
+        AscendSFALayerwiseIndexerCacheSpec,
+    )
+    from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.layerwise_config import (
+        get_layerwise_storage_indices,
+        get_sfa_indexer_groups,
+    )
+
+    transfer_config = vllm_config.kv_transfer_config
+    if (
+        transfer_config is None
+        or transfer_config.kv_connector != "AscendStoreConnector"
+        or not transfer_config.kv_connector_extra_config.get(
+            "use_layerwise", False
+        )
+        or getattr(vllm_config.model_config.hf_text_config, "model_type", None)
+        != "glm_moe_dsa"
+    ):
+        return None
+
+    main_names = [
+        name
+        for name, spec in kv_cache_spec.items()
+        if isinstance(spec, AscendMLAAttentionSpec)
+    ]
+    indexer_names = [
+        name
+        for name, spec in kv_cache_spec.items()
+        if isinstance(spec, AscendSFALayerwiseIndexerCacheSpec)
+    ]
+    if not main_names or not indexer_names:
+        return None
+    if len(main_names) + len(indexer_names) != len(kv_cache_spec):
+        return None
+    if (
+        vllm_config.parallel_config.decode_context_parallel_size != 1
+        or vllm_config.parallel_config.prefill_context_parallel_size != 1
+    ):
+        raise ValueError(
+            "GLM SFA layerwise AscendStore cache reuse requires DCP=1 and PCP=1"
+        )
+
+    def layer_id(name: str) -> int:
+        return int(name.split(".layers.", 1)[1].split(".", 1)[0])
+
+    main_names.sort(key=layer_id)
+    indexer_names.sort(key=layer_id)
+    num_pools = len(
+        get_layerwise_storage_indices(
+            len(main_names), transfer_config.kv_connector_extra_config
+        )
+    )
+    specs = vllm.v1.core.kv_cache_utils.unify_kv_cache_spec_page_size(
+        kv_cache_spec
+    )
+    groups = [
+        vllm.v1.core.kv_cache_utils.create_kv_cache_group_specs(
+            specs, [main_names]
+        )[0]
+    ]
+    indexer_groups = get_sfa_indexer_groups(indexer_names, num_pools)
+    groups.extend(
+        vllm.v1.core.kv_cache_utils.create_kv_cache_group_specs(
+            specs, indexer_groups
+        )
+    )
+    return groups
+
+
+def get_kv_cache_groups(
+    vllm_config: VllmConfig,
+    kv_cache_spec: dict[str, KVCacheSpec],
+) -> list[KVCacheGroupSpec]:
+    groups = _get_glm_sfa_layerwise_kv_cache_groups(
+        vllm_config, kv_cache_spec
+    )
+    if groups is not None:
+        return groups
+    return _orig_get_kv_cache_groups(vllm_config, kv_cache_spec)
 
 
 def _ascend_resolve_kv_cache_block_sizes(
@@ -250,6 +338,7 @@ def _get_kv_cache_config_deepseek_v4(
 
 
 vllm.v1.core.kv_cache_utils.resolve_kv_cache_block_sizes = _ascend_resolve_kv_cache_block_sizes
+vllm.v1.core.kv_cache_utils.get_kv_cache_groups = get_kv_cache_groups
 vllm.v1.core.kv_cache_utils.group_and_unify_kv_cache_specs = group_and_unify_kv_cache_specs
 vllm.v1.core.kv_cache_utils._get_kv_cache_groups_uniform_groups = _get_kv_cache_groups_uniform_groups
 # vllm v0.24.0 renamed _get_kv_cache_config_deepseek_v4 to _get_kv_cache_config_packed and

@@ -24,6 +24,10 @@ from vllm.v1.kv_cache_interface import (
     UniformTypeKVCacheSpecs,
 )
 
+from vllm_ascend.core.kv_cache_interface import (
+    AscendMLAAttentionSpec,
+    AscendSFALayerwiseIndexerCacheSpec,
+)
 from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.backend import (
     backend_map,
 )
@@ -172,11 +176,28 @@ class KVPoolWorker:
         self.block_size = self.grouped_block_size[0]
         self.lcm_block_size = math.lcm(*self.grouped_block_size)
         self.num_kv_cache_groups = len(self.grouped_block_size)
+        self.use_sfa_layerwise_groups = bool(
+            self.use_layerwise
+            and kv_cache_config is not None
+            and any(
+                isinstance(
+                    group.kv_cache_spec,
+                    AscendSFALayerwiseIndexerCacheSpec,
+                )
+                for group in kv_cache_config.kv_cache_groups
+            )
+        )
         self.kv_cache_group_families = self._infer_group_families()
         self.group_uses_align_state = self._infer_group_uses_align_state()
         self.cache_transfer_granularity = self._infer_cache_transfer_granularity()
-        if self.use_layerwise and self.num_kv_cache_groups > 1:
+        if (
+            self.use_layerwise
+            and self.num_kv_cache_groups > 1
+            and not self.use_sfa_layerwise_groups
+        ):
             raise NotImplementedError("AscendStore layerwise mode does not yet support hybrid KV cache groups.")
+        if self.use_sfa_layerwise_groups:
+            self.use_gva_layerwise = False
         self.h2d_stagger_us = int(extra_config.get("h2d_stagger_us", 0))
         self.layerwise_max_transfer_blocks = int(extra_config.get("layerwise_max_transfer_blocks", 0))
         self.layerwise_max_transfer_bytes = int(extra_config.get("layerwise_max_transfer_bytes", 0))
@@ -315,6 +336,11 @@ class KVPoolWorker:
             return
 
         if self.use_layerwise:
+            transfer_block_size = (
+                self.grouped_block_size
+                if self.use_sfa_layerwise_groups
+                else self.block_size
+            )
             self.get_event = threading.Event()
             self.layer_load_finished_events = [threading.Event() for i in range(self.num_layers)]
             self.layer_save_finished_events = [threading.Event() for i in range(self.num_layers)]
@@ -324,7 +350,7 @@ class KVPoolWorker:
                 self.kv_send_thread = KVCacheStoreLayerSendingThread(
                     self.m_store,
                     self.token_database,
-                    self.block_size,
+                    transfer_block_size,
                     self.tp_rank,
                     self.tp_size,
                     self.dcp_size,
@@ -348,7 +374,7 @@ class KVPoolWorker:
                 self.kv_send_thread = KVCacheStoreKeyLayerSendingThread(
                     self.m_store,
                     self.token_database,
-                    self.block_size,
+                    transfer_block_size,
                     self.tp_rank,
                     self.tp_size,
                     self.dcp_size,
@@ -365,7 +391,7 @@ class KVPoolWorker:
                 self.kv_recv_thread = KVCacheStoreLayerRecvingThread(
                     self.m_store,
                     self.token_database,
-                    self.block_size,
+                    transfer_block_size,
                     self.tp_rank,
                     self.tp_size,
                     self.dcp_size,
@@ -385,7 +411,7 @@ class KVPoolWorker:
                 self.kv_recv_thread = KVCacheStoreKeyLayerRecvingThread(
                     self.m_store,
                     self.token_database,
-                    self.block_size,
+                    transfer_block_size,
                     self.tp_rank,
                     self.tp_size,
                     self.dcp_size,
@@ -515,6 +541,14 @@ class KVPoolWorker:
             return False
         if getattr(vllm_config.scheduler_config, "disable_hybrid_kv_cache_manager", False):
             return False
+        if any(
+            isinstance(
+                group.kv_cache_spec,
+                AscendSFALayerwiseIndexerCacheSpec,
+            )
+            for group in kv_cache_config.kv_cache_groups
+        ):
+            return True
         return len(kv_cache_config.kv_cache_groups) > 1 and any(
             not isinstance(group.kv_cache_spec, FullAttentionSpec) for group in kv_cache_config.kv_cache_groups
         )
@@ -592,6 +626,8 @@ class KVPoolWorker:
             for group_id in range(self.num_kv_cache_groups)
         }
         self.group_num_layers: dict[int, int] = {}
+        self.layerwise_group_owners: dict[int, list[tuple[int, int]]] = {}
+        self.main_kv_group_id = 0
 
         logger.info(
             "Registering KV_Caches. use_mla: %s, use_sparse: %s, shape %s",
@@ -625,6 +661,23 @@ class KVPoolWorker:
         if self.kv_cache_config is not None and self.use_hybrid:
             for group_id, group_spec in enumerate(self.kv_cache_config.kv_cache_groups):
                 self._infer_cache_group_metadata(group_id, group_spec.layer_names)
+                if isinstance(group_spec.kv_cache_spec, AscendMLAAttentionSpec):
+                    self.main_kv_group_id = group_id
+                if self.use_sfa_layerwise_groups:
+                    for group_layer_id, layer_name in enumerate(
+                        group_spec.layer_names
+                    ):
+                        try:
+                            transformer_layer = int(
+                                layer_name.split(".layers.", 1)[1].split(
+                                    ".", 1
+                                )[0]
+                            )
+                        except (IndexError, ValueError):
+                            continue
+                        self.layerwise_group_owners.setdefault(
+                            transformer_layer, []
+                        ).append((group_id, group_layer_id))
         else:
             self._infer_cache_group_metadata(0, list(kv_caches.keys()))
 
@@ -632,7 +685,11 @@ class KVPoolWorker:
         # includes ALL attention layers (main + MTP), so it is the authoritative
         # layer count for this worker.
         original_num_layers = self.num_layers
-        self.num_layers = sum(self.group_num_layers.values())
+        self.num_layers = (
+            self.group_num_layers[self.main_kv_group_id]
+            if self.use_sfa_layerwise_groups
+            else sum(self.group_num_layers.values())
+        )
         if self.num_layers != original_num_layers:
             logger.info(
                 "KVPoolWorker: updated num_layers %d -> %d (includes MTP/spec-decode draft layers).",
@@ -766,80 +823,113 @@ class KVPoolWorker:
         requests: list[ReqMeta],
         layer_id: int,
     ) -> None:
-        request_block_ranges = []
-        for request in requests:
-            if request.can_save is None or not request.can_save:
-                continue
-            save_start_block = request.save_start_token // self.block_size
-            save_end_block = request.save_end_token // self.block_size
-            if save_start_block >= save_end_block and request.partial_block_index is None:
-                continue
-            partial_block_index = request.partial_block_index
-            request_block_ranges.append(
-                LayerBlockRange(
-                    request=request,
-                    start_block=save_start_block,
-                    end_block=save_end_block,
-                    partial_block_index=partial_block_index,
+        owners = self.layerwise_group_owners.get(
+            layer_id, [(self.main_kv_group_id, layer_id)]
+        )
+        for group_id, group_layer_id in owners:
+            group_block_size = self.grouped_block_size[group_id]
+            request_block_ranges = []
+            for request in requests:
+                if request.can_save is None or not request.can_save:
+                    continue
+                save_start_block = request.save_start_token // group_block_size
+                save_end_block = request.save_end_token // group_block_size
+                partial_block_index = None
+                if request.partial_block_index is not None:
+                    partial_token = (
+                        request.partial_block_index * self.block_size
+                    )
+                    partial_block_index = partial_token // group_block_size
+                if (
+                    save_start_block >= save_end_block
+                    and partial_block_index is None
+                ):
+                    continue
+                request_block_ranges.append(
+                    LayerBlockRange(
+                        request=request,
+                        start_block=save_start_block,
+                        end_block=save_end_block,
+                        partial_block_index=partial_block_index,
+                    )
                 )
-            )
-        if request_block_ranges:
-            self.layer_save_tasks[layer_id].append(
-                LayerTransferTask(
-                    layer_id=layer_id,
-                    block_ranges=request_block_ranges,
+            if request_block_ranges:
+                self.layer_save_tasks[layer_id].append(
+                    LayerTransferTask(
+                        layer_id=layer_id,
+                        block_ranges=request_block_ranges,
+                        kv_cache_group_id=group_id,
+                        group_layer_id=group_layer_id,
+                    )
                 )
-            )
 
     def _process_load_for_layer_batch(
         self,
         requests: list[ReqMeta],
         layer_id: int,
     ) -> None:
-        request_block_ranges = []
-        for request in requests:
-            if request.load_spec is None or not request.load_spec.can_load:
-                continue
-            cached_tokens = request.load_spec.kvpool_cached_tokens
-            load_start_block = get_layer_load_start_block(
-                layer_id,
-                self.independent_layers,
-                request.load_spec.vllm_cached_tokens,
-                self.block_size,
-                self.layerwise_offload,
-            )
-            cached_full_blocks = cached_tokens // self.block_size
-            full_blocks = min(cached_full_blocks, len(request.block_hashes))
-            needs_last_block_at_boundary = (
-                cached_tokens > 0 and cached_tokens % self.block_size == 0 and full_blocks < cached_full_blocks
-            )
-            if request.last_block_gva is not None and (
-                cached_tokens % self.block_size != 0 or needs_last_block_at_boundary
-            ):
-                partial_block_index = (
-                    cached_full_blocks if cached_tokens % self.block_size != 0 else cached_full_blocks - 1
+        owners = self.layerwise_group_owners.get(
+            layer_id, [(self.main_kv_group_id, layer_id)]
+        )
+        for group_id, group_layer_id in owners:
+            group_block_size = self.grouped_block_size[group_id]
+            request_block_ranges = []
+            for request in requests:
+                if request.load_spec is None or not request.load_spec.can_load:
+                    continue
+                cached_tokens = request.load_spec.kvpool_cached_tokens
+                if group_id == self.main_kv_group_id:
+                    load_start_block = get_layer_load_start_block(
+                        layer_id,
+                        self.independent_layers,
+                        request.load_spec.vllm_cached_tokens,
+                        group_block_size,
+                        self.layerwise_offload,
+                    )
+                else:
+                    # Indexer pools are shared with main KV pools and cannot
+                    # rely on a previously resident device copy.
+                    load_start_block = 0
+                cached_full_blocks = cached_tokens // group_block_size
+                group_block_ids = (
+                    request.block_ids_by_group[group_id]
+                    if group_id < len(request.block_ids_by_group)
+                    else []
                 )
-            else:
+                full_blocks = min(cached_full_blocks, len(group_block_ids))
                 partial_block_index = None
-            if partial_block_index is not None and partial_block_index < load_start_block:
-                partial_block_index = None
-            if load_start_block >= full_blocks and partial_block_index is None:
-                continue
-            request_block_ranges.append(
-                LayerBlockRange(
-                    request=request,
-                    start_block=load_start_block,
-                    end_block=full_blocks,
-                    partial_block_index=partial_block_index,
+                if (
+                    cached_tokens % group_block_size != 0
+                    and cached_full_blocks < len(group_block_ids)
+                ):
+                    partial_block_index = cached_full_blocks
+                if (
+                    partial_block_index is not None
+                    and partial_block_index < load_start_block
+                ):
+                    partial_block_index = None
+                if (
+                    load_start_block >= full_blocks
+                    and partial_block_index is None
+                ):
+                    continue
+                request_block_ranges.append(
+                    LayerBlockRange(
+                        request=request,
+                        start_block=load_start_block,
+                        end_block=full_blocks,
+                        partial_block_index=partial_block_index,
+                    )
                 )
-            )
-        if request_block_ranges:
-            self.layer_load_tasks[layer_id].append(
-                LayerTransferTask(
-                    layer_id=layer_id,
-                    block_ranges=request_block_ranges,
+            if request_block_ranges:
+                self.layer_load_tasks[layer_id].append(
+                    LayerTransferTask(
+                        layer_id=layer_id,
+                        block_ranges=request_block_ranges,
+                        kv_cache_group_id=group_id,
+                        group_layer_id=group_layer_id,
+                    )
                 )
-            )
 
     def _build_shared_save_data(self) -> None:
         """Build shared block data once and attach to all layer save tasks.
@@ -866,11 +956,22 @@ class KVPoolWorker:
                     for task in self.layer_save_tasks[layer_id]:
                         task.shared_block_data = shared
         elif isinstance(self.kv_send_thread, KVCacheStoreKeyLayerSendingThread):
-            cached = self.kv_send_thread.build_cached_process_tokens(first_task)
-            if cached is not None:
+            if self.use_sfa_layerwise_groups:
                 for layer_id in range(self.num_layers):
                     for task in self.layer_save_tasks[layer_id]:
-                        task.cached_process_tokens = cached
+                        task.cached_process_tokens = (
+                            self.kv_send_thread.build_cached_process_tokens(
+                                task
+                            )
+                        )
+            else:
+                cached = self.kv_send_thread.build_cached_process_tokens(
+                    first_task
+                )
+                if cached is not None:
+                    for layer_id in range(self.num_layers):
+                        for task in self.layer_save_tasks[layer_id]:
+                            task.cached_process_tokens = cached
 
     def _build_shared_load_data(self) -> None:
         """Build shared block data and attach to layer load tasks.
@@ -987,8 +1088,9 @@ class KVPoolWorker:
         send_thread = self.kv_send_thread
         self.sync_save_events[self.current_layer].record()
         if self.layer_save_tasks[self.current_layer]:
-            for block_range in self.layer_save_tasks[self.current_layer][0].block_ranges:
-                send_thread.add_stored_request(block_range.request.req_id)
+            for task in self.layer_save_tasks[self.current_layer]:
+                for block_range in task.block_ranges:
+                    send_thread.add_stored_request(block_range.request.req_id)
             send_thread.add_request(self.layer_save_tasks[self.current_layer])  # type: ignore[arg-type]
         else:
             self.layer_save_finished_events[self.current_layer].set()

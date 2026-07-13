@@ -12,6 +12,8 @@ from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.layerwise_config i
     get_layerwise_num_prefetch_layers,
     get_layerwise_num_shared_buffers,
     get_layerwise_storage_indices,
+    get_sfa_indexer_groups,
+    merge_sfa_physical_pool_owners,
 )
 
 
@@ -151,6 +153,44 @@ class TestStorageIndices:
     def test_no_reuse_one_slot_per_layer(self):
         indices = get_layerwise_storage_indices(5, {"layerwise_independent_layers": "all"})
         assert indices == [[0], [1], [2], [3], [4]]
+
+
+class TestSFAIndexerGroups:
+    def test_compacts_real_indexers_to_pool_width(self):
+        names = [f"indexer.{i}" for i in range(20)]
+        groups = get_sfa_indexer_groups(names, 4)
+        assert groups == [
+            ["indexer.0", "indexer.5", "indexer.10", "indexer.15"],
+            ["indexer.1", "indexer.6", "indexer.11", "indexer.16"],
+            ["indexer.2", "indexer.7", "indexer.12", "indexer.17"],
+            ["indexer.3", "indexer.8", "indexer.13", "indexer.18"],
+            ["indexer.4", "indexer.9", "indexer.14", "indexer.19"],
+        ]
+
+    def test_incomplete_groups_stay_within_pool_width(self):
+        names = [f"indexer.{i}" for i in range(21)]
+        groups = get_sfa_indexer_groups(names, 4)
+        assert len(groups) == 6
+        assert max(map(len, groups)) == 4
+        assert sorted(name for group in groups for name in group) == sorted(names)
+
+    def test_physical_pool_owners_cover_every_cache_once(self):
+        main_names = [f"main.{i}" for i in range(8)]
+        storage = [[0], [7], [1, 3, 5], [2, 4, 6]]
+        indexer_groups = [
+            ["indexer.0", "indexer.4", "indexer.8", "indexer.12"],
+            ["indexer.1", "indexer.5", "indexer.9"],
+        ]
+        pools = merge_sfa_physical_pool_owners(
+            main_names, storage, indexer_groups
+        )
+        owners = [owner for pool in pools for owner in pool]
+        expected = main_names + [
+            owner for group in indexer_groups for owner in group
+        ]
+        assert len(pools) == 4
+        assert sorted(owners) == sorted(expected)
+        assert len(owners) == len(set(owners))
 
 
 class TestGetLayerLoadStartBlock:

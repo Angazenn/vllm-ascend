@@ -688,9 +688,18 @@ class AscendSFAImpl(MLAAttentionImpl):
         # - C8 indexer cache for lightning indexer.
         # GLM5.2 can skip creating indexer on some layers, but these layers
         # still need the packed KV cache when sparse C8 is enabled.
-        self.use_sparse_c8_indexer = self.has_indexer and ascend_config.is_sparse_c8_layer(self.indexer.k_cache.prefix)
-        self.use_sparse_c8_sfa = self.use_sparse_c8_indexer or (
-            ascend_config.enable_sparse_c8 and not self.has_indexer and self.skip_topk
+        self.use_sparse_c8_indexer = (
+            not self.use_offload
+            and self.has_indexer
+            and ascend_config.is_sparse_c8_layer(self.indexer.k_cache.prefix)
+        )
+        self.use_sparse_c8_sfa = not self.use_offload and (
+            self.use_sparse_c8_indexer
+            or (
+                ascend_config.enable_sparse_c8
+                and not self.has_indexer
+                and self.skip_topk
+            )
         )
         if self.use_sparse_c8_sfa or self.use_sparse_c8_indexer:
             if get_ascend_device_type() == AscendDeviceType.A5:
@@ -1539,7 +1548,16 @@ class AscendSFAImpl(MLAAttentionImpl):
             q_li, q_li_scale = torch_npu.npu_dynamic_quant(q_li.view(-1, self.head_dim), dst_type=self.c8_k_cache_dtype)
             q_li_scale = q_li_scale.to(self.c8_k_scale_cache_dtype)  # [b*s,]
 
-        indexer_block_table = attn_metadata.indexer_block_table_tensor if self.use_offload else attn_metadata.block_table
+        layerwise_indexer_metadata = self._get_layerwise_indexer_metadata()
+        indexer_block_table = (
+            layerwise_indexer_metadata.block_table_tensor
+            if layerwise_indexer_metadata is not None
+            else (
+                attn_metadata.indexer_block_table_tensor
+                if self.use_offload
+                else attn_metadata.block_table
+            )
+        )
         return DeviceOperator.indexer_select_post_process(
             self,
             q_li,
@@ -1772,6 +1790,16 @@ class AscendSFAImpl(MLAAttentionImpl):
                 f"got {len(main_cache)} tensors for layer_name={self.layer_name}."
             )
         return (main_cache[0], main_cache[1], indexer_cache[0])
+
+    def _get_layerwise_indexer_metadata(self):
+        """Return metadata owned by a split layerwise indexer group."""
+        if not self.has_indexer or self.indexer is None:
+            return None
+        indexer_cache = self.indexer.k_cache
+        if indexer_cache is None:
+            return None
+        metadata = get_forward_context().attn_metadata
+        return metadata.get(indexer_cache.prefix)
 
     def forward(
         self,
@@ -2056,15 +2084,14 @@ class AscendSFAImpl(MLAAttentionImpl):
 
         if kv_cache is not None and self.has_indexer:
             assert k_li is not None
-            use_indexer_reshape_optim = self.is_kv_producer and get_ascend_config().c8_enable_reshape_optim
+            layerwise_indexer_metadata = self._get_layerwise_indexer_metadata()
+            use_indexer_reshape_optim = (
+                self.is_kv_producer
+                and get_ascend_config().c8_enable_reshape_optim
+                and layerwise_indexer_metadata is None
+            )
             if self.use_offload:
-                # Under offload, C8-ness is per-layer: six-tuple ([5]=scale) vs
-                # five-tuple. dsa_k_scale_cache_idx is only read when k_li_scale
-                # is not None (C8 layers), so one offload branch covers both;
-                # uniformity across layers is enforced by
-                # SFAKVOffloadWorker._register_offload_layers.
                 dsa_k_cache_idx = 2
-                dsa_k_scale_cache_idx = 5
             elif self.use_sparse_c8_sfa:
                 dsa_k_cache_idx = 1
                 dsa_k_scale_cache_idx = 2
@@ -2082,25 +2109,25 @@ class AscendSFAImpl(MLAAttentionImpl):
                     attn_metadata.block_size,
                 )
             else:
-                indexer_slot_mapping = attn_metadata.indexer_slot_mapping if self.use_offload else attn_metadata.slot_mapping
+                indexer_slot_mapping = (
+                    layerwise_indexer_metadata.slot_mapping
+                    if layerwise_indexer_metadata is not None
+                    else (
+                        attn_metadata.indexer_slot_mapping
+                        if self.use_offload
+                        else attn_metadata.slot_mapping
+                    )
+                )
                 torch_npu.npu_scatter_nd_update_(
                     kv_cache[dsa_k_cache_idx].view(-1, k_li.shape[-1]),
                     indexer_slot_mapping.view(-1, 1),
                     k_li.view(-1, k_li.shape[-1]),
                 )  # b, s, n, d
             if self.use_sparse_c8_indexer:
-                if self.use_offload:
-                    # six-tuple (C8) or five-tuple (non-C8); uniformity across
-                    # layers is enforced by SFAKVOffloadWorker._register_offload_layers.
-                    assert len(kv_cache) in (5, 6)
-                else:
-                    assert len(kv_cache) == (3 if self.use_sparse_c8_sfa else 4)
+                assert not self.use_offload
+                assert len(kv_cache) == (3 if self.use_sparse_c8_sfa else 4)
                 if k_li_scale is not None:
-                    scale_slot_mapping = (
-                        attn_metadata.indexer_slot_mapping
-                        if self.use_offload
-                        else attn_metadata.slot_mapping
-                    )
+                    scale_slot_mapping = attn_metadata.slot_mapping
                     if use_indexer_reshape_optim:
                         torch.ops._C_ascend.store_kv_block(
                             k_li_scale,

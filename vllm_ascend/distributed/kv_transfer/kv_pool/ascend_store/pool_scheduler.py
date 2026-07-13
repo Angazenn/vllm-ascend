@@ -24,6 +24,9 @@ from vllm.v1.outputs import KVConnectorOutput
 from vllm.v1.request import Request
 from vllm.v1.serial_utils import MsgpackEncoder
 
+from vllm_ascend.core.kv_cache_interface import (
+    AscendSFALayerwiseIndexerCacheSpec,
+)
 from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.backend import (
     backend_map,
 )
@@ -72,6 +75,17 @@ class KVPoolScheduler:
             else [0]
         )
         self.kv_cache_group_families = self._infer_group_families()
+        self.use_sfa_layerwise_groups = bool(
+            self.use_layerwise
+            and kv_cache_config is not None
+            and any(
+                isinstance(
+                    group.kv_cache_spec,
+                    AscendSFALayerwiseIndexerCacheSpec,
+                )
+                for group in kv_cache_config.kv_cache_groups
+            )
+        )
         self.need_truncate = self.use_compress
         self.num_swa_blocks = self._infer_swa_blocks()
         if kv_cache_config is not None:
@@ -83,7 +97,11 @@ class KVPoolScheduler:
                     raise NotImplementedError(
                         "AscendStore hybrid linear-attention support currently requires mamba_cache_mode='align'."
                     )
-        if self.use_layerwise and len(self.kv_cache_group_ids) > 1:
+        if (
+            self.use_layerwise
+            and len(self.kv_cache_group_ids) > 1
+            and not self.use_sfa_layerwise_groups
+        ):
             raise NotImplementedError("AscendStore layerwise mode does not yet support hybrid KV cache groups.")
         self.kv_role = vllm_config.kv_transfer_config.kv_role
         self.consumer_is_to_load = vllm_config.kv_transfer_config.kv_connector_extra_config.get(
@@ -143,6 +161,8 @@ class KVPoolScheduler:
         backend_name = vllm_config.kv_transfer_config.kv_connector_extra_config.get("backend", "mooncake")
         self.backend_name = backend_name.lower()
         self.use_gva_layerwise = self.use_layerwise and self.backend_name == "memcache"
+        if self.use_sfa_layerwise_groups:
+            self.use_gva_layerwise = False
         backend = backend_map.get(self.backend_name)
         if backend is None:
             raise ValueError(f"Unsupported KV pool backend: {backend_name}")
@@ -442,6 +462,14 @@ class KVPoolScheduler:
             return False
         if getattr(vllm_config.scheduler_config, "disable_hybrid_kv_cache_manager", False):
             return False
+        if any(
+            isinstance(
+                group.kv_cache_spec,
+                AscendSFALayerwiseIndexerCacheSpec,
+            )
+            for group in kv_cache_config.kv_cache_groups
+        ):
+            return True
         return len(kv_cache_config.kv_cache_groups) > 1 and any(
             not isinstance(group.kv_cache_spec, FullAttentionSpec) for group in kv_cache_config.kv_cache_groups
         )
