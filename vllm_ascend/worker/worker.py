@@ -59,6 +59,9 @@ import vllm_ascend.envs as envs_ascend
 from vllm_ascend.ascend_config import get_ascend_config, init_ascend_config
 from vllm_ascend.batch_invariant import init_batch_invariance
 from vllm_ascend.cpu_binding import bind_cpus
+from vllm_ascend.core.kv_cache_interface import (
+    get_sfa_layerwise_ascend_store_config,
+)
 from vllm_ascend.device_allocator.camem import CaMemAllocator
 from vllm_ascend.device_allocator.sleep_mem_optimized import SleepWakeupManager
 from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.layerwise_config import (
@@ -609,7 +612,10 @@ class NPUWorker(WorkerBase):
         kv_transfer_config = self.vllm_config.kv_transfer_config
         if kv_transfer_config is None:
             return available
-        extra_config = kv_transfer_config.kv_connector_extra_config
+        extra_config = (
+            get_sfa_layerwise_ascend_store_config(self.vllm_config)
+            or kv_transfer_config.kv_connector_extra_config
+        )
         total_layers = self.model_config.get_num_layers(self.parallel_config)
         num_tensors = get_layerwise_kv_cache_num_tensors(total_layers, extra_config)
         if num_tensors is not None and num_tensors < total_layers:

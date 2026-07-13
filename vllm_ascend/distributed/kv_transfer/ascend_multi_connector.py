@@ -53,6 +53,13 @@ class AscendMultiConnector(MultiConnector, SupportsHMA):
                 # Call with empty blocks for other connectors.
                 c.update_state_after_alloc(request, empty_blocks, 0)
 
+    def register_kv_cache_config(self, kv_cache_config: "KVCacheConfig") -> None:
+        """Forward the model runner's physical cache-pool rewrite."""
+        for connector in self._connectors:
+            hook = getattr(connector, "register_kv_cache_config", None)
+            if hook is not None:
+                hook(kv_cache_config)
+
     def get_num_new_matched_tokens(
         self,
         request: "Request",

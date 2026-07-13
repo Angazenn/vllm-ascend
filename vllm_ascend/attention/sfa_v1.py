@@ -44,7 +44,9 @@ from vllm_ascend.attention.utils import (
 )
 from vllm_ascend.device.device_op import DeviceOperator
 from vllm_ascend.device.mxfp_compat import FLOAT8_E8M0FNU_DTYPE
-from vllm_ascend.core.kv_cache_interface import is_direct_sfa_kv_offload
+from vllm_ascend.core.kv_cache_interface import (
+    uses_split_sfa_decode_offload_layout,
+)
 from vllm_ascend.distributed.utils import all_gather_async
 from vllm_ascend.ops.layer_shard_linear import (
     is_hidden_layer,
@@ -313,7 +315,8 @@ class AscendSFAMetadataBuilder(MLACommonMetadataBuilder[AscendSFAMetadata]):
         ascend_config = get_ascend_config()
         self.use_offload = ascend_config.use_offload
         self.use_sfa_decode_offload = bool(
-            self.use_offload and is_direct_sfa_kv_offload(vllm_config)
+            self.use_offload
+            and uses_split_sfa_decode_offload_layout(vllm_config)
         )
 
         self.block_size = vllm_config.cache_config.block_size
@@ -646,7 +649,7 @@ class AscendSFAImpl(MLAAttentionImpl):
         self.vllm_config = get_current_vllm_config()
         self.use_sfa_decode_offload = bool(
             self.use_offload
-            and is_direct_sfa_kv_offload(self.vllm_config)
+            and uses_split_sfa_decode_offload_layout(self.vllm_config)
         )
         kv_transfer_config = self.vllm_config.kv_transfer_config
         self.is_kv_producer = kv_transfer_config is not None and kv_transfer_config.is_kv_producer
@@ -1954,6 +1957,10 @@ class AscendSFAImpl(MLAAttentionImpl):
             hidden_states = torch.ops.vllm.maybe_all_gather_and_maybe_unpad(
                 hidden_states.contiguous(), need_gather_q_kv
             )
+            # MLAPO scatters K/V into the paged cache. With layer-reused
+            # physical pools, both PD READ_DONE and the AscendStore reuse gate
+            # must complete before that write can overwrite the previous layer.
+            wait_for_kv_layer_from_connector(layer_name)
             hidden_states, ql_nope, q_pe, q_c = self._sfa_preprocess_with_mlapo(
                 hidden_states=hidden_states,
                 kv_cache=kv_cache,
@@ -1970,7 +1977,6 @@ class AscendSFAImpl(MLAAttentionImpl):
                 )
             else:
                 k_li, k_li_scale = None, None
-            wait_for_kv_layer_from_connector(layer_name)
         # native
         else:
             assert self.fused_qkv_a_proj is not None, "q lora is required for DSA."

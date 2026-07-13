@@ -31,6 +31,8 @@ class ProducerSendState:
     total_layers: int
     layer_metadata: dict[str, LayerMetadata]
     p_session: str
+    indexer_owner_names: tuple[str, ...]
+    source_tensors_by_layer: dict[str, dict[str, torch.Tensor]]
     layer_transfer_finished_events: list[threading.Event] | None
     layer_transfer_pending_events: list[threading.Event] | None
 
@@ -137,19 +139,23 @@ class MembPullSendingThread(threading.Thread):
             send_task.wait_event.synchronize()
         layer_name = send_task.layer_name
 
-        read_reqs: list[tuple[str, list[int]]] = []
+        if envs.VLLM_ASCEND_MF_VERIFY:
+            self._log_source_checksums(send_task)
+
+        read_reqs: list[tuple[str, list[list[int]]]] = []
         done_ext_ids: list[str] = []
         endpoints: set[tuple[str, int]] = set()
         for req_id, rm in send_task.send_request.items():
-            p_block_ids = rm.local_block_ids[0] if rm.local_block_ids else []
+            p_block_ids_by_group = rm.local_block_ids
             ext_id = get_external_request_id(req_id)
             has_endpoint = bool(rm.remote_host) and bool(rm.remote_port)
             chunk_done = layer_idx == self.total_layers - 1 and rm.chunk_finish and has_endpoint
-            if p_block_ids and has_endpoint:
-                read_reqs.append((ext_id, p_block_ids))
+            has_source_blocks = any(p_block_ids_by_group)
+            if has_source_blocks and has_endpoint:
+                read_reqs.append((ext_id, p_block_ids_by_group))
             if chunk_done:
                 done_ext_ids.append(ext_id)
-            if (p_block_ids or chunk_done) and has_endpoint:
+            if (has_source_blocks or chunk_done) and has_endpoint:
                 endpoints.add((rm.remote_host, rm.remote_port))
             if envs.VLLM_ASCEND_SFA_DEBUG:
                 logger.info(
@@ -157,7 +163,7 @@ class MembPullSendingThread(threading.Thread):
                     layer_idx,
                     layer_name,
                     ext_id,
-                    len(p_block_ids),
+                    sum(len(group) for group in p_block_ids_by_group),
                     chunk_done,
                 )
 
@@ -190,6 +196,59 @@ class MembPullSendingThread(threading.Thread):
         else:
             self._signal_layer_done(layer_idx)
 
+    @staticmethod
+    def _sum_manager_pages(
+        tensor: torch.Tensor,
+        block_ids: list[int],
+        block_size_scale: int,
+    ) -> float:
+        if not block_ids:
+            return 0.0
+        kernel_block_ids = [
+            block_id * block_size_scale + offset
+            for block_id in block_ids
+            for offset in range(block_size_scale)
+        ]
+        indices = torch.tensor(
+            kernel_block_ids,
+            dtype=torch.long,
+            device=tensor.device,
+        )
+        return tensor.index_select(0, indices).float().sum().item()
+
+    def _log_source_checksums(self, send_task: SendTask) -> None:
+        tensors = self._state.source_tensors_by_layer[send_task.layer_name]
+        metadata = self._state.layer_metadata[send_task.layer_name]
+        role_meta = {
+            role: (group_id, scale)
+            for role, group_id, scale in zip(
+                metadata.tensor_roles,
+                metadata.tensor_group_idx,
+                metadata.block_size_scale,
+            )
+        }
+        for req_id, req_meta in send_task.send_request.items():
+            checksums = {}
+            for role, tensor in tensors.items():
+                group_id, scale = role_meta[role]
+                block_ids = (
+                    req_meta.local_block_ids[group_id]
+                    if group_id < len(req_meta.local_block_ids)
+                    else []
+                )
+                checksums[role] = self._sum_manager_pages(
+                    tensor, block_ids, scale
+                )
+            logger.info(
+                "MFV P layer %s req %s main_k=%.6f main_v=%.6f "
+                "idx_pre=%.6f",
+                send_task.layer_name,
+                get_external_request_id(req_id),
+                checksums.get("main_k", 0.0),
+                checksums.get("main_v", 0.0),
+                checksums.get("indexer_k", 0.0),
+            )
+
     def _send_mf_meta(self, dealer, encoder: msgspec.msgpack.Encoder) -> None:
         p_meta_dict = {}
         for ln, meta in self._state.layer_metadata.items():
@@ -197,8 +256,19 @@ class MembPullSendingThread(threading.Thread):
                 "base_addrs": list(meta.kv_caches_base_addr),
                 "block_len": list(meta.block_len),
                 "block_size_scale": list(meta.block_size_scale),
+                "group_ids": list(meta.tensor_group_idx),
+                "roles": list(meta.tensor_roles),
             }
-        dealer.send(encoder.encode((MF_META, self._state.p_session, encoder.encode(p_meta_dict))))
+        dealer.send(
+            encoder.encode(
+                (
+                    MF_META,
+                    self._state.p_session,
+                    encoder.encode(p_meta_dict),
+                    list(self._state.indexer_owner_names),
+                )
+            )
+        )
         if dealer.poll(timeout=int(self.timeout * 1000)):
             frames = dealer.recv_multipart()
             payload = [f for f in frames if f != b""]
@@ -206,9 +276,10 @@ class MembPullSendingThread(threading.Thread):
                 raise RuntimeError(f"MembPull P MF_META got unexpected reply: {payload!r}")
             self._mf_meta_sent = True
             logger.info(
-                "MembPull P sent MF_META: session=%s, layers=%d",
+                "MembPull P sent MF_META: session=%s, layers=%d, indexer_owners=%d",
                 self._state.p_session,
                 len(p_meta_dict),
+                len(self._state.indexer_owner_names),
             )
         else:
             raise RuntimeError("MembPull P MF_META timed out (no reply from D)")

@@ -210,13 +210,14 @@ from vllm_ascend.core.kv_cache_interface import (
     AscendSFAOffloadIndexerCacheSpec,
     AscendSlidingWindowMLASpec,
     OffloadMLAAttentionSpec,
-    is_direct_sfa_kv_offload,
+    get_sfa_layerwise_ascend_store_config,
     make_offload_indexer_mla_spec,
     make_offload_main_mla_spec,
     make_sfa_offload_indexer_spec,
     offload_indexer_kernel_block_size,
     offload_indexer_pad_dim,
     offload_main_kv_head_dims_for_pool_split,
+    uses_split_sfa_decode_offload_layout,
 )
 
 # if true, allow tensor initialization and casting with internal format (e.g., NZ)
@@ -394,19 +395,17 @@ class NPUModelRunner(GPUModelRunner):
         self.use_sfa_decode_offload = bool(
             self.use_sparse
             and self.use_offload
-            and is_direct_sfa_kv_offload(self.vllm_config)
+            and uses_split_sfa_decode_offload_layout(self.vllm_config)
             and self.model_config.hf_text_config.model_type == "glm_moe_dsa"
         )
-        kv_transfer_config = self.vllm_config.kv_transfer_config
+        layerwise_ascend_store_config = (
+            get_sfa_layerwise_ascend_store_config(self.vllm_config)
+        )
         self.use_sfa_layerwise_ascend_store = bool(
             self.use_sparse
             and not self.use_offload
             and not self.ascend_config.enable_sparse_c8
-            and kv_transfer_config is not None
-            and kv_transfer_config.kv_connector == "AscendStoreConnector"
-            and kv_transfer_config.kv_connector_extra_config.get(
-                "use_layerwise", False
-            )
+            and layerwise_ascend_store_config is not None
             and self.model_config.hf_text_config.model_type == "glm_moe_dsa"
         )
         if self.use_sparse:
@@ -4112,7 +4111,10 @@ class NPUModelRunner(GPUModelRunner):
         kv_transfer_config = self.vllm_config.kv_transfer_config
         if kv_transfer_config is None:
             return
-        extra_config = kv_transfer_config.kv_connector_extra_config
+        extra_config = (
+            get_sfa_layerwise_ascend_store_config(self.vllm_config)
+            or kv_transfer_config.kv_connector_extra_config
+        )
         total_layers = self.model_config.get_num_layers(self.parallel_config)
         if get_layerwise_kv_cache_reuse_layers(total_layers, extra_config) is None:
             return
@@ -4236,6 +4238,12 @@ class NPUModelRunner(GPUModelRunner):
         self._mamba_copy_bufs = None
         self.may_add_encoder_only_layers_to_kv_cache_config()
         self._merge_kv_cache_tensors_for_layer_reuse(kv_cache_config)
+        if has_kv_transfer_group():
+            register_config = getattr(
+                get_kv_transfer_group(), "register_kv_cache_config", None
+            )
+            if register_config is not None:
+                register_config(kv_cache_config)
         self.maybe_add_kv_sharing_layers_to_kv_cache_groups(kv_cache_config)
         # NOTE(cmq): initialize_attn_backend must before using self.attn_groups
         self.initialize_attn_backend(kv_cache_config)
@@ -4526,9 +4534,12 @@ class NPUModelRunner(GPUModelRunner):
         self.hybrid_with_attn_and_mamba = False
         kv_transfer_config = self.vllm_config.kv_transfer_config
         extra_config = (
-            kv_transfer_config.kv_connector_extra_config
-            if kv_transfer_config is not None
-            else None
+            get_sfa_layerwise_ascend_store_config(self.vllm_config)
+            or (
+                kv_transfer_config.kv_connector_extra_config
+                if kv_transfer_config is not None
+                else None
+            )
         )
         reuse_layers = get_layerwise_kv_cache_reuse_layers(
             self.model_config.get_num_layers(self.parallel_config),

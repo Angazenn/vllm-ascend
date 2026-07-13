@@ -23,9 +23,6 @@ from vllm.v1.core.kv_cache_manager import KVCacheBlocks
 from vllm.v1.core.sched.output import SchedulerOutput
 from vllm.v1.kv_cache_interface import KVCacheConfig
 
-from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.layerwise_config import (
-    get_layerwise_config,
-)
 from vllm_ascend.distributed.kv_transfer.sfa_pd_cpu_offload.scheduler import (
     SFAPDCpuOffloadScheduler,
     SFAPDProducerScheduler,
@@ -67,17 +64,6 @@ class SFAPDCpuOffloadConnector(KVConnectorBase_V1, SupportsHMA):
         # SFA path is layer-wise on both sides.
         self.use_layerwise = vllm_config.kv_transfer_config.kv_connector_extra_config.get("use_layerwise", True)
         self.engine_id = vllm_config.kv_transfer_config.engine_id
-        # Layer-reuse mate map. For a layer that time-multiplexes a shared HBM
-        # slot, the "mate" is the slot's previous occupant whose KV D must finish
-        # reading before this layer may overwrite the slot. ``prefetch_layer_map``
-        # maps each reusing layer -> its mate; empty when layer reuse is disabled
-        # (so the gate below becomes a no-op, matching the no-reuse behavior).
-        lw_config = get_layerwise_config(
-            vllm_config.model_config.get_num_layers(vllm_config.parallel_config),
-            vllm_config.kv_transfer_config.kv_connector_extra_config,
-        )
-        self._reuse_mate_map = lw_config.prefetch_layer_map
-
         # Guard the asymmetric use_offload assumption (the launch scripts must
         # set it via --additional-config). Fail fast at startup rather than
         # producing confusing mid-run failures.
@@ -166,6 +152,13 @@ class SFAPDCpuOffloadConnector(KVConnectorBase_V1, SupportsHMA):
         assert self.connector_worker is not None
         self.connector_worker.register_kv_caches(kv_caches)
 
+    def register_kv_cache_config(self, kv_cache_config: KVCacheConfig) -> None:
+        if self.connector_worker is None:
+            return
+        hook = getattr(self.connector_worker, "register_kv_cache_config", None)
+        if hook is not None:
+            hook(kv_cache_config)
+
     def get_finished(self, finished_req_ids: set[str]) -> tuple[set[str], set[str]]:
         assert self.connector_worker is not None
         if self.is_consumer:
@@ -201,7 +194,11 @@ class SFAPDCpuOffloadConnector(KVConnectorBase_V1, SupportsHMA):
         if match is None:
             return
         layer_idx = int(match.group(1))
-        mate = self._reuse_mate_map.get(layer_idx)
+        worker = self.connector_worker
+        if worker is None:
+            return
+        get_reuse_mate = getattr(worker, "get_reuse_mate", None)
+        mate = get_reuse_mate(layer_idx) if get_reuse_mate else None
         if mate is None:
             return  # independent / first occupant of its slot: nothing to gate.
         self.wait_for_layer_send(mate)

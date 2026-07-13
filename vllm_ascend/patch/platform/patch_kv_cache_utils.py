@@ -31,11 +31,11 @@ def _get_glm_sfa_decode_offload_kv_cache_groups(
     from vllm_ascend.core.kv_cache_interface import (
         AscendSFAOffloadIndexerCacheSpec,
         OffloadMLAAttentionSpec,
-        is_direct_sfa_kv_offload,
+        uses_split_sfa_decode_offload_layout,
     )
 
     if (
-        not is_direct_sfa_kv_offload(vllm_config)
+        not uses_split_sfa_decode_offload_layout(vllm_config)
         or getattr(
             vllm_config.model_config.hf_text_config, "model_type", None
         )
@@ -101,19 +101,16 @@ def _get_glm_sfa_layerwise_kv_cache_groups(
     from vllm_ascend.core.kv_cache_interface import (
         AscendMLAAttentionSpec,
         AscendSFALayerwiseIndexerCacheSpec,
+        get_sfa_layerwise_ascend_store_config,
     )
     from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.layerwise_config import (
         get_layerwise_storage_indices,
         get_sfa_indexer_groups,
     )
 
-    transfer_config = vllm_config.kv_transfer_config
+    layerwise_config = get_sfa_layerwise_ascend_store_config(vllm_config)
     if (
-        transfer_config is None
-        or transfer_config.kv_connector != "AscendStoreConnector"
-        or not transfer_config.kv_connector_extra_config.get(
-            "use_layerwise", False
-        )
+        layerwise_config is None
         or getattr(vllm_config.model_config.hf_text_config, "model_type", None)
         != "glm_moe_dsa"
     ):
@@ -148,7 +145,7 @@ def _get_glm_sfa_layerwise_kv_cache_groups(
     indexer_names.sort(key=layer_id)
     num_pools = len(
         get_layerwise_storage_indices(
-            len(main_names), transfer_config.kv_connector_extra_config
+            len(main_names), layerwise_config
         )
     )
     specs = vllm.v1.core.kv_cache_utils.unify_kv_cache_spec_page_size(

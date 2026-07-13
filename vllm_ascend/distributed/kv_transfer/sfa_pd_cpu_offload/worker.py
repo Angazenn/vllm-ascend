@@ -18,7 +18,6 @@ from __future__ import annotations
 
 import math
 import os
-import re
 import threading
 from collections import defaultdict
 from typing import TYPE_CHECKING, Any
@@ -43,8 +42,16 @@ from vllm_ascend.distributed.kv_transfer.sfa_kv_offload.sfa_kv_offload_worker im
 )
 from vllm_ascend.distributed.kv_transfer.sfa_pd_cpu_offload.protocol import (
     LayerMetadata,
+    ROLE_INDEXER_K,
+    ROLE_INDEXER_SCALE,
+    ROLE_MAIN_K,
+    ROLE_MAIN_V,
     SendTask,
     get_external_request_id,
+)
+from vllm_ascend.distributed.kv_transfer.sfa_pd_cpu_offload.layout import (
+    get_transformer_layer_id,
+    resolve_sfa_split_cache_layout,
 )
 from vllm_ascend.distributed.kv_transfer.sfa_pd_cpu_offload.read_thread import (
     ConsumerReadState,
@@ -68,23 +75,6 @@ from vllm_ascend.distributed.kv_transfer.utils.utils import (
 
 if TYPE_CHECKING:
     from vllm.v1.attention.backend import AttentionMetadata
-
-# kv_cache_group convention for DeepSeek-V3.2 sparse offload:
-# group 0 = indexer (block_size 512), group 1 = main MLA (block_size 128).
-_INDEXER_GROUP_IDX = 0
-_MAIN_GROUP_IDX = 1
-# Matches the transformer-layer index in a kv-cache layer name, e.g.
-# "model.layers.5.self_attn" / "model.layers.5.self_attn.indexer" -> 5. Prefer
-# this over extract_layer_index(), which asserts the name holds exactly one
-# integer and would raise on names carrying an extra index/shard suffix.
-_LAYER_IDX_RE = re.compile(r"layers\.(\d+)")
-
-
-def _layer_idx(layer_name: str) -> int:
-    match = _LAYER_IDX_RE.search(layer_name)
-    assert match is not None, f"no transformer layer index in layer name {layer_name!r}"
-    return int(match.group(1))
-
 
 def _resolve_kv_transfer_backend(vllm_config: VllmConfig) -> str:
     """Pick the KV transfer backend.
@@ -115,6 +105,10 @@ class SFAPDCpuOffloadConsumerWorker:
         )
 
         self.layer_metadata: dict[str, LayerMetadata] = {}
+        assert kv_cache_config is not None
+        self.cache_layout = resolve_sfa_split_cache_layout(
+            kv_cache_config, "decode"
+        )
         self.engine = None
 
         # D-side composed SFA worker (LRU load + CPU pool). Lazily built in
@@ -182,7 +176,8 @@ class SFAPDCpuOffloadConsumerWorker:
         # last block lands here instead of the CPU pool. Keyed by main layer name
         # (the 5-tuple layers); tuple[0]=k_nope, tuple[1]=v_rope.
         self._hbm_kv = {
-            n: (t[0], t[1]) for n, t in kv_caches.items() if isinstance(t, (list, tuple)) and len(t) in (5, 6)
+            name: (kv_caches[name][0], kv_caches[name][1])
+            for name in self.cache_layout.main_layer_names
         }
 
         # memfabric pull mode only.
@@ -332,10 +327,11 @@ class SFAPDCpuOffloadConsumerWorker:
             main_name_to_idx=self._main_name_to_idx,
             cpu_pools=self._cpu_pools,
             hbm_kv=self._hbm_kv,
-            indexer_tensors=self._indexer_tensors,
-            indexer_scale_tensors=self._indexer_scale_tensors,
+            indexer_by_main=self._indexer_by_main,
+            expected_indexer_owner_names=self.cache_layout.indexer_owner_set,
             dest_blocks_by_req=self._dest_blocks_by_req,
             get_offload_layer_id=self.sfa_worker._get_offload_layer_id,
+            num_manager_blocks=self.kv_cache_config.num_blocks,
         )
 
     def _register_memfabric_pull(
@@ -348,14 +344,8 @@ class SFAPDCpuOffloadConsumerWorker:
         its HBM. Every D rank reads local HBM legs; TP0 also reads full Main KV
         into the shared CPU pool."""
         num_blocks = self.kv_cache_config.num_blocks
-        indexer_names = list(self.kv_cache_config.kv_cache_groups[_INDEXER_GROUP_IDX].layer_names)
-
-        def _offload_tuple_len(v: object) -> int:
-            return len(v) if isinstance(v, (list, tuple)) else 1
-
-        main_names = [n for n, v in kv_caches.items() if _offload_tuple_len(v) in (5, 6)]
-        main_by_layer_idx = {_layer_idx(name): name for name in main_names}
-        main_names = [main_by_layer_idx[_layer_idx(name)] for name in indexer_names]
+        main_names = list(self.cache_layout.main_layer_names)
+        indexer_names = list(self.cache_layout.indexer_layer_names)
 
         # Store layer info for MembPullReadThread
         self._indexer_names = indexer_names
@@ -367,30 +357,58 @@ class SFAPDCpuOffloadConsumerWorker:
         self._cpu_pools: list[tuple[torch.Tensor, torch.Tensor] | None] = (
             list(zip(k_caches_cpu, v_caches_cpu)) if has_cpu_pool else [None] * len(main_names)
         )
-        self._indexer_tensors = []
-        self._indexer_scale_tensors: list[torch.Tensor | None] = []
+        indexer_by_layer_id = self.cache_layout.indexer_name_by_layer_id
+        self._indexer_by_main: dict[
+            str, tuple[str, torch.Tensor, torch.Tensor | None]
+        ] = {}
         for main_name in main_names:
-            main_tuple = list(kv_caches[main_name])
-            self._indexer_tensors.append(main_tuple[2])  # dsa_k_indexer
-            self._indexer_scale_tensors.append(main_tuple[5] if len(main_tuple) >= 6 else None)
+            indexer_name = indexer_by_layer_id.get(
+                get_transformer_layer_id(main_name)
+            )
+            if indexer_name is None:
+                continue
+            indexer_entry = kv_caches[indexer_name]
+            if not isinstance(indexer_entry, (list, tuple)):
+                indexer_entry = (indexer_entry,)
+            if len(indexer_entry) not in (1, 2):
+                raise ValueError(
+                    f"Unexpected D indexer cache entry for {indexer_name}: "
+                    f"{len(indexer_entry)} tensors"
+                )
+            self._indexer_by_main[main_name] = (
+                indexer_name,
+                indexer_entry[0],
+                indexer_entry[1] if len(indexer_entry) == 2 else None,
+            )
 
         # Build layer_metadata (D's local addresses, for compatibility)
-        for pool_idx, (iname, mname) in enumerate(zip(indexer_names, main_names)):
-            indexer_t = self._indexer_tensors[pool_idx]
-            indexer_scale_t = self._indexer_scale_tensors[pool_idx]
-            indexer_addrs = [indexer_t.data_ptr()]
-            indexer_block_lens = [indexer_t.element_size() * math.prod(indexer_t.shape[1:])]
-            indexer_block_scales = [indexer_t.shape[0] // num_blocks if num_blocks else 1]
+        for indexer_name in indexer_names:
+            main_name = self.cache_layout.main_name_by_layer_id[
+                get_transformer_layer_id(indexer_name)
+            ]
+            _, indexer_t, indexer_scale_t = self._indexer_by_main[main_name]
+            indexer_tensors = [indexer_t]
+            indexer_roles = [ROLE_INDEXER_K]
             if indexer_scale_t is not None:
-                indexer_addrs.append(indexer_scale_t.data_ptr())
-                indexer_block_lens.append(indexer_scale_t.element_size() * math.prod(indexer_scale_t.shape[1:]))
-                indexer_block_scales.append(indexer_scale_t.shape[0] // num_blocks if num_blocks else 1)
-            self.layer_metadata[iname] = LayerMetadata(
-                tensor_group_idx=[_INDEXER_GROUP_IDX],
-                kv_caches_base_addr=indexer_addrs,
-                block_len=indexer_block_lens,
-                block_size_scale=indexer_block_scales,
+                indexer_tensors.append(indexer_scale_t)
+                indexer_roles.append(ROLE_INDEXER_SCALE)
+            self.layer_metadata[indexer_name] = LayerMetadata(
+                tensor_group_idx=[
+                    self.cache_layout.layer_to_group_id[indexer_name]
+                ] * len(indexer_tensors),
+                kv_caches_base_addr=[t.data_ptr() for t in indexer_tensors],
+                block_len=[
+                    t.element_size() * math.prod(t.shape[1:])
+                    for t in indexer_tensors
+                ],
+                block_size_scale=[
+                    t.shape[0] // num_blocks if num_blocks else 1
+                    for t in indexer_tensors
+                ],
+                tensor_roles=indexer_roles,
             )
+
+        for mname in main_names:
             # cpu_pools follows the SFA offload-layer order (it is zipped from
             # sfa_worker.k_caches_cpu), which may differ from main_names order
             # -> index by mname's offload id, not pool_idx (matches read_thread).
@@ -399,7 +417,10 @@ class SFAPDCpuOffloadConsumerWorker:
             if cpu_pool is not None:
                 k_cpu, v_cpu = cpu_pool
                 self.layer_metadata[mname] = LayerMetadata(
-                    tensor_group_idx=[_MAIN_GROUP_IDX, _MAIN_GROUP_IDX],
+                    tensor_group_idx=[
+                        self.cache_layout.main_group_id,
+                        self.cache_layout.main_group_id,
+                    ],
                     kv_caches_base_addr=[k_cpu.data_ptr(), v_cpu.data_ptr()],
                     block_len=[
                         k_cpu.element_size() * math.prod(k_cpu.shape[1:]),
@@ -409,6 +430,7 @@ class SFAPDCpuOffloadConsumerWorker:
                         k_cpu.shape[0] // num_blocks if num_blocks else 1,
                         v_cpu.shape[0] // num_blocks if num_blocks else 1,
                     ],
+                    tensor_roles=[ROLE_MAIN_K, ROLE_MAIN_V],
                 )
 
         # Create memfabric engine (no registration)
@@ -468,13 +490,18 @@ class SFAPDCpuOffloadProducerWorker:
             )
         self.vllm_config = vllm_config
         self.kv_cache_config = kv_cache_config
+        self.cache_layout = resolve_sfa_split_cache_layout(
+            kv_cache_config, "prefill"
+        )
         self.engine_id = engine_id
         self.dp_rank = vllm_config.parallel_config.data_parallel_rank
         self.tp_rank = get_tensor_model_parallel_rank()
         self.tp_size = vllm_config.parallel_config.tensor_parallel_size
         self.side_channel_host = get_ip()
         self.side_channel_port = vllm_config.kv_transfer_config.kv_port + self.dp_rank * self.tp_size
-        self.total_layers = vllm_config.model_config.get_num_layers(vllm_config.parallel_config)
+        # Main layers are the coordination timeline. Real indexer owners are
+        # attached tensor roles and do not create additional event slots.
+        self.total_layers = len(self.cache_layout.main_layer_names)
         set_shared_layer_transfer_events([threading.Event() for _ in range(self.total_layers)])
         set_shared_layer_transfer_pending_events([threading.Event() for _ in range(self.total_layers)])
         self.engine = global_te.get_transfer_engine(self.side_channel_host, device_name=None)
@@ -488,6 +515,10 @@ class SFAPDCpuOffloadProducerWorker:
         self.current_layer = 0
         self.kv_send_layer_thread: MembPullSendingThread | None = None
         self.layer_send_done_events: list[threading.Event] | None = None
+        self._reuse_mate_map: dict[int, int] = {}
+        self._source_tensors_by_layer: dict[
+            str, dict[str, torch.Tensor]
+        ] = {}
 
     def get_finished(self) -> tuple[set[str], set[str]]:
         return set(), set()
@@ -557,25 +588,79 @@ class SFAPDCpuOffloadProducerWorker:
             total_layers=self.total_layers,
             layer_metadata=self.layer_metadata,
             p_session=global_te._unique_id,
+            indexer_owner_names=tuple(self.cache_layout.indexer_layer_names),
+            source_tensors_by_layer=self._source_tensors_by_layer,
             layer_transfer_finished_events=get_shared_layer_transfer_events(),
             layer_transfer_pending_events=get_shared_layer_transfer_pending_events(),
         )
 
+    def register_kv_cache_config(self, kv_cache_config: KVCacheConfig) -> None:
+        """Capture the model runner's rewritten physical pool ownership."""
+        main_names = set(self.cache_layout.main_layer_names)
+        reuse_mates: dict[int, int] = {}
+        for tensor in kv_cache_config.kv_cache_tensors:
+            pool_main_names = sorted(
+                (name for name in tensor.shared_by if name in main_names),
+                key=get_transformer_layer_id,
+            )
+            for previous, current in zip(
+                pool_main_names, pool_main_names[1:]
+            ):
+                reuse_mates[get_transformer_layer_id(current)] = (
+                    get_transformer_layer_id(previous)
+                )
+        self._reuse_mate_map = reuse_mates
+        logger.info(
+            "MembPull P derived %d layer-reuse mates from %d physical pools",
+            len(reuse_mates),
+            len(kv_cache_config.kv_cache_tensors),
+        )
+
+    def get_reuse_mate(self, layer_idx: int) -> int | None:
+        return self._reuse_mate_map.get(layer_idx)
+
     def register_kv_caches(self, kv_caches: dict[str, torch.Tensor]) -> None:
         # memfabric pull mode only.
         assert self._backend == BACKEND_MEMFABRIC, "SFAPDCpuOffloadConnector P side supports memfabric pull only."
-        layer2group_ids: dict[str, int] = {}
-        for group_idx, kv_cache_group in enumerate(self.kv_cache_config.kv_cache_groups):
-            for layer_name in kv_cache_group.layer_names:
-                layer2group_ids[layer_name] = group_idx
-
         num_blocks = self.kv_cache_config.num_blocks
-        for layer_name, kv_cache_tuple in kv_caches.items():
-            if not isinstance(kv_cache_tuple, (list, tuple)):
-                kv_cache_tuple = [kv_cache_tuple]
-            group_idx = layer2group_ids[layer_name]
-            layer_meta = LayerMetadata([], [], [], [])
-            for single_kv_cache in kv_cache_tuple:
+        indexer_name_by_layer_id = self.cache_layout.indexer_name_by_layer_id
+        for layer_name in self.cache_layout.main_layer_names:
+            main_entry = kv_caches[layer_name]
+            if not isinstance(main_entry, (list, tuple)) or len(main_entry) < 2:
+                raise ValueError(
+                    f"P main cache {layer_name} must expose K/V tensors"
+                )
+            tensors = [main_entry[0], main_entry[1]]
+            roles = [ROLE_MAIN_K, ROLE_MAIN_V]
+            group_ids = [
+                self.cache_layout.main_group_id,
+                self.cache_layout.main_group_id,
+            ]
+            indexer_name = indexer_name_by_layer_id.get(
+                get_transformer_layer_id(layer_name)
+            )
+            if indexer_name is not None:
+                indexer_entry = kv_caches[indexer_name]
+                if not isinstance(indexer_entry, (list, tuple)):
+                    indexer_entry = (indexer_entry,)
+                if len(indexer_entry) not in (1, 2):
+                    raise ValueError(
+                        f"P indexer cache {indexer_name} has an unexpected "
+                        f"{len(indexer_entry)} tensors"
+                    )
+                tensors.append(indexer_entry[0])
+                roles.append(ROLE_INDEXER_K)
+                indexer_group_id = self.cache_layout.layer_to_group_id[
+                    indexer_name
+                ]
+                group_ids.append(indexer_group_id)
+                if len(indexer_entry) == 2:
+                    tensors.append(indexer_entry[1])
+                    roles.append(ROLE_INDEXER_SCALE)
+                    group_ids.append(indexer_group_id)
+
+            layer_meta = LayerMetadata([], [], [], [], roles)
+            for group_idx, single_kv_cache in zip(group_ids, tensors):
                 tensor_num_blocks = single_kv_cache.shape[0]
                 assert tensor_num_blocks % num_blocks == 0, (
                     "The external block size must be an integer multiple of the kernel block size."
@@ -587,19 +672,11 @@ class SFAPDCpuOffloadProducerWorker:
                 layer_meta.block_len.append(single_kv_cache.element_size() * math.prod(block_shape))
                 layer_meta.block_size_scale.append(block_size_scale)
             self.layer_metadata[layer_name] = layer_meta
-            self.index_to_name[_layer_idx(layer_name)].append(layer_name)
-
-        if self.total_layers < len(self.layer_metadata):
-            self.total_layers = len(self.layer_metadata)
-            # The shared PD-transfer events were created in __init__ sized to
-            # get_num_layers() (excludes MTP/spec-decode). kv_caches now shows
-            # the real count (incl MTP); re-create the events so the MTP layer
-            # gets a coordination slot. sfa_pd registers before ascend_store in
-            # the MultiConnector, so ascend_store / the send thread read these
-            # correctly-sized events when they start.
-            set_shared_layer_transfer_events([threading.Event() for _ in range(self.total_layers)])
-            set_shared_layer_transfer_pending_events(
-                [threading.Event() for _ in range(self.total_layers)]
+            self._source_tensors_by_layer[layer_name] = dict(
+                zip(roles, tensors)
+            )
+            self.index_to_name[get_transformer_layer_id(layer_name)].append(
+                layer_name
             )
 
         register_regions = collect_storage_merged_register_regions(kv_caches)
@@ -614,14 +691,12 @@ class SFAPDCpuOffloadProducerWorker:
         )
         self.kv_send_layer_thread.start()
         ready_event.wait()
-        # Stash source tensors on the sending thread for env-gated verify
-        # checksums (VLLM_ASCEND_MF_VERIFY=1): P sums its source blocks so
-        # the user can compare against D's destination sums in the logs.
-        self.kv_send_layer_thread._source_kv_caches = kv_caches
         self.layer_send_done_events = self.kv_send_layer_thread.layer_send_done_events
         logger.info(
-            "MembPull P registered kv caches: layers=%d, p_session=%s",
-            len(kv_caches),
+            "MembPull P registered split kv caches: main_layers=%d, "
+            "indexer_owners=%d, p_session=%s",
+            len(self.cache_layout.main_layer_names),
+            len(self.cache_layout.indexer_layer_names),
             global_te._unique_id,
         )
 
@@ -629,21 +704,20 @@ class SFAPDCpuOffloadProducerWorker:
         self,
         connector_metadata: KVConnectorMetadata,
         layer_idx: int,
-        layer_group_idx: int,
+        layer_group_ids: set[int],
     ) -> bool:
         for req_meta in getattr(connector_metadata, "requests", {}).values():
             has_endpoint = bool(req_meta.remote_host) and bool(req_meta.remote_port)
             if not has_endpoint:
                 continue
-            # Inspect THIS layer's tensor group (was hardcoded to group 0 /
-            # indexer), so a main-MLA layer gates on its own block ids.
             local_block_ids = req_meta.local_block_ids
-            if local_block_ids and len(local_block_ids) > layer_group_idx:
-                p_block_ids = local_block_ids[layer_group_idx]
-            else:
-                p_block_ids = []
+            has_source_blocks = any(
+                group_idx < len(local_block_ids)
+                and bool(local_block_ids[group_idx])
+                for group_idx in layer_group_ids
+            )
             chunk_done = layer_idx == self.total_layers - 1 and req_meta.chunk_finish
-            if p_block_ids or chunk_done:
+            if has_source_blocks or chunk_done:
                 return True
         return False
 
@@ -662,8 +736,12 @@ class SFAPDCpuOffloadProducerWorker:
             # Resolve THIS layer's tensor group so the pull-target gate inspects
             # the right group's block ids (was implicitly group 0 / indexer).
             _gate_layer_name = layer_name if layer_name else self.index_to_name[layer_idx][0]
-            layer_group_idx = self.layer_metadata[_gate_layer_name].tensor_group_idx[0]
-            has_pd_target = self._has_memfabric_pull_target(connector_metadata, layer_idx, layer_group_idx)
+            layer_group_ids = set(
+                self.layer_metadata[_gate_layer_name].tensor_group_idx
+            )
+            has_pd_target = self._has_memfabric_pull_target(
+                connector_metadata, layer_idx, layer_group_ids
+            )
             if (
                 has_pd_target
                 and self.layer_send_done_events is not None
@@ -703,7 +781,7 @@ class SFAPDCpuOffloadProducerWorker:
             wait_event = torch.npu.Event()
             wait_event.record()
 
-        layer_group_idx = self.layer_metadata[layer_name].tensor_group_idx[0]
+        layer_group_ids = set(self.layer_metadata[layer_name].tensor_group_idx)
         layer_send_task = SendTask(
             send_request={},
             wait_event=wait_event,
@@ -712,7 +790,11 @@ class SFAPDCpuOffloadProducerWorker:
         )
         for req_id, req_meta in connector_metadata.requests.items():
             local_block_ids = req_meta.local_block_ids
-            if len(local_block_ids) <= layer_group_idx or not local_block_ids[layer_group_idx]:
+            if not any(
+                group_idx < len(local_block_ids)
+                and bool(local_block_ids[group_idx])
+                for group_idx in layer_group_ids
+            ):
                 continue
             layer_send_task.send_request[req_id] = self.update_decoder_info(req_id, req_meta)
         if layer_send_task.send_request:

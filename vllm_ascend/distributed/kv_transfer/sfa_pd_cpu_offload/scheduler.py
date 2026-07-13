@@ -37,15 +37,14 @@ from vllm_ascend.distributed.kv_transfer.sfa_pd_cpu_offload.protocol import (
     SfaPDProducerMetadata,
     get_external_request_id,
 )
+from vllm_ascend.distributed.kv_transfer.sfa_pd_cpu_offload.layout import (
+    resolve_sfa_split_cache_layout,
+)
 
 if TYPE_CHECKING:
     from vllm.v1.core.kv_cache_manager import KVCacheBlocks
     from vllm.v1.core.sched.output import SchedulerOutput
     from vllm.v1.request import Request
-
-_INDEXER_GROUP_IDX = 0
-_MAIN_GROUP_IDX = 1
-
 
 class _SendReqInfo:
     def __init__(
@@ -226,12 +225,23 @@ class SFAPDCpuOffloadScheduler:
         self.kv_cache_config = kv_cache_config
         self.use_layerwise = use_layerwise
         self.engine_id = vllm_config.kv_transfer_config.engine_id
+        assert kv_cache_config is not None
+        self.cache_layout = resolve_sfa_split_cache_layout(
+            kv_cache_config, "decode"
+        )
+        if len(self.cache_layout.indexer_group_ids) != 1:
+            raise ValueError(
+                "SFAPD decode requires one resident real-indexer group; "
+                f"found {self.cache_layout.indexer_group_ids}"
+            )
+        self._indexer_group_id = self.cache_layout.indexer_group_ids[0]
+        self._main_group_id = self.cache_layout.main_group_id
 
         self.block_size = [
             group_spec.kv_cache_spec.block_size
             for group_spec in (kv_cache_config.kv_cache_groups if kv_cache_config else [])
         ]
-        # main MLA group block size (group 1) — the CPU offload granularity.
+        # Main MLA group block size is the CPU offload granularity.
         # The manager uses its self.block_size to size the null-padded prefix
         # and the SFA kernel uses _main_block_size (via cpu_blocks_map) as the
         # num_offloaded_blocks mask threshold; divergence silently over/under-
@@ -242,10 +252,7 @@ class SFAPDCpuOffloadScheduler:
         # spec value — so under DCP/PCP > 1 the two diverge and this connector's
         # null-pad/mask coupling is NOT supported without extra work. Assert the
         # group exists rather than silently falling back to 128.
-        assert len(self.block_size) > _MAIN_GROUP_IDX, (
-            f"PD offload expects a main-MLA group at index {_MAIN_GROUP_IDX}; got groups={self.block_size}"
-        )
-        self._main_block_size = self.block_size[_MAIN_GROUP_IDX]
+        self._main_block_size = self.block_size[self._main_group_id]
 
         # Hard-fail the unsupported DCP/PCP>1 config instead of silently
         # mis-masking: under DCP*PCP>1 vLLM core scales the manager's
@@ -309,9 +316,15 @@ class SFAPDCpuOffloadScheduler:
         # vLLM-allocated NPU block ids per group (indexer + main MLA).
         npu_block_ids_by_group = list(blocks.get_block_ids())
         indexer_npu_ids = (
-            npu_block_ids_by_group[_INDEXER_GROUP_IDX] if len(npu_block_ids_by_group) > _INDEXER_GROUP_IDX else []
+            npu_block_ids_by_group[self._indexer_group_id]
+            if len(npu_block_ids_by_group) > self._indexer_group_id
+            else []
         )
-        main_hbm_ids = npu_block_ids_by_group[_MAIN_GROUP_IDX] if len(npu_block_ids_by_group) > _MAIN_GROUP_IDX else []
+        main_hbm_ids = (
+            npu_block_ids_by_group[self._main_group_id]
+            if len(npu_block_ids_by_group) > self._main_group_id
+            else []
+        )
 
         # Part A: the CPU pool stores only FULL main MLA blocks (floor division).
         # The optional partial last block stays in HBM — D's logical-last group1
@@ -388,8 +401,11 @@ class SFAPDCpuOffloadScheduler:
             if nbi is None:
                 nbi = []
             elif isinstance(nbi, tuple):
-                # multi-group: tuple of per-group lists; last = main MLA (group1)
-                nbi = nbi[-1] if len(nbi) > 0 else []
+                nbi = (
+                    nbi[self._main_group_id]
+                    if len(nbi) > self._main_group_id
+                    else []
+                )
             new_main_hbm_by_req[rid] = list(nbi)
 
         def _add_req(

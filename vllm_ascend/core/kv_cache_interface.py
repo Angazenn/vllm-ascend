@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 from dataclasses import dataclass, field
+from typing import Any
 
 import torch
 from typing_extensions import Self
@@ -30,6 +31,60 @@ def is_direct_sfa_kv_offload(vllm_config: VllmConfig) -> bool:
         and transfer_config.kv_connector_extra_config.get(
             "use_layerwise", False
         )
+    )
+
+
+def get_sfa_layerwise_ascend_store_config(
+    vllm_config: VllmConfig,
+) -> dict[str, Any] | None:
+    """Return the effective layerwise AscendStore configuration.
+
+    PD prefill uses AscendStore as a child of MultiConnector. Layerwise pool
+    sizing options may be placed on the parent for compatibility with the
+    model-runner memory calculation, so merge those defaults into the child
+    configuration before returning it.
+    """
+    transfer_config = vllm_config.kv_transfer_config
+    if transfer_config is None:
+        return None
+    parent_extra = transfer_config.kv_connector_extra_config or {}
+
+    if transfer_config.kv_connector == "AscendStoreConnector":
+        return dict(parent_extra) if parent_extra.get("use_layerwise", False) else None
+    if transfer_config.kv_connector != "MultiConnector":
+        return None
+
+    parent_layerwise = {
+        key: value
+        for key, value in parent_extra.items()
+        if key.startswith("layerwise_") or key == "use_layerwise"
+    }
+    for child in parent_extra.get("connectors", []):
+        if child.get("kv_connector") != "AscendStoreConnector":
+            continue
+        effective = dict(parent_layerwise)
+        effective.update(child.get("kv_connector_extra_config") or {})
+        if effective.get("use_layerwise", False):
+            return effective
+    return None
+
+
+def uses_split_sfa_decode_offload_layout(vllm_config: VllmConfig) -> bool:
+    """Whether the worker needs split main/indexer decode-offload caches."""
+    if not (vllm_config.additional_config or {}).get("use_offload", False):
+        return False
+    transfer_config = vllm_config.kv_transfer_config
+    if transfer_config is None:
+        return False
+    if not (transfer_config.kv_connector_extra_config or {}).get(
+        "use_layerwise", False
+    ):
+        return False
+    if transfer_config.kv_connector == "SFAKVOffloadConnector":
+        return True
+    return bool(
+        transfer_config.kv_connector == "SFAPDCpuOffloadConnector"
+        and transfer_config.is_kv_consumer
     )
 
 

@@ -3,7 +3,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any
 
 import msgspec
@@ -17,6 +17,11 @@ READ_READY_BATCH = b"read_ready_batch"
 READ_DONE = b"read_done"
 READ_FAILED = b"read_failed"
 
+ROLE_MAIN_K = "main_k"
+ROLE_MAIN_V = "main_v"
+ROLE_INDEXER_K = "indexer_k"
+ROLE_INDEXER_SCALE = "indexer_scale"
+
 
 @dataclass
 class LayerMetadata:
@@ -24,6 +29,7 @@ class LayerMetadata:
     kv_caches_base_addr: list[int]
     block_len: list[int]
     block_size_scale: list[int]
+    tensor_roles: list[str] = field(default_factory=list)
 
 
 class SfaPDAgentMetadata(msgspec.Struct, omit_defaults=True, dict=True):
