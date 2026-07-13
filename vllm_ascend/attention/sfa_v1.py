@@ -26,6 +26,7 @@ from vllm_ascend.ascend_forward_context import _EXTRA_CTX
 from vllm_ascend.attention.attention_mask import AttentionMaskBuilder
 from vllm_ascend.attention.attention_v1 import AscendAttentionState
 from vllm_ascend.attention.context_parallel.common_cp import AscendPCPMetadata
+from vllm_ascend.attention.indexer import AscendSFAOffloadIndexerMetadata
 from vllm_ascend.attention.mla_v1 import MAX_O_PROJ_PREFETCH_SIZE, MLAPO_MAX_SUPPORTED_TOKENS
 from vllm_ascend.attention.utils import (
     SFA_QSFA_TILE_SIZE,
@@ -43,6 +44,7 @@ from vllm_ascend.attention.utils import (
 )
 from vllm_ascend.device.device_op import DeviceOperator
 from vllm_ascend.device.mxfp_compat import FLOAT8_E8M0FNU_DTYPE
+from vllm_ascend.core.kv_cache_interface import is_direct_sfa_kv_offload
 from vllm_ascend.distributed.utils import all_gather_async
 from vllm_ascend.ops.layer_shard_linear import (
     is_hidden_layer,
@@ -310,6 +312,9 @@ class AscendSFAMetadataBuilder(MLACommonMetadataBuilder[AscendSFAMetadata]):
         )
         ascend_config = get_ascend_config()
         self.use_offload = ascend_config.use_offload
+        self.use_sfa_decode_offload = bool(
+            self.use_offload and is_direct_sfa_kv_offload(vllm_config)
+        )
 
         self.block_size = vllm_config.cache_config.block_size
         # Match the logical block size selected for BlockTable.
@@ -400,8 +405,16 @@ class AscendSFAMetadataBuilder(MLACommonMetadataBuilder[AscendSFAMetadata]):
 
         block_table = common_attn_metadata.block_table_tensor[:num_reqs]
         slot_mapping = common_attn_metadata.slot_mapping[:num_input_tokens]
-        indexer_block_table_tensor = common_attn_metadata.indexer_block_table_tensor[:num_reqs] if self.use_offload else None
-        indexer_slot_mapping = common_attn_metadata.indexer_slot_mapping[:num_input_tokens] if self.use_offload else None
+        indexer_block_table_tensor = (
+            common_attn_metadata.indexer_block_table_tensor[:num_reqs]
+            if common_attn_metadata.indexer_block_table_tensor is not None
+            else None
+        )
+        indexer_slot_mapping = (
+            common_attn_metadata.indexer_slot_mapping[:num_input_tokens]
+            if common_attn_metadata.indexer_slot_mapping is not None
+            else None
+        )
         num_offloaded_blocks = common_attn_metadata.num_offloaded_blocks
         req_ids_tensor = common_attn_metadata.req_ids_tensor
         input_positions = common_attn_metadata.positions[:num_input_tokens].long()
@@ -631,6 +644,10 @@ class AscendSFAImpl(MLAAttentionImpl):
         self.use_offload = ascend_config.use_offload
         self.enable_shared_expert_dp = ascend_config.enable_shared_expert_dp
         self.vllm_config = get_current_vllm_config()
+        self.use_sfa_decode_offload = bool(
+            self.use_offload
+            and is_direct_sfa_kv_offload(self.vllm_config)
+        )
         kv_transfer_config = self.vllm_config.kv_transfer_config
         self.is_kv_producer = kv_transfer_config is not None and kv_transfer_config.is_kv_producer
         self.is_kv_consumer = kv_transfer_config is not None and kv_transfer_config.is_kv_consumer
@@ -1548,7 +1565,7 @@ class AscendSFAImpl(MLAAttentionImpl):
             q_li, q_li_scale = torch_npu.npu_dynamic_quant(q_li.view(-1, self.head_dim), dst_type=self.c8_k_cache_dtype)
             q_li_scale = q_li_scale.to(self.c8_k_scale_cache_dtype)  # [b*s,]
 
-        layerwise_indexer_metadata = self._get_layerwise_indexer_metadata()
+        layerwise_indexer_metadata = self._get_split_indexer_metadata()
         indexer_block_table = (
             layerwise_indexer_metadata.block_table_tensor
             if layerwise_indexer_metadata is not None
@@ -1759,12 +1776,35 @@ class AscendSFAImpl(MLAAttentionImpl):
         # separate cache specs, while the current kernel path still expects the
         # legacy combined tuple layout.
         main_cache = kv_cache
-        if self.use_offload or main_cache is None or not self.has_indexer:
+        if main_cache is None or not self.has_indexer:
+            return main_cache
+        if self.use_offload and not self.use_sfa_decode_offload:
             return main_cache
 
         indexer_cache = self.indexer.k_cache.kv_cache
         if indexer_cache is None:
             raise RuntimeError(f"SFA indexer cache is not initialized or bound. layer_name={self.layer_name}.")
+
+        if self.use_sfa_decode_offload:
+            if len(main_cache) != 5:
+                raise RuntimeError(
+                    "Direct SFA decode offload expects the five-entry main "
+                    f"cache tuple, got {len(main_cache)} tensors for "
+                    f"layer_name={self.layer_name}."
+                )
+            if len(indexer_cache) != 1:
+                raise RuntimeError(
+                    "Direct SFA decode offload expects one resident indexer "
+                    f"cache tensor, got {len(indexer_cache)} tensors for "
+                    f"layer_name={self.layer_name}."
+                )
+            return (
+                main_cache[0],
+                main_cache[1],
+                indexer_cache[0],
+                main_cache[3],
+                main_cache[4],
+            )
 
         if self.use_sparse_c8_indexer:
             if len(indexer_cache) != 2:
@@ -1791,15 +1831,37 @@ class AscendSFAImpl(MLAAttentionImpl):
             )
         return (main_cache[0], main_cache[1], indexer_cache[0])
 
-    def _get_layerwise_indexer_metadata(self):
-        """Return metadata owned by a split layerwise indexer group."""
+    def _get_split_indexer_metadata(self):
+        """Return metadata owned by the active split indexer group."""
         if not self.has_indexer or self.indexer is None:
             return None
         indexer_cache = self.indexer.k_cache
         if indexer_cache is None:
             return None
         metadata = get_forward_context().attn_metadata
-        return metadata.get(indexer_cache.prefix)
+        indexer_metadata = metadata.get(indexer_cache.prefix)
+        if self.use_sfa_decode_offload and indexer_metadata is None:
+            # MTP draft layers are not scheduler cache owners, so the draft
+            # forward context only contains their main-attention key. The
+            # proposer carries the indexer group's independently updated
+            # addressing on that main metadata instead.
+            draft_metadata = metadata.get(self.layer_name)
+            if (
+                draft_metadata is not None
+                and draft_metadata.indexer_block_table_tensor is not None
+                and draft_metadata.indexer_slot_mapping is not None
+            ):
+                return AscendSFAOffloadIndexerMetadata(
+                    block_table_tensor=(
+                        draft_metadata.indexer_block_table_tensor
+                    ),
+                    slot_mapping=draft_metadata.indexer_slot_mapping,
+                )
+            raise RuntimeError(
+                "Direct SFA decode offload did not build metadata for real "
+                f"indexer layer {indexer_cache.prefix}."
+            )
+        return indexer_metadata
 
     def forward(
         self,
@@ -2084,7 +2146,7 @@ class AscendSFAImpl(MLAAttentionImpl):
 
         if kv_cache is not None and self.has_indexer:
             assert k_li is not None
-            layerwise_indexer_metadata = self._get_layerwise_indexer_metadata()
+            layerwise_indexer_metadata = self._get_split_indexer_metadata()
             use_indexer_reshape_optim = (
                 self.is_kv_producer
                 and get_ascend_config().c8_enable_reshape_optim

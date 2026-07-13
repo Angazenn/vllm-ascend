@@ -305,6 +305,11 @@ class OffloadMLAAttentionManager(FullAttentionManager):
         super().__init__(kv_cache_spec, **kwargs)
         self.req_to_offloaded_blocks: defaultdict[str, list[KVCacheBlock]] = defaultdict(list)
         self.req_to_num_allocated_tokens: defaultdict[str, int] = defaultdict(int)
+        # The connector only offloads finalized tokens. Keep a one-scheduler-step
+        # lag before freeing so speculative target tokens cannot make the manager
+        # release an HBM block before its CPU copy exists.
+        self.req_to_num_finalized_tokens: defaultdict[str, int] = defaultdict(int)
+        self.req_to_pending_finalized_tokens: dict[str, int] = {}
         self.decode_threshold: int | None = None
         # Req ids whose main-MLA prefix is remote-prefilled (PD): the prefix
         # lives in the CPU pool, was never in HBM, and is null-padded at the
@@ -322,12 +327,14 @@ class OffloadMLAAttentionManager(FullAttentionManager):
         not know about, then defer to the base to free the real HBM blocks
         (block_pool.free_blocks already skips null_block entries, so the
         null-padded prefix of a remote-prefilled req is not double-freed).
-        Without this the three dicts/set leak across the session and a recycled
-        request_id would inherit a stale remote-prefilled flag.
+        Without this the per-request state leaks across the session and a
+        recycled request_id would inherit stale offload bookkeeping.
         """
         self.req_is_remote_prefilled.discard(request_id)
         self.req_to_offloaded_blocks.pop(request_id, None)
         self.req_to_num_allocated_tokens.pop(request_id, None)
+        self.req_to_num_finalized_tokens.pop(request_id, None)
+        self.req_to_pending_finalized_tokens.pop(request_id, None)
         self.req_to_real_free_cursor.pop(request_id, None)
         super().free(request_id)
 
@@ -358,6 +365,12 @@ class OffloadMLAAttentionManager(FullAttentionManager):
         Returns:
             The number of blocks to allocate.
         """
+
+        # ``total_computed_tokens`` has already been corrected for rejected
+        # speculative tokens. Commit it only after this allocation pass so a
+        # block becomes freeable one step after the connector first sees the
+        # same finalized boundary and schedules its HBM-to-CPU copy.
+        self.req_to_pending_finalized_tokens[request_id] = total_computed_tokens
 
         num_required_blocks = cdiv(num_tokens, self.block_size)
         num_req_blocks = len(self.req_to_blocks.get(request_id, ()))
@@ -531,16 +544,19 @@ class OffloadMLAAttentionManager(FullAttentionManager):
         Returns:
             The new allocated blocks.
         """
-        if self.decode_threshold is None:
-            # whether current request is prefill or decode,
-            # decode_threshold = 1 + spec_decode_size,
-            # can't touch vllm config here, have to get it during scheduling.
-            self.decode_threshold = num_tokens - num_tokens_main_model + 1
+        # The initial prefill allocation has no lookahead, so it cannot reveal
+        # the speculative decode width. Grow the threshold when later decode
+        # calls include lookahead slots.
+        current_decode_threshold = num_tokens - num_tokens_main_model + 1
+        self.decode_threshold = max(
+            self.decode_threshold or 0, current_decode_threshold
+        )
 
         req_blocks = self.req_to_blocks[request_id]
         req_freed_blocks = self.req_to_offloaded_blocks[request_id]
         num_required_blocks = cdiv(num_tokens, self.block_size)
         is_remote_prefilled = request_id in self.req_is_remote_prefilled
+        num_safe_offload_tokens = self.req_to_num_finalized_tokens[request_id]
 
         # free old full blocks (which should be already offloaded to CPU by the
         # connector in a prior step -- one-step slack, same convention for both
@@ -552,8 +568,7 @@ class OffloadMLAAttentionManager(FullAttentionManager):
             # stay intact (the block-table length and the attention
             # num_offloaded_blocks mask depend on them). The cursor points at
             # the oldest unfree real block (starts at N at admission).
-            num_allocated_tokens = self.req_to_num_allocated_tokens[request_id]
-            num_offloaded_total = num_allocated_tokens // self.block_size
+            num_offloaded_total = num_safe_offload_tokens // self.block_size
             cursor = self.req_to_real_free_cursor[request_id]
             num_to_free_real = max(
                 min(num_offloaded_total - cursor, len(req_blocks) - cursor), 0
@@ -577,7 +592,9 @@ class OffloadMLAAttentionManager(FullAttentionManager):
                 num_to_free_blocks = 0
             else:
                 # only offload & free after (chunk) prefill is done
-                num_offloaded_blocks = num_allocated_tokens // self.block_size
+                num_offloaded_blocks = (
+                    num_safe_offload_tokens // self.block_size
+                )
                 num_freed_blocks = len(req_freed_blocks)
                 num_to_free_blocks = num_offloaded_blocks - num_freed_blocks
                 # Defensive: never pop more real blocks than req_blocks actually
@@ -603,11 +620,16 @@ class OffloadMLAAttentionManager(FullAttentionManager):
             num_new_blocks = num_required_blocks - len(req_blocks)
         else:
             num_new_blocks = num_required_blocks - len(req_blocks) - len(req_freed_blocks)
-        # req_to_num_allocated_tokens records the FULL logical length (prefix +
-        # decode). The PD free branch reads it as num_offloaded_total and offsets
-        # by the cursor (= N at admission) to count only real decode blocks that
-        # should be freed.
+        # Keep scheduled target length for prefill/decode classification, then
+        # commit the corrected finalized cursor for the next allocation pass.
+        # This one-step lag gives the connector's current forward pass time to
+        # create the CPU copy before a completed HBM block becomes freeable.
         self.req_to_num_allocated_tokens[request_id] = num_tokens_main_model
+        self.req_to_num_finalized_tokens[request_id] = (
+            self.req_to_pending_finalized_tokens.pop(
+                request_id, num_safe_offload_tokens
+            )
+        )
         if num_new_blocks <= 0:
             return []
         else:

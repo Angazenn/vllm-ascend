@@ -19,6 +19,20 @@ from vllm_ascend.core.single_type_kv_cache_manager import CompressAttentionManag
 from vllm_ascend.utils import AscendDeviceType, get_ascend_device_type
 
 
+def is_direct_sfa_kv_offload(vllm_config: VllmConfig) -> bool:
+    """Whether the direct layerwise SFA decode-offload layout is active."""
+    transfer_config = vllm_config.kv_transfer_config
+    additional_config = vllm_config.additional_config or {}
+    return bool(
+        additional_config.get("use_offload", False)
+        and transfer_config is not None
+        and transfer_config.kv_connector == "SFAKVOffloadConnector"
+        and transfer_config.kv_connector_extra_config.get(
+            "use_layerwise", False
+        )
+    )
+
+
 def _get_c8_k_cache_dtype() -> torch.dtype:
     return torch.float8_e4m3fn if get_ascend_device_type() == AscendDeviceType.A5 else torch.int8
 
@@ -260,6 +274,48 @@ class AscendSFALayerwiseIndexerCacheSpec(FullAttentionSpec):
 
 
 @dataclass(frozen=True, kw_only=True)
+class AscendSFAOffloadIndexerCacheSpec(FullAttentionSpec):
+    """BF16 resident indexer cache for direct SFA decode offload.
+
+    The semantic indexer width is ``head_size``. ``indexer_pad_dim`` makes
+    one unified manager page match the main MLA page, allowing the indexer K
+    view to alias the main pool's raw K storage without another allocation.
+    """
+
+    indexer_pad_dim: int = 0
+    cache_dtype_str: str | None = None
+
+    @property
+    def page_size_bytes(self) -> int:
+        return (
+            self.block_size
+            * self.num_kv_heads
+            * (self.head_size + self.indexer_pad_dim)
+            * get_dtype_size(self.dtype)
+        )
+
+    @classmethod
+    def merge(cls, specs: list[Self]) -> Self:
+        assert specs and all(isinstance(spec, cls) for spec in specs)
+        layout = {
+            (
+                spec.block_size,
+                spec.num_kv_heads,
+                spec.head_size,
+                spec.dtype,
+                spec.indexer_pad_dim,
+                spec.cache_dtype_str,
+            )
+            for spec in specs
+        }
+        assert len(layout) == 1, (
+            "All direct SFA offload indexers in one group must use the same "
+            "physical cache layout."
+        )
+        return specs[0]
+
+
+@dataclass(frozen=True, kw_only=True)
 class AscendSlidingWindowMLASpec(SlidingWindowMLASpec):
     """Sliding window attention with MLA cache format."""
 
@@ -392,6 +448,26 @@ def make_offload_indexer_mla_spec(
     )
 
 
+def make_sfa_offload_indexer_spec(
+    *,
+    block_size: int,
+    num_kv_heads: int,
+    index_head_dim: int,
+    indexer_pad_dim: int,
+    dtype: torch.dtype,
+    cache_dtype_str: str,
+) -> AscendSFAOffloadIndexerCacheSpec:
+    """Build the real-indexer spec for direct BF16 decode offload."""
+    return AscendSFAOffloadIndexerCacheSpec(
+        block_size=block_size,
+        num_kv_heads=num_kv_heads,
+        head_size=index_head_dim,
+        indexer_pad_dim=indexer_pad_dim,
+        dtype=dtype,
+        cache_dtype_str=cache_dtype_str,
+    )
+
+
 def register_ascend_kv_cache_specs() -> None:
     KVCacheSpecRegistry.register(
         kvcache_spec_cls=AscendMLAAttentionSpec,
@@ -405,6 +481,11 @@ def register_ascend_kv_cache_specs() -> None:
     )
     KVCacheSpecRegistry.register(
         kvcache_spec_cls=AscendSFALayerwiseIndexerCacheSpec,
+        manager_class=FullAttentionManager,
+        uniform_type_base_spec=FullAttentionSpec,
+    )
+    KVCacheSpecRegistry.register(
+        kvcache_spec_cls=AscendSFAOffloadIndexerCacheSpec,
         manager_class=FullAttentionManager,
         uniform_type_base_spec=FullAttentionSpec,
     )

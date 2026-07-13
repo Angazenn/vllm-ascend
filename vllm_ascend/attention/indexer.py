@@ -125,3 +125,45 @@ class AscendSFALayerwiseIndexerBackend(AscendSFAIndexerBackend):
     @staticmethod
     def get_builder_cls():
         return AscendSFALayerwiseIndexerMetadataBuilder
+
+
+@dataclass
+class AscendSFAOffloadIndexerMetadata(AttentionMetadata):
+    block_table_tensor: torch.Tensor
+    slot_mapping: torch.Tensor
+
+
+class AscendSFAOffloadIndexerMetadataBuilder(
+    AscendSFAIndexerMetadataBuilder
+):
+    """Expose addressing owned by the resident decode indexer group."""
+
+    def build(
+        self,
+        common_prefix_len: int,
+        common_attn_metadata: CommonAttentionMetadata,
+        fast_build: bool = False,
+        **kwargs,
+    ) -> AscendSFAOffloadIndexerMetadata:
+        num_reqs = common_attn_metadata.num_reqs
+        num_tokens = getattr(
+            common_attn_metadata,
+            "num_input_tokens",
+            common_attn_metadata.num_actual_tokens,
+        )
+        return AscendSFAOffloadIndexerMetadata(
+            block_table_tensor=common_attn_metadata.block_table_tensor[
+                :num_reqs
+            ],
+            slot_mapping=common_attn_metadata.slot_mapping[:num_tokens],
+        )
+
+
+class AscendSFAOffloadIndexerBackend(AscendSFAIndexerBackend):
+    @staticmethod
+    def get_name() -> str:
+        return "ASCEND_SFA_OFFLOAD_INDEXER"
+
+    @staticmethod
+    def get_builder_cls():
+        return AscendSFAOffloadIndexerMetadataBuilder

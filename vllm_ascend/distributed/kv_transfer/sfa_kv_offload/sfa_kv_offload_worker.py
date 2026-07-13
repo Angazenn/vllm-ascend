@@ -215,6 +215,10 @@ class SFAKVOffloadWorker:
         )
         self.actual_seq_len_q = torch.arange(self.max_num_reqs, dtype=torch.int32, device='cpu', pin_memory=True) + 1
         self.req_ids = []
+        # Only blocks promoted after wait_for_save() are safe for CPU attention.
+        # The next step queries this map before start_load_kv() stages new saves.
+        self.completed_cpu_blocks: dict[str, int] = {}
+        self.pending_completed_cpu_blocks: dict[str, int] = {}
 
         self.cpu_sparse_attn = cpu_sparse_attn
 
@@ -526,8 +530,39 @@ class SFAKVOffloadWorker:
             assert self.size_buffer_npu.shape == torch.Size([self.max_num_topk_rows * self.sfa_sparse_topk * 2])
             assert self.num_tokens_buffer_npu.shape == torch.Size([1])
 
+    def _stage_cpu_block_completion(
+        self, metadata: SFAKVOffloadConnectorMetadata
+    ) -> None:
+        active_req_ids = set(metadata.unfinished_request_ids)
+        for block_counts in (
+            self.completed_cpu_blocks,
+            self.pending_completed_cpu_blocks,
+        ):
+            for req_id in list(block_counts):
+                if req_id not in active_req_ids:
+                    block_counts.pop(req_id, None)
+
+        for request in metadata.requests:
+            num_total_blocks = len(request.block_ids_cpu)
+            num_new_blocks = request.num_new_offload_blocks
+            num_completed_blocks = max(num_total_blocks - num_new_blocks, 0)
+            self.completed_cpu_blocks[request.req_id] = num_completed_blocks
+            if num_new_blocks > 0:
+                self.pending_completed_cpu_blocks[request.req_id] = num_total_blocks
+
+    def _commit_cpu_block_completion(self) -> None:
+        self.completed_cpu_blocks.update(self.pending_completed_cpu_blocks)
+        self.pending_completed_cpu_blocks.clear()
+
+    def get_num_cpu_blocks(self, req_ids) -> dict[str, int]:
+        return {
+            req_id: self.completed_cpu_blocks.get(req_id, 0)
+            for req_id in req_ids
+        }
+
     def start_load_kv(self, metadata: SFAKVOffloadConnectorMetadata):
         # return
+        self._stage_cpu_block_completion(metadata)
         self.current_layer_save = 0
         self.current_layer_load = 0
         req_id_to_block_ids: dict[str, list[int]] = {}
@@ -588,6 +623,7 @@ class SFAKVOffloadWorker:
         assert self.use_layerwise
         if not self.pending_save_layer_ids:
             # no save tasks, no need to wait
+            self._commit_cpu_block_completion()
             return
         for layer_id in sorted(self.pending_save_layer_ids):
             event = self.layer_save_finished_events[layer_id]
@@ -603,6 +639,7 @@ class SFAKVOffloadWorker:
             event.clear()
         self.pending_save_layer_ids.clear()
         self.submitted_save_layer_ids.clear()
+        self._commit_cpu_block_completion()
  
     def set_req_ids(self, req_ids: list):
         self.req_ids = req_ids

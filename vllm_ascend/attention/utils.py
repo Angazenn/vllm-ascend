@@ -604,13 +604,13 @@ def maybe_wait_for_layer_send(layer_idx: int) -> None:
 
 
 def maybe_get_num_cpu_blocks(req_ids):
-    """Return {req_id: num_main_mla_cpu_blocks} for remote-prefilled requests.
+    """Return safe CPU-resident main-MLA block counts when available.
 
-    Used by the SFA decode threshold (``num_offloaded_blocks``) to mark the
-    entire prefill prefix as CPU-resident, so the NPU-hit attention path never
-    reads D's empty NPU main-MLA cache for remote-prefilled requests (solution
-    1). Returns ``None`` for connectors that don't supply it, in which case the
-    caller falls back to the ``computed // block_size - 1`` heuristic.
+    Decode offload connectors report only blocks whose layerwise save completed
+    before the current forward. Remote-prefill connectors can report the prefix
+    blocks already present in their CPU pool. Returns ``None`` for connectors
+    that do not supply this state, in which case the caller falls back to the
+    computed-token heuristic.
     """
     if not has_kv_transfer_group() or not is_v1_kv_transfer_group():
         return None

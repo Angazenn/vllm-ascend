@@ -28,6 +28,10 @@ import torch  # noqa: E402
 from vllm_ascend.distributed.kv_transfer.sfa_kv_offload.sfa_kv_offload_worker import (  # noqa: E402
     SFAKVOffloadWorker,
 )
+from vllm_ascend.distributed.kv_transfer.sfa_kv_offload.config_data import (  # noqa: E402
+    ReqMeta,
+    SFAKVOffloadConnectorMetadata,
+)
 
 
 def _make_worker_without_init() -> SFAKVOffloadWorker:
@@ -37,6 +41,8 @@ def _make_worker_without_init() -> SFAKVOffloadWorker:
     w.tp_rank = 0
     w.pending_save_layer_ids = set()
     w.submitted_save_layer_ids = set()
+    w.completed_cpu_blocks = {}
+    w.pending_completed_cpu_blocks = {}
     return w
 
 
@@ -68,3 +74,35 @@ def test_register_all_five_tuple_passes():
     w = _make_worker_without_init()
     w._register_offload_layers({"layer.0": _tuple(5), "layer.1": _tuple(5)})
     assert w.num_offload_layers == 2
+
+
+def test_cpu_block_count_promotes_only_after_save_completion():
+    w = _make_worker_without_init()
+    metadata = SFAKVOffloadConnectorMetadata({"req-0"}, set())
+    metadata.add_request(
+        ReqMeta(
+            req_id="req-0",
+            block_ids_npu=[10, 11, 12, 13, 14],
+            block_ids_cpu=[1, 2, 3, 4, 5],
+            num_new_offload_blocks=1,
+        )
+    )
+
+    w._stage_cpu_block_completion(metadata)
+
+    assert w.get_num_cpu_blocks(["req-0"]) == {"req-0": 4}
+    w._commit_cpu_block_completion()
+    assert w.get_num_cpu_blocks(["req-0"]) == {"req-0": 5}
+
+
+def test_cpu_block_count_drops_finished_requests():
+    w = _make_worker_without_init()
+    w.completed_cpu_blocks["finished"] = 3
+    w.pending_completed_cpu_blocks["finished"] = 4
+
+    w._stage_cpu_block_completion(
+        SFAKVOffloadConnectorMetadata(set(), set())
+    )
+
+    assert w.get_num_cpu_blocks(["finished"]) == {"finished": 0}
+    assert w.pending_completed_cpu_blocks == {}

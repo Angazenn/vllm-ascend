@@ -1,9 +1,15 @@
 import torch
+from types import SimpleNamespace
+
+from vllm.v1.core.kv_cache_utils import unify_kv_cache_spec_page_size
 
 from vllm_ascend.core.kv_cache_interface import (
+    AscendSFAOffloadIndexerCacheSpec,
     AscendSFALayerwiseIndexerCacheSpec,
+    is_direct_sfa_kv_offload,
     make_offload_indexer_mla_spec,
     make_offload_main_mla_spec,
+    make_sfa_offload_indexer_spec,
     offload_indexer_kernel_block_size,
     offload_indexer_pad_dim,
 )
@@ -71,3 +77,50 @@ def test_legacy_decode_offload_specs_are_bf16_only():
     assert offload_indexer_kernel_block_size(
         MLA_BLOCK_SIZE, KV_LORA_RANK, INDEX_HEAD_DIM
     ) == MLA_BLOCK_SIZE * 4
+
+
+def test_direct_decode_indexer_page_unifies_with_main_mla():
+    main = make_offload_main_mla_spec(
+        block_size=MLA_BLOCK_SIZE,
+        num_kv_heads=1,
+        head_size=KV_LORA_RANK + QK_ROPE_HEAD_DIM,
+        dtype=torch.bfloat16,
+    )
+    indexer = make_sfa_offload_indexer_spec(
+        block_size=MLA_BLOCK_SIZE,
+        num_kv_heads=1,
+        index_head_dim=INDEX_HEAD_DIM,
+        indexer_pad_dim=INDEXER_PAD_DIM,
+        dtype=torch.bfloat16,
+        cache_dtype_str="auto",
+    )
+    assert isinstance(indexer, AscendSFAOffloadIndexerCacheSpec)
+    unified = unify_kv_cache_spec_page_size(
+        {"indexer": indexer, "main": main}
+    )
+    assert unified["indexer"].block_size == MLA_BLOCK_SIZE * 4
+    assert unified["main"].block_size == MLA_BLOCK_SIZE
+    assert (
+        unified["indexer"].page_size_bytes
+        == unified["main"].page_size_bytes
+    )
+
+
+def test_direct_decode_offload_requires_exact_layerwise_connector():
+    def config(connector: str, use_layerwise: bool = True):
+        return SimpleNamespace(
+            additional_config={"use_offload": True},
+            kv_transfer_config=SimpleNamespace(
+                kv_connector=connector,
+                kv_connector_extra_config={
+                    "use_layerwise": use_layerwise
+                },
+            ),
+        )
+
+    assert is_direct_sfa_kv_offload(config("SFAKVOffloadConnector"))
+    assert not is_direct_sfa_kv_offload(config("AscendStoreConnector"))
+    assert not is_direct_sfa_kv_offload(config("MultiConnector"))
+    assert not is_direct_sfa_kv_offload(
+        config("SFAKVOffloadConnector", use_layerwise=False)
+    )

@@ -120,6 +120,10 @@ class SFAKVOffloadConnector(KVConnectorBase_V1, SupportsHMA):
     def set_req_ids(self, req_ids: list):
         return self.connector_worker.set_req_ids(req_ids)
 
+    def get_num_cpu_blocks(self, req_ids) -> dict[str, int]:
+        """Return only CPU blocks completed before the current forward."""
+        return self.connector_worker.get_num_cpu_blocks(req_ids)
+
     def get_finished(self, finished_req_ids: set[str]) -> tuple[set[str], set[str]]:
         # In sfa kv offload, we don't need delay free, thus no need to return finished_send/recv too.
         return (set(), set())

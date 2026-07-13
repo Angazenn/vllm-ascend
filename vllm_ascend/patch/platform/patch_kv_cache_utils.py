@@ -23,6 +23,76 @@ _orig_resolve_kv_cache_block_sizes = vllm.v1.core.kv_cache_utils.resolve_kv_cach
 _orig_get_kv_cache_groups = vllm.v1.core.kv_cache_utils.get_kv_cache_groups
 
 
+def _get_glm_sfa_decode_offload_kv_cache_groups(
+    vllm_config: VllmConfig,
+    kv_cache_spec: dict[str, KVCacheSpec],
+) -> list[KVCacheGroupSpec] | None:
+    """Build one resident-indexer group followed by one main-KV group."""
+    from vllm_ascend.core.kv_cache_interface import (
+        AscendSFAOffloadIndexerCacheSpec,
+        OffloadMLAAttentionSpec,
+        is_direct_sfa_kv_offload,
+    )
+
+    if (
+        not is_direct_sfa_kv_offload(vllm_config)
+        or getattr(
+            vllm_config.model_config.hf_text_config, "model_type", None
+        )
+        != "glm_moe_dsa"
+    ):
+        return None
+
+    main_names = [
+        name
+        for name, spec in kv_cache_spec.items()
+        if isinstance(spec, OffloadMLAAttentionSpec)
+    ]
+    indexer_names = [
+        name
+        for name, spec in kv_cache_spec.items()
+        if isinstance(spec, AscendSFAOffloadIndexerCacheSpec)
+    ]
+    if not main_names or not indexer_names:
+        return None
+    if len(main_names) + len(indexer_names) != len(kv_cache_spec):
+        return None
+    if (
+        vllm_config.parallel_config.decode_context_parallel_size != 1
+        or vllm_config.parallel_config.prefill_context_parallel_size != 1
+    ):
+        raise ValueError(
+            "Direct GLM SFA decode offload requires DCP=1 and PCP=1"
+        )
+
+    def layer_id(name: str) -> int:
+        return int(name.split(".layers.", 1)[1].split(".", 1)[0])
+
+    main_names.sort(key=layer_id)
+    indexer_names.sort(key=layer_id)
+    main_layer_ids = {layer_id(name) for name in main_names}
+    indexer_layer_ids = {layer_id(name) for name in indexer_names}
+    if not indexer_layer_ids.issubset(main_layer_ids):
+        raise ValueError(
+            "Direct SFA decode indexer owners must be a subset of main "
+            "SFA layers"
+        )
+    if len(indexer_names) > len(main_names):
+        raise ValueError(
+            "Direct SFA decode indexer group cannot be wider than the main "
+            "KV group"
+        )
+
+    specs = vllm.v1.core.kv_cache_utils.unify_kv_cache_spec_page_size(
+        kv_cache_spec
+    )
+    # SFAKVOffloadConnector consumes the final group only. Keep the resident
+    # indexer group first and the single offloaded main-KV group last.
+    return vllm.v1.core.kv_cache_utils.create_kv_cache_group_specs(
+        specs, [indexer_names, main_names]
+    )
+
+
 def _get_glm_sfa_layerwise_kv_cache_groups(
     vllm_config: VllmConfig,
     kv_cache_spec: dict[str, KVCacheSpec],
@@ -102,6 +172,11 @@ def get_kv_cache_groups(
     vllm_config: VllmConfig,
     kv_cache_spec: dict[str, KVCacheSpec],
 ) -> list[KVCacheGroupSpec]:
+    groups = _get_glm_sfa_decode_offload_kv_cache_groups(
+        vllm_config, kv_cache_spec
+    )
+    if groups is not None:
+        return groups
     groups = _get_glm_sfa_layerwise_kv_cache_groups(
         vllm_config, kv_cache_spec
     )
