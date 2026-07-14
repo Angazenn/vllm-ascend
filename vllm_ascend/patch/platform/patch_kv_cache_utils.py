@@ -21,11 +21,184 @@ from vllm.v1.kv_cache_interface import (
 from vllm_ascend.utils import vllm_version_is
 
 _orig_resolve_kv_cache_block_sizes = vllm.v1.core.kv_cache_utils.resolve_kv_cache_block_sizes
+_orig_get_kv_cache_groups = vllm.v1.core.kv_cache_utils.get_kv_cache_groups
+_orig_get_kv_cache_config_from_groups = (
+    vllm.v1.core.kv_cache_utils.get_kv_cache_config_from_groups
+)
+_orig_max_memory_usage_bytes_from_groups = (
+    vllm.v1.core.kv_cache_utils._max_memory_usage_bytes_from_groups
+)
 _orig_generate_scheduler_kv_cache_config = (
     vllm.v1.core.kv_cache_utils.generate_scheduler_kv_cache_config
 )
 
 _SFA_LAYERWISE_SCHEDULER_SPECS_ATTR = "_ascend_sfa_layerwise_cache_specs"
+
+
+def _get_sfa_decode_offload_groups(
+    vllm_config: VllmConfig,
+    kv_cache_spec: dict[str, KVCacheSpec],
+) -> list[KVCacheGroupSpec] | None:
+    """Build one resident real-indexer group and one offloaded main group."""
+
+    from vllm_ascend.core.kv_cache_interface import (
+        AscendSFAOffloadIndexerCacheSpec,
+        OffloadMLAAttentionSpec,
+    )
+    from vllm_ascend.distributed.kv_transfer.sfa_kv_offload.offload_kv_cache_layout import (
+        extract_sfa_layer_id,
+        is_direct_sfa_kv_offload,
+    )
+
+    if not is_direct_sfa_kv_offload(vllm_config):
+        return None
+    main_names = [
+        name
+        for name, spec in kv_cache_spec.items()
+        if isinstance(spec, OffloadMLAAttentionSpec)
+    ]
+    indexer_names = [
+        name
+        for name, spec in kv_cache_spec.items()
+        if isinstance(spec, AscendSFAOffloadIndexerCacheSpec)
+    ]
+    # No marker means this is the legacy direct/C8 layout.
+    if not indexer_names:
+        return None
+    if len(main_names) + len(indexer_names) != len(kv_cache_spec):
+        raise ValueError(
+            "Direct SFA decode offload cannot be combined with additional KV "
+            "cache spec types."
+        )
+    if not main_names or not indexer_names:
+        raise ValueError(
+            "Direct SFA decode offload requires main KV layers and real "
+            "indexer owners."
+        )
+    if (
+        vllm_config.parallel_config.decode_context_parallel_size != 1
+        or vllm_config.parallel_config.prefill_context_parallel_size != 1
+    ):
+        raise ValueError(
+            "Owner-shared SFA decode offload currently requires DCP=1 and "
+            "PCP=1."
+        )
+
+    main_names.sort(key=extract_sfa_layer_id)
+    indexer_names.sort(key=extract_sfa_layer_id)
+    # Stable ordering is useful for logs, but all runtime consumers resolve
+    # the groups by spec type rather than relying on these positions.
+    return vllm.v1.core.kv_cache_utils.create_kv_cache_group_specs(
+        kv_cache_spec,
+        [indexer_names, main_names],
+    )
+
+
+def get_kv_cache_groups(
+    vllm_config: VllmConfig,
+    kv_cache_spec: dict[str, KVCacheSpec],
+) -> list[KVCacheGroupSpec]:
+    groups = _get_sfa_decode_offload_groups(vllm_config, kv_cache_spec)
+    if groups is not None:
+        return groups
+    return _orig_get_kv_cache_groups(vllm_config, kv_cache_spec)
+
+
+def get_kv_cache_config_from_groups(
+    vllm_config: VllmConfig,
+    kv_cache_groups: list[KVCacheGroupSpec],
+    available_memory: int,
+) -> KVCacheConfig:
+    """Allocate one direct-offload physical pool per real indexer owner."""
+
+    from vllm_ascend.distributed.kv_transfer.sfa_kv_offload.offload_kv_cache_layout import (
+        build_sfa_offload_shared_cache_plan,
+    )
+
+    plan = build_sfa_offload_shared_cache_plan(
+        vllm_config,
+        kv_cache_groups,
+    )
+    if plan is None:
+        return _orig_get_kv_cache_config_from_groups(
+            vllm_config,
+            kv_cache_groups,
+            available_memory,
+        )
+
+    paged_memory = available_memory - plan.total_fixed_hbm_bytes
+    bytes_per_global_block = (
+        plan.num_physical_pools * plan.main_page_bytes
+    )
+    if paged_memory <= 0:
+        raise ValueError(
+            "Direct SFA decode offload fixed resident/tail workspaces exceed "
+            f"available KV memory: fixed={plan.total_fixed_hbm_bytes}, "
+            f"available={available_memory}."
+        )
+    num_blocks = paged_memory // bytes_per_global_block
+    num_blocks = may_override_num_blocks(vllm_config, num_blocks)
+    required_memory = (
+        plan.total_fixed_hbm_bytes
+        + num_blocks * bytes_per_global_block
+    )
+    if num_blocks <= 0 or required_memory > available_memory:
+        raise ValueError(
+            "Direct SFA decode offload block allocation does not fit: "
+            f"num_blocks={num_blocks}, required={required_memory}, "
+            f"available={available_memory}."
+        )
+
+    kv_cache_tensors = [
+        KVCacheTensor(
+            size=plan.main_page_bytes * num_blocks,
+            shared_by=list(pool.shared_by),
+        )
+        for pool in plan.pools
+    ]
+    return KVCacheConfig(
+        num_blocks=num_blocks,
+        kv_cache_tensors=kv_cache_tensors,
+        kv_cache_groups=kv_cache_groups,
+    )
+
+
+def _max_memory_usage_bytes_from_groups(
+    vllm_config: VllmConfig,
+    kv_cache_groups: list[KVCacheGroupSpec],
+) -> int:
+    """Use physical owner pools for direct-offload must-fit accounting."""
+
+    from vllm_ascend.distributed.kv_transfer.sfa_kv_offload.offload_kv_cache_layout import (
+        build_sfa_offload_shared_cache_plan,
+    )
+
+    plan = build_sfa_offload_shared_cache_plan(
+        vllm_config,
+        kv_cache_groups,
+    )
+    if plan is None:
+        return _orig_max_memory_usage_bytes_from_groups(
+            vllm_config,
+            kv_cache_groups,
+        )
+
+    main_spec = kv_cache_groups[plan.main_group_id].kv_cache_spec
+    indexer_spec = kv_cache_groups[plan.indexer_group_id].kv_cache_spec
+    max_model_len = vllm_config.model_config.max_model_len
+    # The two groups own distinct global block ids. At first prefill the main
+    # prefix may coexist with the resident indexer prefix before main blocks
+    # are reclaimed by OffloadMLAAttentionManager.
+    global_blocks_needed = (
+        cdiv(max_model_len, main_spec.block_size)
+        + cdiv(max_model_len, indexer_spec.block_size)
+    )
+    return (
+        plan.total_fixed_hbm_bytes
+        + plan.num_physical_pools
+        * plan.main_page_bytes
+        * global_blocks_needed
+    )
 
 
 def _ascend_generate_scheduler_kv_cache_config(
@@ -291,6 +464,13 @@ def _get_kv_cache_config_deepseek_v4(
 
 
 vllm.v1.core.kv_cache_utils.resolve_kv_cache_block_sizes = _ascend_resolve_kv_cache_block_sizes
+vllm.v1.core.kv_cache_utils.get_kv_cache_groups = get_kv_cache_groups
+vllm.v1.core.kv_cache_utils.get_kv_cache_config_from_groups = (
+    get_kv_cache_config_from_groups
+)
+vllm.v1.core.kv_cache_utils._max_memory_usage_bytes_from_groups = (
+    _max_memory_usage_bytes_from_groups
+)
 vllm.v1.core.kv_cache_utils.generate_scheduler_kv_cache_config = (
     _ascend_generate_scheduler_kv_cache_config
 )

@@ -206,15 +206,23 @@ from vllm.model_executor.layers.attention import Attention, MLAAttention
 from vllm_ascend.core.kv_cache_interface import (
     AscendMLAAttentionSpec,
     AscendSFAIndexerCacheSpec,
+    AscendSFAOffloadIndexerCacheSpec,
     AscendSlidingWindowMLASpec,
     OffloadMLAAttentionSpec,
     OffloadSparseC8Layout,
     compute_offload_sparse_c8_layout,
     make_offload_indexer_mla_spec,
     make_offload_main_mla_spec,
+    make_sfa_offload_indexer_spec,
     offload_indexer_kernel_block_size,
     offload_indexer_pad_dim,
     offload_main_kv_head_dims_for_pool_split,
+)
+from vllm_ascend.distributed.kv_transfer.sfa_kv_offload.offload_kv_cache_layout import (
+    OFFLOAD_TAIL_V,
+    TAIL_WINDOW_BLOCKS,
+    build_sfa_offload_shared_cache_plan,
+    is_direct_sfa_kv_offload,
 )
 
 # if true, allow tensor initialization and casting with internal format (e.g., NZ)
@@ -414,6 +422,12 @@ class NPUModelRunner(GPUModelRunner):
         # Alias retained so the SFA offload paths (which still refer to the
         # legacy name) resolve without touching every callsite.
         self.use_sparse_c8_indexer = self.use_sparse_c8
+        self.use_sfa_owner_shared_offload = (
+            self.use_sparse
+            and self.use_offload
+            and not self.use_sparse_c8_indexer
+            and is_direct_sfa_kv_offload(vllm_config)
+        )
         if get_ascend_device_type() == AscendDeviceType.A5:
             self.c8_k_cache_dtype = torch.float8_e4m3fn
             self.c8_k_scale_cache_dtype = torch.float32
@@ -631,8 +645,11 @@ class NPUModelRunner(GPUModelRunner):
 
         self.num_offloaded_blocks = self._make_buffer(self.max_num_reqs, dtype=torch.int32)
         self.req_ids_tensor = self._make_buffer(self.max_num_reqs, dtype=torch.int64)
+        self.tail_req_indices = self._make_buffer(self.max_num_reqs, dtype=torch.int32)
         self.token_to_req = self._make_buffer(self.max_num_tokens, dtype=torch.int32)
         self.tokens_per_req = self._make_buffer(self.max_num_reqs, dtype=torch.int32)
+        self._sfa_tail_req_slots: dict[str, int] = {}
+        self._sfa_free_tail_slots: list[int] = list(range(self.max_num_reqs))
 
     @property
     def use_cp(self) -> bool:
@@ -923,7 +940,11 @@ class NPUModelRunner(GPUModelRunner):
             # the CPU pool, so the offload threshold must equal the ACTUAL number
             # of main-MLA CPU blocks (covering the whole prefill prefix). Falls
             # back to the heuristic for non-remote connectors (returns None).
-            cpu_blocks_map = maybe_get_num_cpu_blocks(self.input_batch.req_ids[:num_reqs])
+            cpu_blocks_map = (
+                maybe_get_num_cpu_blocks(self.input_batch.req_ids[:num_reqs])
+                if not self.use_sfa_owner_shared_offload
+                else None
+            )
             if cpu_blocks_map is not None:
                 for i, req_id in enumerate(self.input_batch.req_ids[:num_reqs]):
                     if req_id in cpu_blocks_map:
@@ -932,7 +953,8 @@ class NPUModelRunner(GPUModelRunner):
             if self.speculative_config is not None:
                 decode_threshold += self.speculative_config.num_speculative_tokens
             is_prefill = num_scheduled_tokens > decode_threshold
-            num_offloaded_blocks[is_prefill] = 0
+            if not self.use_sfa_owner_shared_offload:
+                num_offloaded_blocks[is_prefill] = 0
 
         # OPTIMIZATION: Start copying the block table first.
         # This way, we can overlap the copy with the following CPU operations.
@@ -1506,18 +1528,57 @@ class NPUModelRunner(GPUModelRunner):
             self.tokens_per_req.copy_to_gpu(num_reqs)
             self.token_to_req.np[:total_num_scheduled_tokens] = req_indices[:total_num_scheduled_tokens]
             self.token_to_req.copy_to_gpu(total_num_scheduled_tokens)
-            req_ids_uint32 = []
-            for req_id in self.input_batch.req_ids:
-                req_ids_uint32.append(req_id_2_int(req_id))
+            req_ids = self.input_batch.req_ids[:num_reqs]
+            req_ids_uint32 = [req_id_2_int(req_id) for req_id in req_ids]
             self.req_ids_tensor.np[:num_reqs] = np.array(req_ids_uint32, dtype=np.uint32)
-            self.req_ids_tensor.copy_to_gpu()
-            set_connector_req_ids(self.input_batch.req_ids)
+            self.req_ids_tensor.copy_to_gpu(num_reqs)
+            if self.use_sfa_owner_shared_offload:
+                released_req_ids = set(scheduler_output.finished_req_ids)
+                released_req_ids.update(scheduler_output.preempted_req_ids)
+                tail_req_indices = self._update_sfa_tail_req_indices(
+                    req_ids,
+                    released_req_ids,
+                )
+                self.tail_req_indices.np[:num_reqs] = np.asarray(
+                    tail_req_indices,
+                    dtype=np.int32,
+                )
+                self.tail_req_indices.copy_to_gpu(num_reqs)
+                set_connector_req_ids(req_ids, tail_req_indices)
+            else:
+                set_connector_req_ids(req_ids)
 
         return (
             logits_indices,
             spec_decode_metadata,
             total_num_scheduled_tokens,
         )
+
+    def _update_sfa_tail_req_indices(
+        self,
+        req_ids: list[str],
+        released_req_ids: set[str] | None = None,
+    ) -> list[int]:
+        """Assign stable per-request slots in the layer-private tail caches."""
+        for req_id in released_req_ids or ():
+            tail_index = self._sfa_tail_req_slots.pop(req_id, None)
+            if tail_index is not None:
+                self._sfa_free_tail_slots.append(tail_index)
+        self._sfa_free_tail_slots.sort()
+
+        tail_indices: list[int] = []
+        for req_id in req_ids:
+            tail_index = self._sfa_tail_req_slots.get(req_id)
+            if tail_index is None:
+                if not self._sfa_free_tail_slots:
+                    raise RuntimeError(
+                        "No free SFA tail cache request slots; "
+                        f"max_num_reqs={self.max_num_reqs}"
+                    )
+                tail_index = self._sfa_free_tail_slots.pop(0)
+                self._sfa_tail_req_slots[req_id] = tail_index
+            tail_indices.append(tail_index)
+        return tail_indices
 
     def _rebuild_input_ids_with_corrected_positions(
         self,
@@ -2240,6 +2301,18 @@ class NPUModelRunner(GPUModelRunner):
                 deferred_state_corrections_fn = self._update_states(
                     scheduler_output
                 )
+
+                if self.use_sfa_owner_shared_offload:
+                    # A finished-request-only scheduler step returns before
+                    # _prepare_inputs(), but it still has to release the
+                    # request's stable tail-cache slot for future batches.
+                    released_req_ids = set(scheduler_output.finished_req_ids)
+                    released_req_ids.update(scheduler_output.preempted_req_ids)
+                    if released_req_ids:
+                        self._update_sfa_tail_req_indices(
+                            [],
+                            released_req_ids,
+                        )
 
                 if has_ec_transfer() and get_ec_transfer().is_producer:
                     with self.maybe_get_ec_connector_output(
@@ -3354,7 +3427,25 @@ class NPUModelRunner(GPUModelRunner):
                     )
             return blk_table_tensor, slot_mapping
 
-        block_table_gid_0, slot_mapping_gid_0 = _get_block_table_and_slot_mapping(0)
+        group_block_tables: list[torch.Tensor] | None = None
+        group_slot_mappings: list[torch.Tensor] | None = None
+        if self.use_sfa_owner_shared_offload:
+            # The main and real-indexer groups have different manager block
+            # sizes and disjoint global block IDs. Preserve both mappings in
+            # generic metadata; SFA resolves the semantic role from the cache
+            # plan instead of relying on group order.
+            group_pairs = [
+                _get_block_table_and_slot_mapping(group_id)
+                for group_id in range(len(kv_cache_groups))
+            ]
+            group_block_tables = [pair[0] for pair in group_pairs]
+            group_slot_mappings = [pair[1] for pair in group_pairs]
+            block_table_gid_0 = group_block_tables[0]
+            slot_mapping_gid_0 = group_slot_mappings[0]
+        else:
+            block_table_gid_0, slot_mapping_gid_0 = (
+                _get_block_table_and_slot_mapping(0)
+            )
         self.long_seq_metadata, block_table_gid_0 = _get_pcp_metadata(block_table_gid_0)
         num_computed_tokens_cpu = self.input_batch.num_computed_tokens_cpu_tensor[
             :num_reqs_padded
@@ -3401,6 +3492,26 @@ class NPUModelRunner(GPUModelRunner):
             attn_state=self.attn_state,
             decode_token_per_req=self.decode_token_per_req,
             prefill_context_parallel_metadata=self.long_seq_metadata,
+            block_table_tensors_by_group=group_block_tables,
+            slot_mappings_by_group=group_slot_mappings,
+            num_offloaded_blocks=self.num_offloaded_blocks.gpu[:num_reqs]
+            if self.use_sfa_owner_shared_offload
+            else None,
+            num_offloaded_blocks_cpu=self.num_offloaded_blocks.cpu[:num_reqs]
+            if self.use_sfa_owner_shared_offload
+            else None,
+            req_ids_tensor=self.req_ids_tensor.gpu[:num_reqs]
+            if self.use_sfa_owner_shared_offload
+            else None,
+            tail_req_indices=self.tail_req_indices.gpu[:num_reqs]
+            if self.use_sfa_owner_shared_offload
+            else None,
+            token_to_req=self.token_to_req.gpu[:num_tokens]
+            if self.use_sfa_owner_shared_offload
+            else None,
+            tokens_per_req=self.tokens_per_req.gpu[:num_reqs]
+            if self.use_sfa_owner_shared_offload
+            else None,
         )
 
         if logits_indices is not None and self.cache_config.kv_sharing_fast_prefill:
@@ -3485,9 +3596,14 @@ class NPUModelRunner(GPUModelRunner):
         common_ratio_to_sas_metadata: dict[Any, Any] = {}
         spec_decode_common_attn_metadata = None
         for kv_cache_gid, kv_cache_group in enumerate(self.kv_cache_config.kv_cache_groups):
-            if self.use_offload:
-                if kv_cache_gid == 0: # indexer
-                    continue
+            if (
+                self.use_offload
+                and not self.use_sfa_owner_shared_offload
+                and kv_cache_gid == 0
+            ):
+                # Legacy decode offload embeds the indexer in the main cache
+                # tuple, so its synthetic scheduler group has no layer pass.
+                continue
             cm = copy(cm_base)  # shallow copy
             # Basically only the encoder seq_lens, block_table and slot_mapping change
             # for each kv_cache_group.
@@ -3508,7 +3624,12 @@ class NPUModelRunner(GPUModelRunner):
                     cm.query_start_loc_cpu = self.gdn_query_start_loc.cpu[: num_reqs_padded + 1]
                     cm.query_start_loc = self.gdn_query_start_loc.gpu[: num_reqs_padded + 1]
 
-            if kv_cache_gid > 0:
+            if self.use_sfa_owner_shared_offload:
+                assert group_block_tables is not None
+                assert group_slot_mappings is not None
+                cm.block_table_tensor = group_block_tables[kv_cache_gid]
+                cm.slot_mapping = group_slot_mappings[kv_cache_gid]
+            elif kv_cache_gid > 0:
                 cm.block_table_tensor, cm.slot_mapping = _get_block_table_and_slot_mapping(
                     kv_cache_gid
                 )
@@ -3528,14 +3649,32 @@ class NPUModelRunner(GPUModelRunner):
                 from vllm_ascend.attention.kvcomp_attn.attention_utils import build_kvcomp_metadata
                 build_kvcomp_metadata(self.kvcomp_meta_data, cm)
             if self.use_offload:
-                indexer_block_table_tensor, indexer_slot_mapping = _get_block_table_and_slot_mapping(0)
-                cm.indexer_block_table_tensor = indexer_block_table_tensor
-                cm.indexer_slot_mapping = indexer_slot_mapping
-                cm.num_offloaded_blocks = self.num_offloaded_blocks.gpu[:num_reqs]
-                cm.req_ids_tensor = self.req_ids_tensor.gpu[:num_reqs]
-                cm.token_to_req = self.token_to_req.gpu[:num_tokens]
-                cm.tokens_per_req = self.tokens_per_req.gpu[:num_reqs]
-                kv_cache_gid = 0
+                if self.use_sfa_owner_shared_offload:
+                    cm.block_table_tensors_by_group = group_block_tables
+                    cm.slot_mappings_by_group = group_slot_mappings
+                    cm.num_offloaded_blocks = (
+                        self.num_offloaded_blocks.gpu[:num_reqs]
+                    )
+                    cm.num_offloaded_blocks_cpu = (
+                        self.num_offloaded_blocks.cpu[:num_reqs]
+                    )
+                    cm.req_ids_tensor = self.req_ids_tensor.gpu[:num_reqs]
+                    cm.tail_req_indices = self.tail_req_indices.gpu[:num_reqs]
+                    cm.token_to_req = self.token_to_req.gpu[:num_tokens]
+                    cm.tokens_per_req = self.tokens_per_req.gpu[:num_reqs]
+                else:
+                    indexer_block_table_tensor, indexer_slot_mapping = (
+                        _get_block_table_and_slot_mapping(0)
+                    )
+                    cm.indexer_block_table_tensor = indexer_block_table_tensor
+                    cm.indexer_slot_mapping = indexer_slot_mapping
+                    cm.num_offloaded_blocks = (
+                        self.num_offloaded_blocks.gpu[:num_reqs]
+                    )
+                    cm.req_ids_tensor = self.req_ids_tensor.gpu[:num_reqs]
+                    cm.token_to_req = self.token_to_req.gpu[:num_tokens]
+                    cm.tokens_per_req = self.tokens_per_req.gpu[:num_reqs]
+                    kv_cache_gid = 0
             for attn_gid in range(len(self.attn_groups[kv_cache_gid])):
                 _build_attn_group_metadata(
                     kv_cache_gid,
@@ -4213,6 +4352,26 @@ class NPUModelRunner(GPUModelRunner):
         """
         kv_cache_config = deepcopy(kv_cache_config)
         self.kv_cache_config = kv_cache_config
+        self.sfa_offload_shared_cache_plan = (
+            build_sfa_offload_shared_cache_plan(
+                self.vllm_config,
+                kv_cache_config.kv_cache_groups,
+            )
+            if self.use_sfa_owner_shared_offload
+            else None
+        )
+        if self.sfa_offload_shared_cache_plan is not None:
+            plan = self.sfa_offload_shared_cache_plan
+            logger.info(
+                "SFA owner-shared decode cache: indexer_group=%d, "
+                "main_group=%d, owner_pools=%d, main_layers=%d, "
+                "num_blocks=%d",
+                plan.indexer_group_id,
+                plan.main_group_id,
+                plan.num_physical_pools,
+                len(plan.main_layer_names),
+                kv_cache_config.num_blocks,
+            )
         self._mamba_bufs = None
         self._mamba_copy_bufs = None
         self.may_add_encoder_only_layers_to_kv_cache_config()
@@ -4352,6 +4511,17 @@ class NPUModelRunner(GPUModelRunner):
                     self.kv_caches,
                     num_attn_module,
                 )
+
+        if self.sfa_offload_shared_cache_plan is not None:
+            plan = self.sfa_offload_shared_cache_plan
+            for layer_name in plan.main_layer_names:
+                attention_layer = (
+                    self.compilation_config.static_forward_context[layer_name]
+                )
+                attention_layer.impl.sfa_indexer_group_id = (
+                    plan.indexer_group_id
+                )
+                attention_layer.impl.sfa_main_group_id = plan.main_group_id
 
         if self.enable_hamming_sparse is True:
             from vllm_ascend.worker.kvcomp_utils import init_and_bind_hashk_cache
@@ -4539,6 +4709,65 @@ class NPUModelRunner(GPUModelRunner):
                     "hybrid attention+mamba KV cache tensors."
                 )
             self.hybrid_with_attn_and_mamba = self.hybrid_with_attn_and_mamba or (use_mamba and use_attn)
+
+            shared_layer_names = list(kv_cache_tensor.shared_by)
+            owner_indexers = [
+                name
+                for name in shared_layer_names
+                if isinstance(
+                    layer_kv_cache_spec[name],
+                    AscendSFAOffloadIndexerCacheSpec,
+                )
+            ]
+            if owner_indexers:
+                main_names = [
+                    name
+                    for name in shared_layer_names
+                    if isinstance(
+                        layer_kv_cache_spec[name],
+                        OffloadMLAAttentionSpec,
+                    )
+                ]
+                if (
+                    not self.use_sfa_owner_shared_offload
+                    or len(owner_indexers) != 1
+                    or not main_names
+                    or len(main_names) + 1 != len(shared_layer_names)
+                ):
+                    raise ValueError(
+                        "An owner-shared SFA decode pool must contain exactly "
+                        "one real indexer and at least one main KV layer."
+                    )
+
+                # One physical pool is represented by two contiguous aligned
+                # allocations because the SFA kernels require independently
+                # contiguous K and V tensors. The indexer aliases raw K.
+                hf_cfg = self.model_config.hf_text_config
+                total_dim = hf_cfg.kv_lora_rank + hf_cfg.qk_rope_head_dim
+                k_tensor_size = (
+                    kv_cache_tensor.size * hf_cfg.kv_lora_rank // total_dim
+                )
+                v_tensor_size = kv_cache_tensor.size - k_tensor_size
+                if k_tensor_size <= 0 or v_tensor_size <= 0:
+                    raise ValueError(
+                        "Invalid owner-shared SFA K/V pool split: "
+                        f"total={kv_cache_tensor.size}, k={k_tensor_size}, "
+                        f"v={v_tensor_size}."
+                    )
+                raw_cache = (
+                    self._allocate_int8_cache_tensor(
+                        k_tensor_size,
+                        alignment,
+                    ),
+                    self._allocate_int8_cache_tensor(
+                        v_tensor_size,
+                        alignment,
+                    ),
+                )
+                for name in shared_layer_names:
+                    kv_cache_raw_tensors[name] = raw_cache
+                continue
+
             for idx in range(len(kv_cache_tensor.shared_by)):
                 layer_name = kv_cache_tensor.shared_by[idx]
                 if (
@@ -4800,9 +5029,53 @@ class NPUModelRunner(GPUModelRunner):
 
                 current_kv_cache_spec = layer_kv_cache_spec[layer_name]
 
+                if isinstance(
+                    current_kv_cache_spec,
+                    AscendSFAOffloadIndexerCacheSpec,
+                ):
+                    raw_k_tensor, raw_v_tensor = kv_cache_raw_tensors[
+                        layer_name
+                    ]
+                    total_bytes = (
+                        raw_k_tensor.numel() + raw_v_tensor.numel()
+                    )
+                    if (
+                        total_bytes
+                        % current_kv_cache_spec.page_size_bytes
+                        != 0
+                    ):
+                        raise ValueError(
+                            "Owner-shared SFA indexer raw pool is not an "
+                            "integer number of manager pages."
+                        )
+                    num_blocks = (
+                        total_bytes
+                        // current_kv_cache_spec.page_size_bytes
+                    )
+                    indexer_shape = attn_backend.get_kv_cache_shape(
+                        num_blocks,
+                        current_kv_cache_spec.block_size,
+                        current_kv_cache_spec.num_kv_heads,
+                        current_kv_cache_spec.head_size,
+                    )
+                    expected_k_bytes = (
+                        math.prod(indexer_shape)
+                        * get_dtype_size(current_kv_cache_spec.dtype)
+                    )
+                    if expected_k_bytes != raw_k_tensor.numel():
+                        raise ValueError(
+                            "Owner-shared SFA indexer alias must consume the "
+                            "complete raw K pool, got "
+                            f"expected={expected_k_bytes}, "
+                            f"actual={raw_k_tensor.numel()}."
+                        )
+                    indexer_k_cache = raw_k_tensor.view(
+                        current_kv_cache_spec.dtype
+                    ).view(indexer_shape)
+                    kv_caches[layer_name] = (indexer_k_cache,)
                 # TODO: remove this after the OOM issue is located and fixed, otherwise, some model may
                 # encounter OOM issue
-                if self.use_sparse and self.use_offload:
+                elif self.use_sparse and self.use_offload:
                     raw_entry = kv_cache_raw_tensors[layer_name]  # type: ignore
                     hf_cfg = self.model_config.hf_text_config
                     c8_layout = None
@@ -4873,14 +5146,14 @@ class NPUModelRunner(GPUModelRunner):
                     lru_resident_enabled = self.ascend_config.use_offload and lru_resident_config.enabled
                     resident_capacity = lru_resident_config.buffer_size if lru_resident_enabled else 2048
                     topk_buffer_k = torch.zeros(
-                        [max_num_topk_rows, resident_capacity, 1, 512],
-                        dtype=torch.bfloat16,
-                        device='npu',
+                        [max_num_topk_rows, resident_capacity, 1, hf_cfg.kv_lora_rank],
+                        dtype=dtype,
+                        device=self.device,
                     )
                     topk_buffer_v = torch.zeros(
-                        [max_num_topk_rows, resident_capacity, 1, 64],
-                        dtype=torch.bfloat16,
-                        device='npu',
+                        [max_num_topk_rows, resident_capacity, 1, hf_cfg.qk_rope_head_dim],
+                        dtype=dtype,
+                        device=self.device,
                     )
 
                     indexer_k_dtype = (
@@ -4913,6 +5186,35 @@ class NPUModelRunner(GPUModelRunner):
                             .view(dsa_k_scale_cache_shape)
                         )
                         kv_cache_entries.append(dsa_k_scale_cache)
+                    elif self.use_sfa_owner_shared_offload:
+                        tail_blocks = (
+                            self.vllm_config.scheduler_config.max_num_seqs
+                            * TAIL_WINDOW_BLOCKS
+                        )
+                        tail_k_cache = torch.zeros(
+                            [
+                                tail_blocks,
+                                mla_block_size,
+                                num_kv_heads,
+                                hf_cfg.kv_lora_rank,
+                            ],
+                            dtype=dtype,
+                            device=self.device,
+                        )
+                        tail_v_cache = torch.zeros(
+                            [
+                                tail_blocks,
+                                mla_block_size,
+                                num_kv_heads,
+                                hf_cfg.qk_rope_head_dim,
+                            ],
+                            dtype=dtype,
+                            device=self.device,
+                        )
+                        kv_cache_entries.extend(
+                            [tail_k_cache, tail_v_cache]
+                        )
+                        assert len(kv_cache_entries) == OFFLOAD_TAIL_V + 1
                     kv_caches[layer_name] = tuple(kv_cache_entries)
                 elif self.use_compress and isinstance(current_kv_cache_spec,
                                                     (AscendMLAAttentionSpec, AscendSlidingWindowMLASpec)):
@@ -5240,7 +5542,7 @@ class NPUModelRunner(GPUModelRunner):
         # For other backends (like Mamba), use [0] (no splitting)
         self.kernel_block_sizes = []
         # TODO try compatible with current compute flow
-        if self.use_offload:
+        if self.use_offload and not self.use_sfa_owner_shared_offload:
             hf_cfg = self.model_config.hf_text_config
             if self.use_sparse_c8_indexer:
                 c8_layout = self._get_offload_sparse_c8_layout()
@@ -5256,6 +5558,27 @@ class NPUModelRunner(GPUModelRunner):
             self.kernel_block_sizes = [[indexer_kernel_block], [self.block_size]]
         for kv_cache_group_id, kv_cache_group in enumerate(kv_cache_config.kv_cache_groups):
             if self.use_offload:
+                if self.use_sfa_owner_shared_offload:
+                    kv_cache_spec = kv_cache_group.kv_cache_spec
+                    if isinstance(
+                        kv_cache_spec,
+                        AscendSFAOffloadIndexerCacheSpec,
+                    ):
+                        self.kernel_block_sizes.append(
+                            [kv_cache_spec.block_size]
+                        )
+                    elif isinstance(
+                        kv_cache_spec,
+                        OffloadMLAAttentionSpec,
+                    ):
+                        self.kernel_block_sizes.append(
+                            [kv_cache_spec.block_size]
+                        )
+                    else:
+                        raise ValueError(
+                            "Unexpected cache group in owner-shared SFA "
+                            f"decode offload: {type(kv_cache_spec).__name__}."
+                        )
                 continue
             if self.pcp_size > 1:
                 self.pcp_manager.initialize_slot_mapping()
@@ -5355,7 +5678,13 @@ class NPUModelRunner(GPUModelRunner):
                 layer_kv_cache_spec = kv_cache_group_spec.kv_cache_spec
                 if isinstance(layer_kv_cache_spec, UniformTypeKVCacheSpecs):
                     layer_kv_cache_spec = layer_kv_cache_spec.kv_cache_specs[layer_name]
-                if isinstance(layer_kv_cache_spec, AscendSFAIndexerCacheSpec):
+                if isinstance(
+                    layer_kv_cache_spec,
+                    (
+                        AscendSFAIndexerCacheSpec,
+                        AscendSFAOffloadIndexerCacheSpec,
+                    ),
+                ):
                     from vllm_ascend.attention.indexer import AscendSFAIndexerBackend
 
                     attn_backend = AscendSFAIndexerBackend
@@ -5395,11 +5724,21 @@ class NPUModelRunner(GPUModelRunner):
         for kv_cache_group_spec in kv_cache_config.kv_cache_groups:
             group_spec = kv_cache_group_spec.kv_cache_spec
             has_split_indexer = isinstance(
-                group_spec, AscendSFAIndexerCacheSpec
+                group_spec,
+                (
+                    AscendSFAIndexerCacheSpec,
+                    AscendSFAOffloadIndexerCacheSpec,
+                ),
             ) or (
                 isinstance(group_spec, UniformTypeKVCacheSpecs)
                 and any(
-                    isinstance(spec, AscendSFAIndexerCacheSpec)
+                    isinstance(
+                        spec,
+                        (
+                            AscendSFAIndexerCacheSpec,
+                            AscendSFAOffloadIndexerCacheSpec,
+                        ),
+                    )
                     for spec in group_spec.kv_cache_specs.values()
                 )
             )
@@ -5465,7 +5804,11 @@ class NPUModelRunner(GPUModelRunner):
         attn_layer_names = set()
         # Sparse offload exposes both the per-layer indexer cache and the MLA
         # attention cache in attn_layers.
-        if self.use_sparse and self.use_offload:
+        if (
+            self.use_sparse
+            and self.use_offload
+            and not self.use_sfa_owner_shared_offload
+        ):
             # glm5.2, pad reused indexer module for kv allocating
             # TODO change to full hybrid (4 kv + 1 indexer)
             # Pad an indexer for EVERY main MLA layer (incl MTP/spec-decode extra
@@ -5482,7 +5825,37 @@ class NPUModelRunner(GPUModelRunner):
                 if indexer_name not in attn_layers:
                     attn_layers[indexer_name] = deepcopy(indexer_module)
         for layer_name, attn_module in attn_layers.items():
-            if self.use_sparse and self.use_offload:
+            if (
+                self.use_sfa_owner_shared_offload
+                and isinstance(attn_module, MLAAttention)
+            ):
+                hf_cfg = self.model_config.hf_text_config
+                kv_cache_spec[layer_name] = make_offload_main_mla_spec(
+                    block_size=self.block_size,
+                    num_kv_heads=1,
+                    head_size=(
+                        hf_cfg.kv_lora_rank
+                        + hf_cfg.qk_rope_head_dim
+                    ),
+                    dtype=self.kv_cache_dtype,
+                )
+            elif (
+                self.use_sfa_owner_shared_offload
+                and isinstance(attn_module, DeepseekV32IndexerCache)
+            ):
+                hf_cfg = self.model_config.hf_text_config
+                kv_cache_spec[layer_name] = make_sfa_offload_indexer_spec(
+                    main_block_size=self.block_size,
+                    num_kv_heads=1,
+                    kv_lora_rank=hf_cfg.kv_lora_rank,
+                    qk_rope_head_dim=hf_cfg.qk_rope_head_dim,
+                    index_head_dim=hf_cfg.index_head_dim,
+                    dtype=self.kv_cache_dtype,
+                    cache_dtype_str=(
+                        self.vllm_config.cache_config.cache_dtype
+                    ),
+                )
+            elif self.use_sparse and self.use_offload:
                 if isinstance(attn_module, MLAAttention):
                     hf_cfg = self.model_config.hf_text_config
                     kv_cache_spec[layer_name] = make_offload_main_mla_spec(

@@ -18,6 +18,9 @@ from vllm.v1.request import Request
 
 from vllm_ascend.distributed.kv_transfer.sfa_kv_offload.sfa_kv_offload_scheduler import SFAKVOffloadlScheduler
 from vllm_ascend.distributed.kv_transfer.sfa_kv_offload.sfa_kv_offload_worker import SFAKVOffloadWorker
+from vllm_ascend.distributed.kv_transfer.sfa_kv_offload.offload_kv_cache_layout import (
+    build_sfa_offload_shared_cache_plan,
+)
 
 class SFAKVOffloadConnector(KVConnectorBase_V1, SupportsHMA):
     def __init__(self, vllm_config: VllmConfig, role: KVConnectorRole, kv_cache_config: KVCacheConfig | None = None):
@@ -25,6 +28,15 @@ class SFAKVOffloadConnector(KVConnectorBase_V1, SupportsHMA):
         self.kv_role = vllm_config.kv_transfer_config.kv_role
 
         self.use_layerwise = vllm_config.kv_transfer_config.kv_connector_extra_config.get("use_layerwise", False)
+        shared_cache_plan = build_sfa_offload_shared_cache_plan(
+            vllm_config,
+            kv_cache_config.kv_cache_groups,
+        )
+        self.main_group_id = (
+            shared_cache_plan.main_group_id
+            if shared_cache_plan is not None
+            else len(kv_cache_config.kv_cache_groups) - 1
+        )
 
         if role == KVConnectorRole.SCHEDULER:
             self.connector_scheduler = SFAKVOffloadlScheduler(vllm_config, self.use_layerwise, kv_cache_config)
@@ -68,8 +80,10 @@ class SFAKVOffloadConnector(KVConnectorBase_V1, SupportsHMA):
         block_ids: tuple[list[int], ...],
     ) -> tuple[bool, dict[str, Any] | None]:
         assert self.connector_scheduler is not None
-        # sfa offload, 0 for indexer and 1 for ori kv_cache
-        return self.request_finished(request, block_ids[-1])
+        return self.request_finished(
+            request,
+            block_ids[self.main_group_id],
+        )
 
     ############################################################
     # Worker Side Methods
@@ -86,6 +100,9 @@ class SFAKVOffloadConnector(KVConnectorBase_V1, SupportsHMA):
     def wait_for_layer_load(self, layer_name: str) -> None:
         # In sfa kv offload, we use prepare_lru_resident_and_load instead of wait_for_layer_load
         return
+
+    def wait_for_scratch_reuse(self, layer_name: str) -> None:
+        self.connector_worker.wait_for_scratch_reuse(layer_name)
 
     def save_kv_layer(
         self, layer_name: str, kv_layer: torch.Tensor, attn_metadata: "AttentionMetadata", **kwargs
@@ -117,8 +134,15 @@ class SFAKVOffloadConnector(KVConnectorBase_V1, SupportsHMA):
             capturing,
         )
 
-    def set_req_ids(self, req_ids: list):
-        return self.connector_worker.set_req_ids(req_ids)
+    def set_req_ids(
+        self,
+        req_ids: list[str],
+        tail_req_indices: list[int] | None = None,
+    ):
+        return self.connector_worker.set_req_ids(
+            req_ids,
+            tail_req_indices,
+        )
 
     def get_finished(self, finished_req_ids: set[str]) -> tuple[set[str], set[str]]:
         # In sfa kv offload, we don't need delay free, thus no need to return finished_send/recv too.

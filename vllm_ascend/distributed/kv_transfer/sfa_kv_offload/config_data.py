@@ -93,3 +93,4 @@ class LayerMultiBlockReqMeta:
     block_ids_cpu: list[int] | None = None
     cache_npu: tuple[torch.Tensor, torch.Tensor] | None = None
     cache_cpu: tuple[torch.Tensor, torch.Tensor] | None = None
+    uses_shared_scratch: bool = False

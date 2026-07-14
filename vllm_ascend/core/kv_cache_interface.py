@@ -403,6 +403,58 @@ class AscendSFAIndexerCacheSpec(FullAttentionSpec):
 
 
 @dataclass(frozen=True, kw_only=True)
+class AscendSFAOffloadIndexerCacheSpec(FullAttentionSpec):
+    """Resident BF16 indexer cache for direct SFA decode offload.
+
+    ``head_size`` is the real indexer width. ``indexer_pad_dim`` accounts for
+    the V bytes that are not part of the K alias, making one indexer manager
+    page the same size as one main MLA manager page. The model runner binds the
+    actual cache to a contiguous view over the shared raw K allocation.
+    """
+
+    indexer_pad_dim: int = 0
+    cache_dtype_str: str | None = None
+
+    @property
+    def page_size_bytes(self) -> int:
+        return (
+            self.block_size
+            * self.num_kv_heads
+            * (self.head_size + self.indexer_pad_dim)
+            * get_dtype_size(self.dtype)
+        )
+
+    @property
+    def real_page_size_bytes(self) -> int:
+        return (
+            self.block_size
+            * self.num_kv_heads
+            * self.head_size
+            * get_dtype_size(self.dtype)
+        )
+
+    @classmethod
+    def merge(cls, specs: list[Self]) -> Self:
+        assert specs and all(isinstance(spec, cls) for spec in specs)
+        layouts = {
+            (
+                spec.block_size,
+                spec.num_kv_heads,
+                spec.head_size,
+                spec.dtype,
+                spec.indexer_pad_dim,
+                spec.cache_dtype_str,
+            )
+            for spec in specs
+        }
+        assert len(layouts) == 1, (
+            "All direct SFA offload indexers in one group must use the same "
+            "physical cache layout."
+        )
+        return specs[0]
+
+
+@dataclass(frozen=True, kw_only=True)
 class AscendSlidingWindowMLASpec(SlidingWindowMLASpec):
     """Sliding window attention with MLA cache format."""
 
@@ -536,6 +588,60 @@ def make_offload_main_mla_spec(
     )
 
 
+def make_sfa_offload_indexer_spec(
+    *,
+    main_block_size: int,
+    num_kv_heads: int,
+    kv_lora_rank: int,
+    qk_rope_head_dim: int,
+    index_head_dim: int,
+    dtype: torch.dtype,
+    cache_dtype_str: str,
+) -> AscendSFAOffloadIndexerCacheSpec:
+    """Build a page-compatible real-indexer spec for BF16 decode offload."""
+
+    if kv_lora_rank % index_head_dim != 0:
+        raise ValueError(
+            "SFA decode offload requires kv_lora_rank to be divisible by "
+            f"index_head_dim, got {kv_lora_rank=} {index_head_dim=}."
+        )
+    if (index_head_dim * qk_rope_head_dim) % kv_lora_rank != 0:
+        raise ValueError(
+            "SFA decode offload requires index_head_dim * qk_rope_head_dim "
+            "to be divisible by kv_lora_rank, got "
+            f"{index_head_dim=} {qk_rope_head_dim=} {kv_lora_rank=}."
+        )
+
+    indexer_block_size = (
+        main_block_size * kv_lora_rank // index_head_dim
+    )
+    indexer_pad_dim = offload_indexer_pad_dim(
+        index_head_dim,
+        qk_rope_head_dim,
+        kv_lora_rank,
+    )
+    spec = AscendSFAOffloadIndexerCacheSpec(
+        block_size=indexer_block_size,
+        num_kv_heads=num_kv_heads,
+        head_size=index_head_dim,
+        indexer_pad_dim=indexer_pad_dim,
+        dtype=dtype,
+        cache_dtype_str=cache_dtype_str,
+    )
+    expected_page_size = (
+        main_block_size
+        * num_kv_heads
+        * (kv_lora_rank + qk_rope_head_dim)
+        * get_dtype_size(dtype)
+    )
+    if spec.page_size_bytes != expected_page_size:
+        raise ValueError(
+            "SFA decode offload main/indexer manager pages must match, got "
+            f"main={expected_page_size} indexer={spec.page_size_bytes}."
+        )
+    return spec
+
+
 def make_offload_indexer_mla_spec(
     *,
     block_size: int,
@@ -593,6 +699,11 @@ def register_ascend_kv_cache_specs() -> None:
     )
     KVCacheSpecRegistry.register(
         kvcache_spec_cls=AscendSFAIndexerCacheSpec,
+        manager_class=FullAttentionManager,
+        uniform_type_base_spec=FullAttentionSpec,
+    )
+    KVCacheSpecRegistry.register(
+        kvcache_spec_cls=AscendSFAOffloadIndexerCacheSpec,
         manager_class=FullAttentionManager,
         uniform_type_base_spec=FullAttentionSpec,
     )

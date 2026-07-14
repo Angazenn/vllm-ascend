@@ -578,8 +578,98 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
         self.runner.tokens_per_req.copy_to_gpu(num_reqs)
         self.runner.token_to_req.np[:num_tokens] = token_to_req
         self.runner.token_to_req.copy_to_gpu(num_tokens)
+        tail_req_indices = getattr(self.runner, "tail_req_indices", None)
+        if tail_req_indices is not None:
+            tail_req_indices.np[:num_reqs] = np.arange(
+                num_reqs,
+                dtype=np.int32,
+            )
+            tail_req_indices.copy_to_gpu(num_reqs)
 
         return self._get_dummy_block_table_and_slot_mapping(0, num_reqs)
+
+    def _populate_owner_offload_group_metadata(
+        self,
+        common_attn_metadata: CommonAttentionMetadata,
+        num_input_tokens: int,
+        draft_index: int = 0,
+    ) -> None:
+        """Rebuild both owner-shared cache mappings for an MTP draft pass."""
+        plan = getattr(
+            self.runner,
+            "sfa_offload_shared_cache_plan",
+            None,
+        )
+        if plan is None:
+            return
+
+        num_actual_tokens = common_attn_metadata.num_actual_tokens
+        num_reqs = common_attn_metadata.num_reqs
+        positions = common_attn_metadata.positions
+        if positions is None or positions.shape[-1] < num_actual_tokens:
+            positions = self.positions
+        positions = positions[:num_actual_tokens].to(torch.int64)
+
+        token_to_req = common_attn_metadata.token_to_req
+        if token_to_req is None or token_to_req.shape[0] < num_actual_tokens:
+            token_to_req = self.runner.token_to_req.gpu[:num_actual_tokens]
+        else:
+            token_to_req = token_to_req[:num_actual_tokens]
+        token_to_req = token_to_req.to(torch.int64)
+
+        num_groups = len(self.runner.kv_cache_config.kv_cache_groups)
+        block_tables: list[torch.Tensor] = []
+        slot_mappings: list[torch.Tensor] = []
+        for group_id in range(num_groups):
+            group_block_table = self.runner.input_batch.block_table[group_id]
+            block_table = group_block_table.get_device_tensor()[:num_reqs]
+            block_size = self.runner.kv_cache_config.kv_cache_groups[
+                group_id
+            ].kv_cache_spec.block_size
+            logical_blocks = torch.div(
+                positions,
+                block_size,
+                rounding_mode="floor",
+            )
+            physical_blocks = block_table[
+                token_to_req,
+                logical_blocks,
+            ].to(torch.int64)
+            slots = physical_blocks * block_size + positions % block_size
+
+            # MTP reuses the existing persistent legacy buffers only as
+            # storage. The metadata exposed to SFA remains the generic
+            # per-group lists, with no explicit indexer slot mapping.
+            if group_id == plan.main_group_id:
+                slot_buffer = self.slot_mapping_group[draft_index]
+            elif group_id == plan.indexer_group_id:
+                slot_buffer = self.indexer_slot_mapping_group[draft_index]
+            else:
+                raise RuntimeError(
+                    "Owner-shared SFA decode offload expected exactly the "
+                    f"main/indexer groups, got group_id={group_id}."
+                )
+            slot_buffer.fill_(PADDING_SLOT_ID)
+            slot_buffer[:num_actual_tokens].copy_(slots.to(torch.int32))
+            block_tables.append(block_table)
+            slot_mappings.append(slot_buffer[:num_input_tokens])
+
+        common_attn_metadata.block_table_tensors_by_group = block_tables
+        common_attn_metadata.slot_mappings_by_group = slot_mappings
+        common_attn_metadata.block_table_tensor = block_tables[
+            plan.main_group_id
+        ]
+        common_attn_metadata.slot_mapping = slot_mappings[
+            plan.main_group_id
+        ]
+        common_attn_metadata.indexer_block_table_tensor = None
+        common_attn_metadata.indexer_slot_mapping = None
+        common_attn_metadata.positions = positions
+        common_attn_metadata.token_to_req = token_to_req
+        if common_attn_metadata.tail_req_indices is None:
+            common_attn_metadata.tail_req_indices = (
+                self.runner.tail_req_indices.gpu[:num_reqs]
+            )
 
     def _get_indexer_slot_mapping_for_positions(
         self,
@@ -725,6 +815,11 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
                 if self.pcp_size * self.dcp_size > 1 and draft_index > 0:
                     assert self.block_table_tensor_clone is not None, "block_table_tensor_clone is not init"
                     common_attn_metadata.block_table_tensor = self.block_table_tensor_clone[:num_reqs]
+                self._populate_owner_offload_group_metadata(
+                    common_attn_metadata,
+                    num_tokens,
+                    draft_index,
+                )
                 if not self.use_compress or draft_index == 0:
                     attn_metadata_eagle = builder.build_for_graph_capture(
                         common_attn_metadata,
@@ -990,6 +1085,10 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
         common_attn_metadata.query_start_loc = self.query_start_loc_group[0][: num_reqs_padded + 1]
 
         common_attn_metadata.num_input_tokens = num_input_tokens
+        self._populate_owner_offload_group_metadata(
+            common_attn_metadata,
+            num_input_tokens,
+        )
         # FIXME(woosuk): The below two ops cause synchronization. Optimize.
         assert len(self.draft_attn_groups) > 0
         builder = self.draft_attn_groups[0].get_metadata_builder()
@@ -1865,6 +1964,15 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
                 self.indexer_slot_mapping_group[draft_index][indexer_slot_mapping.shape[0] :].fill_(PADDING_SLOT_ID)
                 common_attn_metadata.indexer_slot_mapping = self.indexer_slot_mapping_group[draft_index]
 
+        # Owner-shared offload does not expose the legacy indexer mapping.
+        # Rebuild both semantic groups after advancing the draft position so
+        # the MTP indexer and main KV writes land in their respective pages.
+        self._populate_owner_offload_group_metadata(
+            common_attn_metadata,
+            input_batch_size,
+            draft_index,
+        )
+
         self.seq_lens_group[draft_index][: common_attn_metadata.seq_lens.shape[0]].copy_(common_attn_metadata.seq_lens)
         self.seq_lens_group[draft_index][common_attn_metadata.seq_lens.shape[0] :].fill_(0)
         common_attn_metadata.seq_lens = self.seq_lens_group[draft_index][: common_attn_metadata.seq_lens.shape[0]]
@@ -2106,11 +2214,28 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
             is_prefilling=common_attn_metadata.is_prefilling,
             indexer_block_table_tensor=common_attn_metadata.indexer_block_table_tensor,
             indexer_slot_mapping=common_attn_metadata.indexer_slot_mapping,
+            block_table_tensors_by_group=(
+                common_attn_metadata.block_table_tensors_by_group
+            ),
+            slot_mappings_by_group=(
+                common_attn_metadata.slot_mappings_by_group
+            ),
             num_offloaded_blocks=common_attn_metadata.num_offloaded_blocks,
+            num_offloaded_blocks_cpu=(
+                common_attn_metadata.num_offloaded_blocks_cpu
+            ),
             req_ids_tensor=common_attn_metadata.req_ids_tensor,
+            tail_req_indices=common_attn_metadata.tail_req_indices,
             token_to_req=token_to_req,
             tokens_per_req=common_attn_metadata.tokens_per_req,
             max_seq_len=0,
+        )
+        # Rejection compaction changes the active token rows. Recompute both
+        # owner-shared slot mappings from the compact positions instead of
+        # retaining views into the pre-compaction buffers.
+        self._populate_owner_offload_group_metadata(
+            spec_common_attn_metadata,
+            common_attn_metadata.num_input_tokens,
         )
         return spec_common_attn_metadata, token_indices
 

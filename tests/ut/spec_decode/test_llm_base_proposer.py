@@ -21,6 +21,7 @@ from __future__ import annotations
 from types import SimpleNamespace
 
 import pytest
+import torch
 from vllm.config import CUDAGraphMode
 
 from vllm_ascend.spec_decode.llm_base_proposer import AscendSpecDecodeBaseProposer
@@ -38,6 +39,84 @@ NON_FULL_CUDAGRAPH_MODES = [
     CUDAGraphMode.NONE,
     CUDAGraphMode.PIECEWISE,
 ]
+
+
+class _FakeBlockTable:
+    def __init__(self, block_table: torch.Tensor):
+        self._block_table = block_table
+
+    def get_device_tensor(self) -> torch.Tensor:
+        return self._block_table
+
+
+def test_owner_offload_mtp_populates_both_group_mappings():
+    proposer = AscendSpecDecodeBaseProposer.__new__(
+        AscendSpecDecodeBaseProposer
+    )
+    proposer.slot_mapping_group = [
+        torch.empty(5, dtype=torch.int32)
+    ]
+    proposer.indexer_slot_mapping_group = [
+        torch.empty(5, dtype=torch.int32)
+    ]
+    proposer.positions = torch.tensor([0, 128, 129])
+
+    groups = [
+        SimpleNamespace(
+            kv_cache_spec=SimpleNamespace(block_size=512)
+        ),
+        SimpleNamespace(
+            kv_cache_spec=SimpleNamespace(block_size=128)
+        ),
+    ]
+    proposer.runner = SimpleNamespace(
+        sfa_offload_shared_cache_plan=SimpleNamespace(
+            indexer_group_id=0,
+            main_group_id=1,
+        ),
+        kv_cache_config=SimpleNamespace(kv_cache_groups=groups),
+        input_batch=SimpleNamespace(
+            block_table=[
+                _FakeBlockTable(torch.tensor([[10, 11]])),
+                _FakeBlockTable(torch.tensor([[20, 21, 22]])),
+            ]
+        ),
+        token_to_req=SimpleNamespace(
+            gpu=torch.tensor([0, 0, 0], dtype=torch.int32)
+        ),
+        tail_req_indices=SimpleNamespace(
+            gpu=torch.tensor([3], dtype=torch.int32)
+        ),
+    )
+    metadata = SimpleNamespace(
+        num_actual_tokens=3,
+        num_reqs=1,
+        positions=torch.tensor([0, 128, 129]),
+        token_to_req=torch.tensor([0, 0, 0], dtype=torch.int32),
+        tail_req_indices=None,
+        indexer_block_table_tensor=torch.empty(0),
+        indexer_slot_mapping=torch.empty(0),
+    )
+
+    proposer._populate_owner_offload_group_metadata(
+        metadata,
+        num_input_tokens=5,
+    )
+
+    assert torch.equal(
+        metadata.slot_mappings_by_group[0],
+        torch.tensor([5120, 5248, 5249, -1, -1]),
+    )
+    assert torch.equal(
+        metadata.slot_mappings_by_group[1],
+        torch.tensor([2560, 2688, 2689, -1, -1]),
+    )
+    assert metadata.block_table_tensor.data_ptr() == (
+        metadata.block_table_tensors_by_group[1].data_ptr()
+    )
+    assert metadata.indexer_block_table_tensor is None
+    assert metadata.indexer_slot_mapping is None
+    assert torch.equal(metadata.tail_req_indices, torch.tensor([3]))
 
 
 class TestDisablePaddedDrafterBatchWithFullGraph:

@@ -321,8 +321,12 @@ class AscendCommonAttentionMetadata(CommonAttentionMetadata):
 
     indexer_block_table_tensor: torch.Tensor | None = None
     indexer_slot_mapping: torch.Tensor | None = None
+    block_table_tensors_by_group: list[torch.Tensor] | None = None
+    slot_mappings_by_group: list[torch.Tensor] | None = None
     num_offloaded_blocks: torch.Tensor | None = None
+    num_offloaded_blocks_cpu: torch.Tensor | None = None
     req_ids_tensor: torch.Tensor | None = None
+    tail_req_indices: torch.Tensor | None = None
     token_to_req: torch.Tensor | None = None
     tokens_per_req: torch.Tensor | None = None
     # TODO: Remove it when vLLM no longer uses this function.
@@ -358,8 +362,14 @@ class AscendCommonAttentionMetadata(CommonAttentionMetadata):
             prefill_context_parallel_metadata=self.prefill_context_parallel_metadata,
             indexer_block_table_tensor=self.indexer_block_table_tensor,
             indexer_slot_mapping=self.indexer_slot_mapping,
+            block_table_tensors_by_group=self.block_table_tensors_by_group,
+            slot_mappings_by_group=self.slot_mappings_by_group,
             num_offloaded_blocks=_slice_reqs(self.num_offloaded_blocks),
+            num_offloaded_blocks_cpu=_slice_reqs(
+                self.num_offloaded_blocks_cpu
+            ),
             req_ids_tensor=_slice_reqs(self.req_ids_tensor),
+            tail_req_indices=_slice_reqs(self.tail_req_indices),
             token_to_req=self.token_to_req[:num_actual_tokens]
             if self.token_to_req is not None
             else None,
@@ -549,13 +559,28 @@ def maybe_save_kv_layer_to_connector(
     connector.save_kv_layer(layer_name, kv_cache_layer, attn_metadata)
 
 
-def set_connector_req_ids(req_ids):
+def set_connector_req_ids(
+    req_ids: list[str],
+    tail_req_indices: list[int] | None = None,
+) -> None:
     if not has_kv_transfer_group() or not is_v1_kv_transfer_group():
         return
     connector = get_kv_transfer_group()
     if not hasattr(connector, 'set_req_ids'):
         return
-    connector.set_req_ids(req_ids)
+    if tail_req_indices is None:
+        connector.set_req_ids(req_ids)
+    else:
+        connector.set_req_ids(req_ids, tail_req_indices)
+
+
+def maybe_wait_for_sfa_scratch_reuse(layer_name: str) -> None:
+    if not has_kv_transfer_group() or not is_v1_kv_transfer_group():
+        return
+    connector = get_kv_transfer_group()
+    wait_for_reuse = getattr(connector, "wait_for_scratch_reuse", None)
+    if wait_for_reuse is not None:
+        wait_for_reuse(layer_name)
 
 
 def maybe_prepare_lru_resident_and_load_graph(

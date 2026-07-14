@@ -19,6 +19,9 @@ from vllm_ascend.distributed.kv_transfer.sfa_kv_offload.config_data import (
     ReqMeta,
     RequestTracker,
 )
+from vllm_ascend.distributed.kv_transfer.sfa_kv_offload.offload_kv_cache_layout import (
+    build_sfa_offload_shared_cache_plan,
+)
 
 
 def _num_finalized_scheduled_tokens(scheduler_output: SchedulerOutput, req_id: str) -> int:
@@ -63,8 +66,17 @@ class SFAKVOffloadlScheduler:
         self.kv_role = vllm_config.kv_transfer_config.kv_role
         self.pcp_size = getattr(vllm_config.parallel_config, "prefill_context_parallel_size", 1)
         self.dcp_size = getattr(vllm_config.parallel_config, "decode_context_parallel_size", 1)
+        self.shared_cache_plan = build_sfa_offload_shared_cache_plan(
+            vllm_config,
+            kv_cache_config.kv_cache_groups,
+        )
+        self.main_group_id = (
+            self.shared_cache_plan.main_group_id
+            if self.shared_cache_plan is not None
+            else len(kv_cache_config.kv_cache_groups) - 1
+        )
         self.group_block_sizes = self._infer_group_block_sizes(vllm_config, kv_cache_config)
-        self._block_size = self.group_block_sizes[-1] # only offload kv cache
+        self._block_size = self.group_block_sizes[self.main_group_id]
 
         # request_id -> full_token_ids
         self._request_trackers: dict[str, RequestTracker] = {}
@@ -74,10 +86,16 @@ class SFAKVOffloadlScheduler:
 
         # sfa kv offload related
         npu_block_num = self.kv_cache_config.num_blocks
-        # we need 4 * npu_blocks of cpu_blocks to fully store all offload blocks (dskv32, 512/128)
-        # but you may want to set this to 1 in debug case in case of allocating to much dram
-        # TODO remove this and directly compute from model config before merge
-        cpu_block_num_multiple = 4
+        if self.shared_cache_plan is not None:
+            indexer_block_size = self.group_block_sizes[
+                self.shared_cache_plan.indexer_group_id
+            ]
+            cpu_block_num_multiple = max(
+                indexer_block_size // self._block_size,
+                1,
+            )
+        else:
+            cpu_block_num_multiple = 4
         cpu_block_num = npu_block_num * cpu_block_num_multiple
         self.cpu_block_manager = CPUBlockManager(cpu_block_num)
 
@@ -126,7 +144,7 @@ class SFAKVOffloadlScheduler:
         meta = SFAKVOffloadConnectorMetadata(self._unfinished_request_ids, scheduler_output.preempted_req_ids)
 
         for request in scheduler_output.scheduled_new_reqs:
-            block_ids_npu = request.block_ids[-1].copy() # NOTE dskv32 sparse offload, 0 for indexer and 1 for ori kv_cache
+            block_ids_npu = request.block_ids[self.main_group_id].copy()
             num_tokens_to_compute = request.num_computed_tokens + _num_finalized_scheduled_tokens(
                 scheduler_output, request.req_id)
             num_new_offload_blocks = num_tokens_to_compute // self._block_size
@@ -150,8 +168,7 @@ class SFAKVOffloadlScheduler:
             # resumed request
             new_block_ids_npu = cached_reqs.new_block_ids[i]
             if isinstance(new_block_ids_npu, tuple):
-                # NOTE dskv32 sparse offload, 0 for indexer and 1 for ori kv_cache
-                new_block_ids_npu = new_block_ids_npu[-1]
+                new_block_ids_npu = new_block_ids_npu[self.main_group_id]
             elif new_block_ids_npu is None:
                 new_block_ids_npu = []
             if req_id in self._preempted_req_ids:

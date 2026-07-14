@@ -39,11 +39,16 @@ from vllm_ascend.distributed.kv_transfer.sfa_kv_offload.kv_transfer import (
 from vllm_ascend.distributed.kv_transfer.sfa_kv_offload.offload_kv_cache_layout import (
     OFFLOAD_C8_TUPLE_LEN,
     OFFLOAD_INDEXER_S,
+    OFFLOAD_LEGACY_TUPLE_LEN,
     OFFLOAD_MAIN_K,
     OFFLOAD_MAIN_V,
     OFFLOAD_RESIDENT_K,
     OFFLOAD_RESIDENT_V,
+    OFFLOAD_TAIL_K,
+    OFFLOAD_TAIL_V,
     OFFLOAD_TUPLE_LEN,
+    TAIL_WINDOW_BLOCKS,
+    build_sfa_offload_shared_cache_plan,
     is_offload_c8_kv_cache,
 )
 
@@ -166,8 +171,17 @@ class SFAKVOffloadWorker:
         self.use_offload = ascend_config.use_offload
 
         self.kv_role = vllm_config.kv_transfer_config.kv_role
+        self.shared_cache_plan = build_sfa_offload_shared_cache_plan(
+            vllm_config,
+            kv_cache_config.kv_cache_groups,
+        )
         self.group_block_sizes = self._infer_group_block_sizes(vllm_config, kv_cache_config)
-        self.block_size = self.group_block_sizes[-1] # only offload kv cache
+        self.main_group_id = (
+            self.shared_cache_plan.main_group_id
+            if self.shared_cache_plan is not None
+            else len(self.group_block_sizes) - 1
+        )
+        self.block_size = self.group_block_sizes[self.main_group_id]
 
         self.current_layer_save = 0
         self.current_layer_load = 0
@@ -199,10 +213,9 @@ class SFAKVOffloadWorker:
         self.sfa_sparse_topk = lru_resident_config.topk
         self.lru_resident_capacity = lru_resident_config.buffer_size
 
-        # TODO get from config
         head_num = 1
-        head_dim_k = 512
-        head_dim_v = 64
+        head_dim_k = self.hf_config.kv_lora_rank
+        head_dim_v = self.hf_config.qk_rope_head_dim
         dtype = torch.bfloat16
         self.token_size_bytes_k = head_num * head_dim_k * dtype.itemsize
         self.token_size_bytes_v = head_num * head_dim_v * dtype.itemsize
@@ -218,6 +231,7 @@ class SFAKVOffloadWorker:
         )
         self.actual_seq_len_q = torch.arange(self.max_num_reqs, dtype=torch.int32, device='cpu', pin_memory=True) + 1
         self.req_ids = []
+        self.req_id_to_tail_index: dict[str, int] = {}
 
         self.cpu_sparse_attn = cpu_sparse_attn
 
@@ -258,18 +272,33 @@ class SFAKVOffloadWorker:
         return tuple(cache_or_caches)
 
     def _register_offload_layers(self, kv_caches: dict[str, torch.Tensor]) -> None:
-        self.offload_layer_names = [
+        discovered_layer_names = [
             layer_name
             for layer_name, cache_or_caches in kv_caches.items()
             if len(self._as_cache_tuple(cache_or_caches))
-            in (OFFLOAD_TUPLE_LEN, OFFLOAD_C8_TUPLE_LEN)
+            in (
+                OFFLOAD_LEGACY_TUPLE_LEN,
+                OFFLOAD_C8_TUPLE_LEN,
+                OFFLOAD_TUPLE_LEN,
+            )
         ]
+        if self.shared_cache_plan is not None:
+            expected = list(self.shared_cache_plan.main_layer_names)
+            missing = sorted(set(expected) - set(discovered_layer_names))
+            if missing:
+                raise ValueError(
+                    "SFA owner-shared offload caches are missing main layers: "
+                    f"{missing}."
+                )
+            self.offload_layer_names = expected
+        else:
+            self.offload_layer_names = discovered_layer_names
         if not self.offload_layer_names:
             raise ValueError("SFA KV Offload did not find SFA KV cache layers.")
 
         # Under offload, the attention path (sfa_v1.py / device_op.py) gates the
         # C8 indexer read on the GLOBAL use_sparse_c8_indexer flag, not per-layer.
-        # Mixed five/six-tuple layers would therefore route a non-C8 layer through
+        # Mixed seven/six-tuple layers would therefore route a BF16 layer through
         # the quant indexer (or vice versa). Forbid it here so the global gate
         # stays sound; C8 must be all-or-nothing across sparse offload layers.
         tuple_lens = {
@@ -279,7 +308,7 @@ class SFAKVOffloadWorker:
             raise ValueError(
                 "SFA KV offload does not support mixed LIC8 / non-LIC8 layers: "
                 f"found tuple lengths {sorted(tuple_lens)} "
-                f"(five-tuple and six-tuple coexist). Under offload, C8 must be "
+                f"(seven-tuple and six-tuple coexist). Under offload, C8 must be "
                 f"enabled uniformly across all sparse layers."
             )
 
@@ -292,6 +321,19 @@ class SFAKVOffloadWorker:
         self.layer_save_tasks = [[] for _ in range(self.num_layers)]
         self.pending_save_layer_ids.clear()
         self.submitted_save_layer_ids.clear()
+        self.scratch_pending_layer_ids: set[int] = set()
+        self.scratch_predecessor: dict[int, int] = {}
+        if self.shared_cache_plan is not None:
+            for pool in self.shared_cache_plan.pools:
+                pool_layer_ids = [
+                    self.layer_name_to_offload_id[layer_name]
+                    for layer_name in pool.main_layer_names
+                ]
+                for previous, current in zip(
+                    pool_layer_ids,
+                    pool_layer_ids[1:],
+                ):
+                    self.scratch_predecessor[current] = previous
 
         logger.info(
             "SFA KV offload registered %s layers (%s target layers).",
@@ -339,18 +381,36 @@ class SFAKVOffloadWorker:
             self.v_caches_npu: list[torch.Tensor] = []
             self.topk_buffers_k: list[torch.Tensor] = []
             self.topk_buffers_v: list[torch.Tensor] = []
+            self.tail_k_caches_npu: list[torch.Tensor | None] = []
+            self.tail_v_caches_npu: list[torch.Tensor | None] = []
+            self.tail_window_blocks = TAIL_WINDOW_BLOCKS
             for layer_name in self.offload_layer_names:
                 cache_or_caches = self._as_cache_tuple(kv_caches[layer_name])
                 tuple_len = len(cache_or_caches)
-                if tuple_len not in (OFFLOAD_TUPLE_LEN, OFFLOAD_C8_TUPLE_LEN):
+                if tuple_len not in (
+                    OFFLOAD_LEGACY_TUPLE_LEN,
+                    OFFLOAD_C8_TUPLE_LEN,
+                    OFFLOAD_TUPLE_LEN,
+                ):
                     raise ValueError(
                         f"SFA KV offload layer {layer_name}: expected tuple length "
-                        f"{OFFLOAD_TUPLE_LEN} or {OFFLOAD_C8_TUPLE_LEN}, got {tuple_len}"
+                        f"{OFFLOAD_LEGACY_TUPLE_LEN}, {OFFLOAD_C8_TUPLE_LEN}, "
+                        f"or {OFFLOAD_TUPLE_LEN}, got {tuple_len}"
                     )
                 self.k_caches_npu.append(cache_or_caches[OFFLOAD_MAIN_K])
                 self.v_caches_npu.append(cache_or_caches[OFFLOAD_MAIN_V])
                 self.topk_buffers_k.append(cache_or_caches[OFFLOAD_RESIDENT_K])
                 self.topk_buffers_v.append(cache_or_caches[OFFLOAD_RESIDENT_V])
+                if tuple_len == OFFLOAD_TUPLE_LEN:
+                    self.tail_k_caches_npu.append(
+                        cache_or_caches[OFFLOAD_TAIL_K]
+                    )
+                    self.tail_v_caches_npu.append(
+                        cache_or_caches[OFFLOAD_TAIL_V]
+                    )
+                else:
+                    self.tail_k_caches_npu.append(None)
+                    self.tail_v_caches_npu.append(None)
                 if is_offload_c8_kv_cache(cache_or_caches):
                     # Guard against the LIC8 scale tensor aliasing a resident
                     # top-K buffer. Compare storage identity (data_ptr), NOT
@@ -373,12 +433,16 @@ class SFAKVOffloadWorker:
             if self.use_layerwise:
                 ready_event = threading.Event()
                 self.layer_save_finished_events = [threading.Event() for _ in range(self.num_layers)]
+                self.scratch_save_finished_events = [
+                    threading.Event() for _ in range(self.num_layers)
+                ]
                 self.kv_send_thread = KVCacheStoreLayerSendingThread(
                     self.block_size,
                     self.num_layers,
                     self.tp_rank,
                     ready_event,
                     self.layer_save_finished_events,
+                    self.scratch_save_finished_events,
                 )
                 self.kv_send_thread.start()
                 ready_event.wait()
@@ -387,12 +451,26 @@ class SFAKVOffloadWorker:
 
             if self.tp_rank == 0:
                 npu_block_num = self.num_blocks
-                # we need 4 * npu_blocks of cpu_blocks to fully store all offload blocks (dskv32, 512/128)
-                # but you may want to set this to 1 in debug case in case of allocating to much dram
-                # TODO remove this and directly compute from model config before merge
-                cpu_block_num_multiple = 4
+                if self.shared_cache_plan is not None:
+                    indexer_block_size = self.group_block_sizes[
+                        self.shared_cache_plan.indexer_group_id
+                    ]
+                    cpu_block_num_multiple = max(
+                        indexer_block_size // self.block_size,
+                        1,
+                    )
+                else:
+                    cpu_block_num_multiple = 4
                 cpu_block_num = npu_block_num * cpu_block_num_multiple
-                cpu_cache_size = cpu_block_num * self.block_size * (512 + 64) * torch.bfloat16.itemsize * self.num_layers
+                head_dim_k = self.hf_config.kv_lora_rank
+                head_dim_v = self.hf_config.qk_rope_head_dim
+                cpu_cache_size = (
+                    cpu_block_num
+                    * self.block_size
+                    * (head_dim_k + head_dim_v)
+                    * torch.bfloat16.itemsize
+                    * self.num_layers
+                )
                 logger.info(f'KV offload allocate {cpu_block_num} cpu blocks, size = {cpu_cache_size / 1024 / 1024 / 1024} GB')
                 if cpu_cache_size > self.allocate_dram_size:
                     raise ValueError(
@@ -401,11 +479,17 @@ class SFAKVOffloadWorker:
                         "try to decrease gpu_memory_utilization or allocate more cpu memory during init."
                     )
                 self.k_caches_cpu: list[torch.Tensor] = [
-                    self._empty_aligned_cpu_tensor([cpu_block_num, self.block_size, 1, 512], dtype=torch.bfloat16)
+                    self._empty_aligned_cpu_tensor(
+                        [cpu_block_num, self.block_size, 1, head_dim_k],
+                        dtype=torch.bfloat16,
+                    )
                     for _ in range(self.num_layers)
                 ]
                 self.v_caches_cpu: list[torch.Tensor] = [
-                    self._empty_aligned_cpu_tensor([cpu_block_num, self.block_size, 1, 64], dtype=torch.bfloat16)
+                    self._empty_aligned_cpu_tensor(
+                        [cpu_block_num, self.block_size, 1, head_dim_v],
+                        dtype=torch.bfloat16,
+                    )
                     for _ in range(self.num_layers)
                 ]
 
@@ -573,8 +657,21 @@ class SFAKVOffloadWorker:
             layer_save_task.clear()
         self.pending_save_layer_ids.clear()
         self.submitted_save_layer_ids.clear()
+        self.scratch_pending_layer_ids.clear()
         for event in getattr(self, "layer_save_finished_events", []):
             event.clear()
+        for event in getattr(self, "scratch_save_finished_events", []):
+            event.clear()
+        if not metadata.requests:
+            # vLLM issues a connector-only step after the final token so the
+            # scheduler can retire the request. No model input preparation
+            # runs for that step, therefore set_req_ids() has not replaced the
+            # previous batch. Drop those stale IDs instead of looking them up
+            # in the intentionally empty request metadata.
+            self.req_ids = []
+            self.req_id_to_tail_index.clear()
+            self.num_save_tasks = 0
+            return
         for request in metadata.requests:
             req_id_to_block_ids[request.req_id] = request.block_ids_cpu
             if self.tp_rank > 0 or request.num_new_offload_blocks <= 0:
@@ -642,8 +739,67 @@ class SFAKVOffloadWorker:
         self.pending_save_layer_ids.clear()
         self.submitted_save_layer_ids.clear()
  
-    def set_req_ids(self, req_ids: list):
+    def set_req_ids(
+        self,
+        req_ids: list[str],
+        tail_req_indices: list[int] | None = None,
+    ) -> None:
         self.req_ids = req_ids
+        if tail_req_indices is None:
+            self.req_id_to_tail_index = {
+                req_id: index for index, req_id in enumerate(req_ids)
+            }
+            return
+        if len(req_ids) != len(tail_req_indices):
+            raise ValueError(
+                "SFA tail request metadata length mismatch: "
+                f"req_ids={len(req_ids)} slots={len(tail_req_indices)}."
+            )
+        if len(set(tail_req_indices)) != len(tail_req_indices):
+            raise ValueError("Active SFA requests must have distinct tail slots.")
+        self.req_id_to_tail_index = dict(zip(req_ids, tail_req_indices))
+
+    def wait_for_scratch_reuse(self, layer_name: str) -> None:
+        """Wait only for the prior normal-source copy in this owner pool."""
+        if self.shared_cache_plan is None:
+            return
+        layer_id = self._get_offload_layer_id(layer_name)
+        predecessor = self.scratch_predecessor.get(layer_id)
+        if predecessor is None:
+            return
+        if _is_current_stream_capturing():
+            # Keep the gate in piecewise graph replay. The callback checks the
+            # current batch's pending set, so tail-only steps pass through.
+            current_stream = torch_npu.npu.current_stream()
+            subscribed_streams = get_subscribed_compute_streams()
+            if current_stream not in subscribed_streams:
+                torch_npu.npu._subscribe_report(current_stream)
+                subscribed_streams.add(current_stream)
+            torch_npu.npu._launch_host_func(
+                current_stream,
+                self._wait_for_scratch_reuse_host,
+                (predecessor, layer_id),
+            )
+            return
+        self._wait_for_scratch_reuse_host((predecessor, layer_id))
+
+    def _wait_for_scratch_reuse_host(
+        self,
+        args: tuple[int, int],
+    ) -> None:
+        predecessor, layer_id = args
+        if predecessor not in self.scratch_pending_layer_ids:
+            return
+        event = self.scratch_save_finished_events[predecessor]
+        while not event.wait(timeout=30):
+            logger.warning(
+                "SFA scratch pool waits for layer %d normal offload before "
+                "layer %d reuse",
+                predecessor,
+                layer_id,
+            )
+        event.clear()
+        self.scratch_pending_layer_ids.discard(predecessor)
 
     def prepare_lru_resident_and_load_cpu(self, args):
         (
@@ -835,22 +991,90 @@ class SFAKVOffloadWorker:
         Generate kv offload related metadata.
         """
         num_new_offload_blocks = request.num_new_offload_blocks
+        untrimmed_num_npu_blocks = len(request.block_ids_npu)
         block_ids_npu = request.block_ids_npu
         block_ids_cpu = request.block_ids_cpu
         if len(block_ids_npu) > len(block_ids_cpu):
             # in most cases block_ids_npu has one more unfull block, remove it
             block_ids_npu = block_ids_npu[:-1]
         assert len(block_ids_npu) == len(block_ids_cpu)
+        first_new_logical_block = (
+            len(block_ids_cpu) - num_new_offload_blocks
+        )
+        new_logical_blocks = list(
+            range(first_new_logical_block, len(block_ids_cpu))
+        )
         block_ids_npu = block_ids_npu[-num_new_offload_blocks:]
         block_ids_cpu = block_ids_cpu[-num_new_offload_blocks:]
+        tail_start_logical_block = max(
+            untrimmed_num_npu_blocks - self.tail_window_blocks,
+            0,
+        )
+        tail_req_index = self.req_id_to_tail_index.get(request.req_id)
 
         for layer_id in range(self.num_layers):
-            req_meta_save = LayerMultiBlockReqMeta(
-                request.req_id,
-                layer_id,
-                block_ids_npu=block_ids_npu,
-                block_ids_cpu=block_ids_cpu,
-                cache_npu=(self.k_caches_npu[layer_id], self.v_caches_npu[layer_id]),
-                cache_cpu=(self.k_caches_cpu[layer_id], self.v_caches_cpu[layer_id]),
-            )
-            self.layer_save_tasks[layer_id].append(req_meta_save)
+            normal_block_ids_npu: list[int] = []
+            normal_block_ids_cpu: list[int] = []
+            tail_block_ids_npu: list[int] = []
+            tail_block_ids_cpu: list[int] = []
+            tail_k_cache = self.tail_k_caches_npu[layer_id]
+            tail_v_cache = self.tail_v_caches_npu[layer_id]
+            for logical_block_id, npu_block_id, cpu_block_id in zip(
+                new_logical_blocks,
+                block_ids_npu,
+                block_ids_cpu,
+            ):
+                use_tail_source = (
+                    tail_req_index is not None
+                    and tail_k_cache is not None
+                    and tail_v_cache is not None
+                    and logical_block_id >= tail_start_logical_block
+                )
+                if use_tail_source:
+                    tail_block_ids_npu.append(
+                        tail_req_index * self.tail_window_blocks
+                        + logical_block_id % self.tail_window_blocks
+                    )
+                    tail_block_ids_cpu.append(cpu_block_id)
+                else:
+                    normal_block_ids_npu.append(npu_block_id)
+                    normal_block_ids_cpu.append(cpu_block_id)
+
+            if normal_block_ids_cpu:
+                self.layer_save_tasks[layer_id].append(
+                    LayerMultiBlockReqMeta(
+                        request.req_id,
+                        layer_id,
+                        block_ids_npu=normal_block_ids_npu,
+                        block_ids_cpu=normal_block_ids_cpu,
+                        cache_npu=(
+                            self.k_caches_npu[layer_id],
+                            self.v_caches_npu[layer_id],
+                        ),
+                        cache_cpu=(
+                            self.k_caches_cpu[layer_id],
+                            self.v_caches_cpu[layer_id],
+                        ),
+                        uses_shared_scratch=(
+                            self.shared_cache_plan is not None
+                        ),
+                    )
+                )
+                if self.shared_cache_plan is not None:
+                    self.scratch_pending_layer_ids.add(layer_id)
+            if tail_block_ids_cpu:
+                assert tail_k_cache is not None
+                assert tail_v_cache is not None
+                self.layer_save_tasks[layer_id].append(
+                    LayerMultiBlockReqMeta(
+                        request.req_id,
+                        layer_id,
+                        block_ids_npu=tail_block_ids_npu,
+                        block_ids_cpu=tail_block_ids_cpu,
+                        cache_npu=(tail_k_cache, tail_v_cache),
+                        cache_cpu=(
+                            self.k_caches_cpu[layer_id],
+                            self.v_caches_cpu[layer_id],
+                        ),
+                    )
+                )
