@@ -332,10 +332,13 @@ def test_kimi_kda_flashcomm_gathers_once_before_projections(
     core_shapes: list[tuple[int, ...]] = []
 
     def fake_kda_attention(q, k, v, raw_gate, beta, core_attn_out, prefix):
-        del k, v, raw_gate, beta
+        del raw_gate, beta
         assert prefix == layer.prefix
+        assert q.shape == (4, 6)
+        assert k.shape == (4, 0)
+        assert v.shape == (4, 0)
         core_shapes.append(tuple(core_attn_out.shape))
-        core_attn_out.copy_(q.reshape(1, q.shape[0], 1, 2))
+        core_attn_out.copy_(q[:, :2].reshape(1, q.shape[0], 1, 2))
 
     monkeypatch.setattr(
         kimi_kda.torch.ops.vllm,

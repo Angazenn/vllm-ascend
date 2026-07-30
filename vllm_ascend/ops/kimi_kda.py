@@ -33,6 +33,15 @@ from vllm_ascend.transformers_utils.configs.kimi_k3 import KimiK3TextConfig
 from vllm_ascend.utils import parse_layer_idx, uses_global_inputs_embeds
 
 _KDA_CHUNK_SIZE = 64
+_KDA_QKV_CONCAT_STREAM = None
+
+
+def _kda_qkv_concat_stream() -> torch.npu.Stream:
+    """Return the process-local stream used to overlap KDA QKV packing."""
+    global _KDA_QKV_CONCAT_STREAM
+    if _KDA_QKV_CONCAT_STREAM is None:
+        _KDA_QKV_CONCAT_STREAM = torch.npu.Stream()
+    return _KDA_QKV_CONCAT_STREAM
 
 
 def _load_kimi_k3_a_log(
@@ -177,6 +186,23 @@ class AscendKimiGatedDeltaNetAttention(KimiGatedDeltaNetAttention):
         k = self.k_proj(hidden_states)[0]
         v = self.v_proj(hidden_states)[0]
 
+        # QKV packing is a vector operation.  Run it on a side stream so it can
+        # overlap the independent Cube-heavy gate projections below.  The CPU
+        # path keeps unit tests and non-Ascend shape checks device agnostic.
+        main_stream = None
+        qkv_concat_stream = None
+        if q.device.type == "npu":
+            main_stream = torch.npu.current_stream()
+            qkv_concat_stream = _kda_qkv_concat_stream()
+            q.record_stream(qkv_concat_stream)
+            k.record_stream(qkv_concat_stream)
+            v.record_stream(qkv_concat_stream)
+            qkv_concat_stream.wait_stream(main_stream)
+            with torch.npu.stream(qkv_concat_stream):
+                mixed_qkv = torch.cat((q, k, v), dim=-1)
+        else:
+            mixed_qkv = torch.cat((q, k, v), dim=-1)
+
         beta = self.b_proj(hidden_states)[0].float().sigmoid().unsqueeze(0)
         raw_gate = self.f_b_proj(self.f_a_proj(hidden_states)[0])[0]
         raw_gate = rearrange(raw_gate, "n (h d) -> 1 n h d", d=self.head_dim)
@@ -192,10 +218,18 @@ class AscendKimiGatedDeltaNetAttention(KimiGatedDeltaNetAttention):
             dtype=hidden_states.dtype,
             device=hidden_states.device,
         )
+        if qkv_concat_stream is not None:
+            assert main_stream is not None
+            main_stream.wait_stream(qkv_concat_stream)
+
+        # Keep vLLM 0.23's opaque custom-op boundary without performing a
+        # second concat inside it.  Empty views in the legacy K/V slots mark
+        # the first argument as an already packed [Q | K | V] tensor.
+        packed_qkv_sentinel = mixed_qkv[:, :0]
         torch.ops.vllm.kda_attention(
-            q,
-            k,
-            v,
+            mixed_qkv,
+            packed_qkv_sentinel,
+            packed_qkv_sentinel,
             raw_gate,
             beta,
             core_attn_out,
@@ -400,14 +434,21 @@ class AscendKimiGatedDeltaNetAttention(KimiGatedDeltaNetAttention):
         assert isinstance(attn_metadata, GDNAttentionMetadata)
 
         num_actual_tokens = attn_metadata.num_actual_tokens
-        q_proj_states = q_proj_states[:num_actual_tokens]
-        k_proj_states = k_proj_states[:num_actual_tokens]
-        v_proj_states = v_proj_states[:num_actual_tokens]
+        if k_proj_states.numel() == 0 and v_proj_states.numel() == 0:
+            # The Ascend forward path packs QKV on an auxiliary stream before
+            # entering this opaque op so the concat overlaps the gate matmuls.
+            mixed_qkv = q_proj_states[:num_actual_tokens]
+        else:
+            # Preserve compatibility with the upstream op contract and direct
+            # tests that still provide three independent projected tensors.
+            q_proj_states = q_proj_states[:num_actual_tokens]
+            k_proj_states = k_proj_states[:num_actual_tokens]
+            v_proj_states = v_proj_states[:num_actual_tokens]
+            mixed_qkv = torch.cat((q_proj_states, k_proj_states, v_proj_states), dim=-1)
         g1 = g1[:, :num_actual_tokens]
         beta = beta[:, :num_actual_tokens]
 
         conv_state, recurrent_state = self.kv_cache
-        mixed_qkv = torch.cat((q_proj_states, k_proj_states, v_proj_states), dim=-1)
         conv_weights_t = self._conv_weights_t(mixed_qkv.dtype)
 
         spec_masks = attn_metadata.spec_sequence_masks
