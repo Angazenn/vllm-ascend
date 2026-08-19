@@ -1,8 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Ascend project
 import math
-from collections import defaultdict
-from collections.abc import Iterable
+from collections import OrderedDict, defaultdict
+from collections.abc import Iterable, Sequence
 
 import vllm.v1.core.block_pool
 import vllm.v1.core.kv_cache_utils
@@ -29,6 +29,11 @@ from vllm.v1.kv_cache_interface import (
 from vllm_ascend.utils import vllm_version_is
 
 
+_DEBUG_QUEUE_ATTR = "_ascend_debug_free_block_ids"
+_DEBUG_QUEUE_FULL_LIMIT = 256
+_DEBUG_QUEUE_EDGE_LIMIT = 32
+
+
 def _queue_block_summary(block: KVCacheBlock) -> str:
     prev_id = block.prev_free_block.block_id if block.prev_free_block is not None else None
     next_id = block.next_free_block.block_id if block.next_free_block is not None else None
@@ -43,12 +48,259 @@ def _swa_block_diag(kind: str, block: KVCacheBlock, where: str) -> None:
     logger.warning(msg)
 
 
-def _dedupe_free_blocks(blocks: Iterable[KVCacheBlock], where: str) -> list[KVCacheBlock]:
+def _init_debug_free_queue(
+    queue: FreeKVCacheBlockQueue,
+    blocks: Iterable[KVCacheBlock] | None = None,
+) -> OrderedDict[int, None]:
+    debug_ids: OrderedDict[int, None] = OrderedDict()
+    if blocks is not None:
+        for block in blocks:
+            debug_ids[block.block_id] = None
+    else:
+        curr_block = queue.fake_free_list_head.next_free_block
+        seen_block_ids: set[int] = set()
+        while curr_block is not None and curr_block is not queue.fake_free_list_tail:
+            if curr_block.block_id in seen_block_ids:
+                break
+            seen_block_ids.add(curr_block.block_id)
+            debug_ids[curr_block.block_id] = None
+            curr_block = curr_block.next_free_block
+    setattr(queue, _DEBUG_QUEUE_ATTR, debug_ids)
+    return debug_ids
+
+
+def _debug_free_queue_ids(queue: FreeKVCacheBlockQueue) -> OrderedDict[int, None]:
+    debug_ids = getattr(queue, _DEBUG_QUEUE_ATTR, None)
+    if debug_ids is None:
+        debug_ids = _init_debug_free_queue(queue)
+    return debug_ids
+
+
+def _debug_head_tail_ids(debug_ids: OrderedDict[int, None]) -> tuple[int | None, int | None]:
+    if not debug_ids:
+        return None, None
+    return next(iter(debug_ids)), next(reversed(debug_ids))
+
+
+def _debug_block_ids_summary(debug_ids: OrderedDict[int, None]) -> str:
+    count = len(debug_ids)
+    if count <= _DEBUG_QUEUE_FULL_LIMIT:
+        return f"debug_block_ids={list(debug_ids)}"
+
+    first_ids: list[int] = []
+    for block_id in debug_ids:
+        first_ids.append(block_id)
+        if len(first_ids) >= _DEBUG_QUEUE_EDGE_LIMIT:
+            break
+
+    last_ids: list[int] = []
+    for block_id in reversed(debug_ids):
+        last_ids.append(block_id)
+        if len(last_ids) >= _DEBUG_QUEUE_EDGE_LIMIT:
+            break
+    last_ids.reverse()
+
+    omitted = count - len(first_ids) - len(last_ids)
+    return (
+        f"debug_block_ids_first={first_ids} "
+        f"debug_block_ids_last={last_ids} "
+        f"debug_block_ids_omitted={omitted}"
+    )
+
+
+def _debug_free_queue_summary(
+    queue: FreeKVCacheBlockQueue,
+    requested_n: int | None = None,
+    block: KVCacheBlock | None = None,
+) -> str:
+    debug_ids = _debug_free_queue_ids(queue)
+    debug_head, debug_tail = _debug_head_tail_ids(debug_ids)
+    msg = (
+        f"debug_free_blocks={len(debug_ids)} "
+        f"debug_head_block_id={debug_head} "
+        f"debug_tail_block_id={debug_tail} "
+        f"{_debug_block_ids_summary(debug_ids)}"
+    )
+    if requested_n is not None:
+        expected_ids: list[int] = []
+        for block_id in debug_ids:
+            expected_ids.append(block_id)
+            if len(expected_ids) >= min(requested_n, _DEBUG_QUEUE_EDGE_LIMIT):
+                break
+        msg += f" debug_expected_pop_block_ids={expected_ids}"
+    if block is not None:
+        msg += f" debug_contains_target={block.block_id in debug_ids}"
+    return msg
+
+
+def _warn_debug_count_drift(queue: FreeKVCacheBlockQueue, where: str) -> None:
+    debug_ids = _debug_free_queue_ids(queue)
+    if len(debug_ids) == queue.num_free_blocks:
+        return
+    logger.warning(
+        "SWA_BLOCK_DIAG free_queue_debug_count_mismatch "
+        f"where={where} num_free_blocks={queue.num_free_blocks} "
+        f"{_debug_free_queue_summary(queue)}"
+    )
+
+
+def _debug_note_popleft(
+    queue: FreeKVCacheBlockQueue,
+    blocks: Sequence[KVCacheBlock],
+    where: str,
+) -> None:
+    debug_ids = _debug_free_queue_ids(queue)
+    for block in blocks:
+        if not debug_ids:
+            logger.warning(
+                "SWA_BLOCK_DIAG free_queue_debug_empty_pop "
+                f"where={where} popped_block_id={block.block_id} "
+                f"{_debug_free_queue_summary(queue, block=block)}"
+            )
+            continue
+        expected_block_id, _ = debug_ids.popitem(last=False)
+        if expected_block_id != block.block_id:
+            logger.warning(
+                "SWA_BLOCK_DIAG free_queue_debug_pop_mismatch "
+                f"where={where} expected_block_id={expected_block_id} "
+                f"popped_block_id={block.block_id} "
+                f"{_debug_free_queue_summary(queue, block=block)}"
+            )
+    _warn_debug_count_drift(queue, where)
+
+
+def _debug_note_insert(
+    queue: FreeKVCacheBlockQueue,
+    blocks: Sequence[KVCacheBlock],
+    where: str,
+    prepend: bool = False,
+) -> None:
+    if not blocks:
+        return
+    debug_ids = _debug_free_queue_ids(queue)
+    if prepend:
+        next_debug_ids: OrderedDict[int, None] = OrderedDict()
+        for block in blocks:
+            next_debug_ids[block.block_id] = None
+        next_debug_ids.update(debug_ids)
+        setattr(queue, _DEBUG_QUEUE_ATTR, next_debug_ids)
+    else:
+        for block in blocks:
+            debug_ids[block.block_id] = None
+    _warn_debug_count_drift(queue, where)
+
+
+def _debug_note_remove(
+    queue: FreeKVCacheBlockQueue,
+    block: KVCacheBlock,
+    where: str,
+) -> None:
+    debug_ids = _debug_free_queue_ids(queue)
+    if block.block_id not in debug_ids:
+        logger.warning(
+            "SWA_BLOCK_DIAG free_queue_debug_missing_remove "
+            f"where={where} {_queue_block_summary(block)} "
+            f"{_debug_free_queue_summary(queue, block=block)}"
+        )
+    else:
+        debug_ids.pop(block.block_id)
+    _warn_debug_count_drift(queue, where)
+
+
+def _swa_queue_block_diag(
+    kind: str,
+    block: KVCacheBlock,
+    where: str,
+    queue: FreeKVCacheBlockQueue,
+) -> None:
+    msg = (
+        f"SWA_BLOCK_DIAG {kind} where={where} "
+        f"{_queue_block_summary(block)} {_debug_free_queue_summary(queue, block=block)}"
+    )
+    logger.warning(msg)
+    _check_free_queue(queue, f"{where}:{kind}", block=block)
+
+
+def _check_free_queue(
+    queue: FreeKVCacheBlockQueue,
+    where: str,
+    requested_n: int | None = None,
+    block: KVCacheBlock | None = None,
+) -> None:
+    real_count = 0
+    linked_block_ids: list[int] = []
+    sample_block_ids: list[int] = []
+    seen_block_ids: set[int] = set()
+    curr_block = queue.fake_free_list_head.next_free_block
+    prev_block = queue.fake_free_list_head
+    issue: str | None = None
+    bad_block: KVCacheBlock | None = None
+
+    if curr_block is None:
+        issue = "missing_head_next"
+    else:
+        while curr_block is not queue.fake_free_list_tail:
+            if curr_block is None:
+                issue = "linked_list_reached_none"
+                break
+            if curr_block.block_id in seen_block_ids:
+                issue = "linked_list_cycle_or_duplicate"
+                bad_block = curr_block
+                break
+            if curr_block.prev_free_block is not prev_block:
+                issue = "broken_prev_link"
+                bad_block = curr_block
+                break
+            seen_block_ids.add(curr_block.block_id)
+            linked_block_ids.append(curr_block.block_id)
+            if len(sample_block_ids) < 16:
+                sample_block_ids.append(curr_block.block_id)
+            real_count += 1
+            prev_block = curr_block
+            curr_block = curr_block.next_free_block
+
+    if issue is None and queue.fake_free_list_tail.prev_free_block is not prev_block:
+        issue = "broken_tail_prev"
+    if issue is None and real_count != queue.num_free_blocks:
+        issue = "num_free_blocks_mismatch"
+    debug_ids = _debug_free_queue_ids(queue)
+    if issue is None and real_count != len(debug_ids):
+        issue = "debug_num_free_blocks_mismatch"
+    if issue is None and linked_block_ids != list(debug_ids):
+        issue = "debug_free_queue_order_mismatch"
+    if issue is None:
+        return
+
+    head_next = queue.fake_free_list_head.next_free_block
+    tail_prev = queue.fake_free_list_tail.prev_free_block
+    msg = (
+        "SWA_BLOCK_DIAG free_queue_mismatch "
+        f"where={where} issue={issue} "
+        f"num_free_blocks={queue.num_free_blocks} actual_free_blocks={real_count} "
+        f"head_next_block_id={head_next.block_id if head_next is not None else None} "
+        f"tail_prev_block_id={tail_prev.block_id if tail_prev is not None else None} "
+        f"sample_block_ids={sample_block_ids} "
+        f"{_debug_free_queue_summary(queue, requested_n=requested_n, block=block)}"
+    )
+    if requested_n is not None:
+        msg += f" requested_n={requested_n}"
+    if block is not None:
+        msg += f" target_{_queue_block_summary(block)}"
+    if bad_block is not None:
+        msg += f" bad_{_queue_block_summary(bad_block)}"
+    logger.warning(msg)
+
+
+def _dedupe_free_blocks(
+    blocks: Iterable[KVCacheBlock],
+    where: str,
+    queue: FreeKVCacheBlockQueue,
+) -> list[KVCacheBlock]:
     deduped_blocks: list[KVCacheBlock] = []
     seen_block_ids: set[int] = set()
     for block in blocks:
         if not block.is_null and block.block_id in seen_block_ids:
-            _swa_block_diag("duplicate_free_batch", block, where)
+            _swa_queue_block_diag("duplicate_free_batch", block, where, queue)
             continue
         if not block.is_null:
             seen_block_ids.add(block.block_id)
@@ -56,21 +308,29 @@ def _dedupe_free_blocks(blocks: Iterable[KVCacheBlock], where: str) -> list[KVCa
     return deduped_blocks
 
 
-def _filter_queue_insert_blocks(blocks: list[KVCacheBlock], where: str) -> list[KVCacheBlock]:
+def _filter_queue_insert_blocks(
+    blocks: list[KVCacheBlock],
+    where: str,
+    queue: FreeKVCacheBlockQueue,
+) -> list[KVCacheBlock]:
     filtered_blocks: list[KVCacheBlock] = []
     seen_block_ids: set[int] = set()
+    debug_ids = _debug_free_queue_ids(queue)
     for block in blocks:
         if block.is_null:
-            _swa_block_diag("null_free_queue_insert", block, where)
+            _swa_queue_block_diag("null_free_queue_insert", block, where, queue)
             continue
         if block.block_id in seen_block_ids:
-            _swa_block_diag("duplicate_free_queue_insert", block, where)
+            _swa_queue_block_diag("duplicate_free_queue_insert", block, where, queue)
+            continue
+        if block.block_id in debug_ids:
+            _swa_queue_block_diag("debug_duplicate_free_queue_insert", block, where, queue)
             continue
         if block.ref_cnt != 0:
-            _swa_block_diag("nonzero_ref_cnt_free_queue_insert", block, where)
+            _swa_queue_block_diag("nonzero_ref_cnt_free_queue_insert", block, where, queue)
             continue
         if block.prev_free_block is not None or block.next_free_block is not None:
-            _swa_block_diag("linked_free_queue_insert", block, where)
+            _swa_queue_block_diag("linked_free_queue_insert", block, where, queue)
             continue
         seen_block_ids.add(block.block_id)
         filtered_blocks.append(block)
@@ -78,6 +338,7 @@ def _filter_queue_insert_blocks(blocks: list[KVCacheBlock], where: str) -> list[
 
 
 _orig_block_pool_free_blocks = BlockPool.free_blocks
+_orig_block_pool_touch = BlockPool.touch
 
 
 def _ascend_free_blocks(
@@ -86,24 +347,113 @@ def _ascend_free_blocks(
     prepend: bool = False,
 ) -> None:
     filtered_blocks: list[KVCacheBlock] = []
-    for block in _dedupe_free_blocks(ordered_blocks, "BlockPool.free_blocks"):
+    for block in _dedupe_free_blocks(ordered_blocks, "BlockPool.free_blocks", self.free_block_queue):
         if not block.is_null and block.ref_cnt <= 0:
-            _swa_block_diag("ref_cnt_underflow_free_blocks", block, "BlockPool.free_blocks")
+            _swa_queue_block_diag(
+                "ref_cnt_underflow_free_blocks",
+                block,
+                "BlockPool.free_blocks",
+                self.free_block_queue,
+            )
             continue
         filtered_blocks.append(block)
     _orig_block_pool_free_blocks(self, filtered_blocks, prepend)
 
 
+def _ascend_touch(self: BlockPool, blocks: Sequence[KVCacheBlock]) -> None:
+    seen_block_ids: set[int] = set()
+    for block in blocks:
+        if not block.is_null and block.block_id in seen_block_ids:
+            _swa_queue_block_diag("duplicate_touch_batch", block, "BlockPool.touch", self.free_block_queue)
+        if not block.is_null:
+            seen_block_ids.add(block.block_id)
+
+        if block.ref_cnt == 0 and not block.is_null:
+            if block.prev_free_block is None or block.next_free_block is None:
+                _swa_queue_block_diag("unlinked_free_block_touch", block, "BlockPool.touch", self.free_block_queue)
+            elif block.prev_free_block.next_free_block is not block or block.next_free_block.prev_free_block is not block:
+                _swa_queue_block_diag("broken_link_free_block_touch", block, "BlockPool.touch", self.free_block_queue)
+        elif block.ref_cnt > 0 and (block.prev_free_block is not None or block.next_free_block is not None):
+            _swa_queue_block_diag("linked_inuse_block_touch", block, "BlockPool.touch", self.free_block_queue)
+
+    try:
+        return _orig_block_pool_touch(self, blocks)
+    except Exception:
+        _check_free_queue(self.free_block_queue, "BlockPool.touch:exception")
+        raise
+
+
+_orig_free_queue_popleft = FreeKVCacheBlockQueue.popleft
+_orig_free_queue_init = FreeKVCacheBlockQueue.__init__
+_orig_free_queue_popleft_n = FreeKVCacheBlockQueue.popleft_n
+_orig_free_queue_remove = FreeKVCacheBlockQueue.remove
 _orig_free_queue_prepend_n = FreeKVCacheBlockQueue.prepend_n
 _orig_free_queue_append_n = FreeKVCacheBlockQueue.append_n
 
 
+def _ascend_free_queue_init(
+    self: FreeKVCacheBlockQueue,
+    blocks: list[KVCacheBlock],
+) -> None:
+    _orig_free_queue_init(self, blocks)
+    _init_debug_free_queue(self, blocks)
+
+
+def _ascend_free_queue_popleft(self: FreeKVCacheBlockQueue) -> KVCacheBlock:
+    try:
+        block = _orig_free_queue_popleft(self)
+    except Exception:
+        _check_free_queue(self, "FreeKVCacheBlockQueue.popleft:exception")
+        raise
+    _debug_note_popleft(self, [block], "FreeKVCacheBlockQueue.popleft")
+    return block
+
+
+def _ascend_free_queue_popleft_n(self: FreeKVCacheBlockQueue, n: int) -> list[KVCacheBlock]:
+    try:
+        blocks = _orig_free_queue_popleft_n(self, n)
+    except Exception:
+        _check_free_queue(self, "FreeKVCacheBlockQueue.popleft_n:exception", requested_n=n)
+        raise
+    _debug_note_popleft(self, blocks, "FreeKVCacheBlockQueue.popleft_n")
+    return blocks
+
+
+def _ascend_free_queue_remove(self: FreeKVCacheBlockQueue, block: KVCacheBlock) -> None:
+    if block.prev_free_block is None or block.next_free_block is None:
+        _swa_queue_block_diag("invalid_free_queue_remove", block, "FreeKVCacheBlockQueue.remove", self)
+    elif block.prev_free_block.next_free_block is not block or block.next_free_block.prev_free_block is not block:
+        _swa_queue_block_diag("broken_link_free_queue_remove", block, "FreeKVCacheBlockQueue.remove", self)
+    try:
+        _orig_free_queue_remove(self, block)
+    except Exception:
+        _check_free_queue(self, "FreeKVCacheBlockQueue.remove:exception", block=block)
+        raise
+    _debug_note_remove(self, block, "FreeKVCacheBlockQueue.remove")
+
+
 def _ascend_free_queue_prepend_n(self: FreeKVCacheBlockQueue, blocks: list[KVCacheBlock]) -> None:
-    _orig_free_queue_prepend_n(self, _filter_queue_insert_blocks(blocks, "FreeKVCacheBlockQueue.prepend_n"))
+    filtered_blocks = _filter_queue_insert_blocks(blocks, "FreeKVCacheBlockQueue.prepend_n", self)
+    if not filtered_blocks:
+        return
+    try:
+        _orig_free_queue_prepend_n(self, filtered_blocks)
+    except Exception:
+        _check_free_queue(self, "FreeKVCacheBlockQueue.prepend_n:exception")
+        raise
+    _debug_note_insert(self, filtered_blocks, "FreeKVCacheBlockQueue.prepend_n", prepend=True)
 
 
 def _ascend_free_queue_append_n(self: FreeKVCacheBlockQueue, blocks: list[KVCacheBlock]) -> None:
-    _orig_free_queue_append_n(self, _filter_queue_insert_blocks(blocks, "FreeKVCacheBlockQueue.append_n"))
+    filtered_blocks = _filter_queue_insert_blocks(blocks, "FreeKVCacheBlockQueue.append_n", self)
+    if not filtered_blocks:
+        return
+    try:
+        _orig_free_queue_append_n(self, filtered_blocks)
+    except Exception:
+        _check_free_queue(self, "FreeKVCacheBlockQueue.append_n:exception")
+        raise
+    _debug_note_insert(self, filtered_blocks, "FreeKVCacheBlockQueue.append_n")
 
 
 _orig_resolve_kv_cache_block_sizes = vllm.v1.core.kv_cache_utils.resolve_kv_cache_block_sizes
@@ -337,9 +687,19 @@ def _get_kv_cache_config_deepseek_v4(
 
 
 BlockPool.free_blocks = _ascend_free_blocks
+BlockPool.touch = _ascend_touch
 vllm.v1.core.block_pool.BlockPool.free_blocks = _ascend_free_blocks
+vllm.v1.core.block_pool.BlockPool.touch = _ascend_touch
+FreeKVCacheBlockQueue.__init__ = _ascend_free_queue_init
+FreeKVCacheBlockQueue.popleft = _ascend_free_queue_popleft
+FreeKVCacheBlockQueue.popleft_n = _ascend_free_queue_popleft_n
+FreeKVCacheBlockQueue.remove = _ascend_free_queue_remove
 FreeKVCacheBlockQueue.prepend_n = _ascend_free_queue_prepend_n
 FreeKVCacheBlockQueue.append_n = _ascend_free_queue_append_n
+vllm.v1.core.kv_cache_utils.FreeKVCacheBlockQueue.__init__ = _ascend_free_queue_init
+vllm.v1.core.kv_cache_utils.FreeKVCacheBlockQueue.popleft = _ascend_free_queue_popleft
+vllm.v1.core.kv_cache_utils.FreeKVCacheBlockQueue.popleft_n = _ascend_free_queue_popleft_n
+vllm.v1.core.kv_cache_utils.FreeKVCacheBlockQueue.remove = _ascend_free_queue_remove
 vllm.v1.core.kv_cache_utils.FreeKVCacheBlockQueue.prepend_n = _ascend_free_queue_prepend_n
 vllm.v1.core.kv_cache_utils.FreeKVCacheBlockQueue.append_n = _ascend_free_queue_append_n
 vllm.v1.core.kv_cache_utils.resolve_kv_cache_block_sizes = _ascend_resolve_kv_cache_block_sizes
