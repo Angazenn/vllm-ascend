@@ -1,15 +1,18 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Ascend project
 import math
+import weakref
 from collections import OrderedDict, defaultdict
 from collections.abc import Iterable, Sequence
 
 import vllm.v1.core.block_pool
+import vllm.v1.core.kv_cache_manager
 import vllm.v1.core.kv_cache_utils
 from vllm.config import VllmConfig
 from vllm.logger import logger
 from vllm.utils.math_utils import cdiv, round_up
 from vllm.v1.core.block_pool import BlockPool
+from vllm.v1.core.kv_cache_manager import KVCacheManager
 from vllm.v1.core.kv_cache_utils import (
     FreeKVCacheBlockQueue,
     KVCacheBlock,
@@ -30,8 +33,18 @@ from vllm_ascend.utils import vllm_version_is
 
 
 _DEBUG_QUEUE_ATTR = "_ascend_debug_free_block_ids"
+_DEBUG_QUEUE_DRIFT_COUNT_ATTR = "_ascend_debug_free_queue_drift_count"
+_DEBUG_QUEUE_LAST_DRIFT_ATTR = "_ascend_debug_free_queue_last_drift"
+_DEBUG_QUEUE_EVENT_COUNTS_ATTR = "_ascend_debug_free_queue_event_counts"
+_KV_CACHE_MANAGER_ATTR = "_ascend_kv_cache_manager"
+_REF_AUDIT_STEP_ATTR = "_ascend_ref_audit_step"
+_REF_AUDIT_MISMATCH_REPORTS_ATTR = "_ascend_ref_audit_mismatch_reports"
 _DEBUG_QUEUE_FULL_LIMIT = 256
 _DEBUG_QUEUE_EDGE_LIMIT = 32
+_REF_AUDIT_INTERVAL = 1000
+_REF_AUDIT_SAMPLE_LIMIT = 16
+_REF_AUDIT_REPORT_FIRST_N = 5
+_REF_AUDIT_REPORT_EVERY = 100
 
 
 def _queue_block_summary(block: KVCacheBlock) -> str:
@@ -74,6 +87,15 @@ def _debug_free_queue_ids(queue: FreeKVCacheBlockQueue) -> OrderedDict[int, None
     if debug_ids is None:
         debug_ids = _init_debug_free_queue(queue)
     return debug_ids
+
+
+def _should_log_debug_queue_event(queue: FreeKVCacheBlockQueue, event: str) -> bool:
+    counts = getattr(queue, _DEBUG_QUEUE_EVENT_COUNTS_ATTR, None)
+    if counts is None:
+        counts = defaultdict(int)
+        setattr(queue, _DEBUG_QUEUE_EVENT_COUNTS_ATTR, counts)
+    counts[event] += 1
+    return counts[event] == 1
 
 
 def _debug_head_tail_ids(debug_ids: OrderedDict[int, None]) -> tuple[int | None, int | None]:
@@ -135,11 +157,24 @@ def _debug_free_queue_summary(
 
 def _warn_debug_count_drift(queue: FreeKVCacheBlockQueue, where: str) -> None:
     debug_ids = _debug_free_queue_ids(queue)
-    if len(debug_ids) == queue.num_free_blocks:
+    debug_free_blocks = len(debug_ids)
+    free_block_count_drift = queue.num_free_blocks - debug_free_blocks
+    if free_block_count_drift == 0:
+        setattr(queue, _DEBUG_QUEUE_DRIFT_COUNT_ATTR, 0)
+        setattr(queue, _DEBUG_QUEUE_LAST_DRIFT_ATTR, None)
         return
+    drift_count = getattr(queue, _DEBUG_QUEUE_DRIFT_COUNT_ATTR, 0) + 1
+    setattr(queue, _DEBUG_QUEUE_DRIFT_COUNT_ATTR, drift_count)
+    last_drift = getattr(queue, _DEBUG_QUEUE_LAST_DRIFT_ATTR, None)
+    if last_drift == free_block_count_drift:
+        return
+    setattr(queue, _DEBUG_QUEUE_LAST_DRIFT_ATTR, free_block_count_drift)
     logger.warning(
         "SWA_BLOCK_DIAG free_queue_debug_count_mismatch "
-        f"where={where} num_free_blocks={queue.num_free_blocks} "
+        f"where={where} mismatch_count={drift_count} "
+        f"num_free_blocks={queue.num_free_blocks} debug_free_blocks={debug_free_blocks} "
+        f"free_block_count_drift={free_block_count_drift} "
+        f"previous_free_block_count_drift={last_drift} "
         f"{_debug_free_queue_summary(queue)}"
     )
 
@@ -152,20 +187,22 @@ def _debug_note_popleft(
     debug_ids = _debug_free_queue_ids(queue)
     for block in blocks:
         if not debug_ids:
-            logger.warning(
-                "SWA_BLOCK_DIAG free_queue_debug_empty_pop "
-                f"where={where} popped_block_id={block.block_id} "
-                f"{_debug_free_queue_summary(queue, block=block)}"
-            )
+            if _should_log_debug_queue_event(queue, "free_queue_debug_empty_pop"):
+                logger.warning(
+                    "SWA_BLOCK_DIAG free_queue_debug_empty_pop "
+                    f"where={where} popped_block_id={block.block_id} "
+                    f"{_debug_free_queue_summary(queue, block=block)}"
+                )
             continue
         expected_block_id, _ = debug_ids.popitem(last=False)
         if expected_block_id != block.block_id:
-            logger.warning(
-                "SWA_BLOCK_DIAG free_queue_debug_pop_mismatch "
-                f"where={where} expected_block_id={expected_block_id} "
-                f"popped_block_id={block.block_id} "
-                f"{_debug_free_queue_summary(queue, block=block)}"
-            )
+            if _should_log_debug_queue_event(queue, "free_queue_debug_pop_mismatch"):
+                logger.warning(
+                    "SWA_BLOCK_DIAG free_queue_debug_pop_mismatch "
+                    f"where={where} expected_block_id={expected_block_id} "
+                    f"popped_block_id={block.block_id} "
+                    f"{_debug_free_queue_summary(queue, block=block)}"
+                )
     _warn_debug_count_drift(queue, where)
 
 
@@ -197,11 +234,12 @@ def _debug_note_remove(
 ) -> None:
     debug_ids = _debug_free_queue_ids(queue)
     if block.block_id not in debug_ids:
-        logger.warning(
-            "SWA_BLOCK_DIAG free_queue_debug_missing_remove "
-            f"where={where} {_queue_block_summary(block)} "
-            f"{_debug_free_queue_summary(queue, block=block)}"
-        )
+        if _should_log_debug_queue_event(queue, "free_queue_debug_missing_remove"):
+            logger.warning(
+                "SWA_BLOCK_DIAG free_queue_debug_missing_remove "
+                f"where={where} {_queue_block_summary(block)} "
+                f"{_debug_free_queue_summary(queue, block=block)}"
+            )
     else:
         debug_ids.pop(block.block_id)
     _warn_debug_count_drift(queue, where)
@@ -291,6 +329,161 @@ def _check_free_queue(
     logger.warning(msg)
 
 
+def _is_block_linked(block: KVCacheBlock) -> bool:
+    return block.prev_free_block is not None or block.next_free_block is not None
+
+
+def _is_block_in_debug_free_queue(block_pool: BlockPool, block: KVCacheBlock) -> bool:
+    debug_ids = _debug_free_queue_ids(block_pool.free_block_queue)
+    return block.block_id in debug_ids
+
+
+def _get_attached_kv_cache_manager(block_pool: BlockPool) -> KVCacheManager | None:
+    manager = getattr(block_pool, _KV_CACHE_MANAGER_ATTR, None)
+    if manager is None:
+        return None
+    if isinstance(manager, weakref.ReferenceType):
+        return manager()
+    return manager
+
+
+def _should_log_ref_audit_mismatch(
+    kv_cache_manager: KVCacheManager,
+    force_log: bool,
+) -> bool:
+    if force_log:
+        return True
+    reports = getattr(kv_cache_manager, _REF_AUDIT_MISMATCH_REPORTS_ATTR, 0) + 1
+    setattr(kv_cache_manager, _REF_AUDIT_MISMATCH_REPORTS_ATTR, reports)
+    return reports <= _REF_AUDIT_REPORT_FIRST_N or reports % _REF_AUDIT_REPORT_EVERY == 0
+
+
+def _audit_ref_cnt_against_req_to_blocks(
+    kv_cache_manager: KVCacheManager,
+    where: str,
+    force_log: bool = False,
+) -> dict[str, int | bool]:
+    block_pool = kv_cache_manager.block_pool
+    actual_refs = [0] * len(block_pool.blocks)
+    invalid_req_block_refs = 0
+    invalid_req_samples: list[str] = []
+    total_req_block_refs = 0
+    manager_req_entries = 0
+
+    for group_idx, manager in enumerate(
+        kv_cache_manager.coordinator.single_type_managers
+    ):
+        for req_id, req_blocks in manager.req_to_blocks.items():
+            manager_req_entries += 1
+            for block_idx, block in enumerate(req_blocks):
+                if block.is_null:
+                    continue
+                total_req_block_refs += 1
+                if 0 <= block.block_id < len(actual_refs):
+                    actual_refs[block.block_id] += 1
+                else:
+                    invalid_req_block_refs += 1
+                    if len(invalid_req_samples) < _REF_AUDIT_SAMPLE_LIMIT:
+                        invalid_req_samples.append(
+                            f"group={group_idx} req={req_id} index={block_idx} "
+                            f"block_id={block.block_id}"
+                        )
+
+    mismatch_count = 0
+    ref_cnt_lt_actual = 0
+    ref_cnt_gt_actual = 0
+    ref_cnt_negative = 0
+    mismatch_samples: list[str] = []
+    for block in block_pool.blocks:
+        if block.is_null:
+            continue
+        actual = actual_refs[block.block_id]
+        if block.ref_cnt < 0:
+            ref_cnt_negative += 1
+        if block.ref_cnt == actual:
+            continue
+        mismatch_count += 1
+        if block.ref_cnt < actual:
+            ref_cnt_lt_actual += 1
+        else:
+            ref_cnt_gt_actual += 1
+        if len(mismatch_samples) < _REF_AUDIT_SAMPLE_LIMIT:
+            mismatch_samples.append(
+                f"block_id={block.block_id}:ref_cnt={block.ref_cnt}:actual_refs={actual}:"
+                f"is_linked={_is_block_linked(block)}:"
+                f"in_debug_free_queue={_is_block_in_debug_free_queue(block_pool, block)}:"
+                f"has_hash={block.block_hash is not None}"
+            )
+
+    ok = mismatch_count == 0 and invalid_req_block_refs == 0
+    if not ok and _should_log_ref_audit_mismatch(kv_cache_manager, force_log):
+        logger.warning(
+            "SWA_BLOCK_DIAG ref_cnt_audit_mismatch "
+            f"where={where} total_blocks={len(block_pool.blocks)} "
+            f"manager_req_entries={manager_req_entries} "
+            f"total_req_block_refs={total_req_block_refs} "
+            f"mismatch_count={mismatch_count} "
+            f"ref_cnt_lt_actual={ref_cnt_lt_actual} "
+            f"ref_cnt_gt_actual={ref_cnt_gt_actual} "
+            f"ref_cnt_negative={ref_cnt_negative} "
+            f"invalid_req_block_refs={invalid_req_block_refs} "
+            f"mismatch_samples={mismatch_samples} "
+            f"invalid_req_samples={invalid_req_samples}"
+        )
+
+    return {
+        "ok": ok,
+        "mismatch_count": mismatch_count,
+        "ref_cnt_lt_actual": ref_cnt_lt_actual,
+        "ref_cnt_gt_actual": ref_cnt_gt_actual,
+        "ref_cnt_negative": ref_cnt_negative,
+        "invalid_req_block_refs": invalid_req_block_refs,
+        "total_req_block_refs": total_req_block_refs,
+    }
+
+
+def _rebuild_free_queue_from_ref_cnt(block_pool: BlockPool, where: str) -> None:
+    for block in block_pool.blocks:
+        block.prev_free_block = None
+        block.next_free_block = None
+
+    free_blocks = [
+        block for block in block_pool.blocks if block.ref_cnt == 0 and not block.is_null
+    ]
+    block_pool.free_block_queue = FreeKVCacheBlockQueue(free_blocks)
+    logger.warning(
+        "SWA_BLOCK_DIAG free_queue_rebuilt "
+        f"where={where} total_blocks={len(block_pool.blocks)} "
+        f"free_blocks={len(free_blocks)}"
+    )
+
+
+def _audit_and_rebuild_free_queue_if_ref_cnt_ok(
+    block_pool: BlockPool,
+    where: str,
+) -> bool:
+    kv_cache_manager = _get_attached_kv_cache_manager(block_pool)
+    if kv_cache_manager is None:
+        logger.warning(
+            "SWA_BLOCK_DIAG free_queue_rebuild_skipped "
+            f"where={where} reason=missing_kv_cache_manager"
+        )
+        return False
+
+    audit = _audit_ref_cnt_against_req_to_blocks(kv_cache_manager, where, force_log=True)
+    if not audit["ok"]:
+        logger.warning(
+            "SWA_BLOCK_DIAG free_queue_rebuild_skipped "
+            f"where={where} reason=ref_cnt_audit_mismatch "
+            f"mismatch_count={audit['mismatch_count']} "
+            f"invalid_req_block_refs={audit['invalid_req_block_refs']}"
+        )
+        return False
+
+    _rebuild_free_queue_from_ref_cnt(block_pool, where)
+    return True
+
+
 def _dedupe_free_blocks(
     blocks: Iterable[KVCacheBlock],
     where: str,
@@ -339,6 +532,9 @@ def _filter_queue_insert_blocks(
 
 _orig_block_pool_free_blocks = BlockPool.free_blocks
 _orig_block_pool_touch = BlockPool.touch
+_orig_block_pool_get_new_blocks = BlockPool.get_new_blocks
+_orig_kv_cache_manager_init = KVCacheManager.__init__
+_orig_kv_cache_manager_new_step_starts = KVCacheManager.new_step_starts
 
 
 def _ascend_free_blocks(
@@ -347,7 +543,9 @@ def _ascend_free_blocks(
     prepend: bool = False,
 ) -> None:
     filtered_blocks: list[KVCacheBlock] = []
-    for block in _dedupe_free_blocks(ordered_blocks, "BlockPool.free_blocks", self.free_block_queue):
+    for block in _dedupe_free_blocks(
+        ordered_blocks, "BlockPool.free_blocks", self.free_block_queue
+    ):
         if not block.is_null and block.ref_cnt <= 0:
             _swa_queue_block_diag(
                 "ref_cnt_underflow_free_blocks",
@@ -357,30 +555,109 @@ def _ascend_free_blocks(
             )
             continue
         filtered_blocks.append(block)
-    _orig_block_pool_free_blocks(self, filtered_blocks, prepend)
+    try:
+        _orig_block_pool_free_blocks(self, filtered_blocks, prepend)
+    except Exception:
+        _check_free_queue(self.free_block_queue, "BlockPool.free_blocks:exception")
+        if _audit_and_rebuild_free_queue_if_ref_cnt_ok(
+            self, "BlockPool.free_blocks:exception"
+        ):
+            return
+        raise
 
 
 def _ascend_touch(self: BlockPool, blocks: Sequence[KVCacheBlock]) -> None:
     seen_block_ids: set[int] = set()
     for block in blocks:
         if not block.is_null and block.block_id in seen_block_ids:
-            _swa_queue_block_diag("duplicate_touch_batch", block, "BlockPool.touch", self.free_block_queue)
+            _swa_queue_block_diag(
+                "duplicate_touch_batch", block, "BlockPool.touch", self.free_block_queue
+            )
         if not block.is_null:
             seen_block_ids.add(block.block_id)
 
         if block.ref_cnt == 0 and not block.is_null:
             if block.prev_free_block is None or block.next_free_block is None:
-                _swa_queue_block_diag("unlinked_free_block_touch", block, "BlockPool.touch", self.free_block_queue)
-            elif block.prev_free_block.next_free_block is not block or block.next_free_block.prev_free_block is not block:
-                _swa_queue_block_diag("broken_link_free_block_touch", block, "BlockPool.touch", self.free_block_queue)
-        elif block.ref_cnt > 0 and (block.prev_free_block is not None or block.next_free_block is not None):
-            _swa_queue_block_diag("linked_inuse_block_touch", block, "BlockPool.touch", self.free_block_queue)
+                _swa_queue_block_diag(
+                    "unlinked_free_block_touch",
+                    block,
+                    "BlockPool.touch",
+                    self.free_block_queue,
+                )
+            elif (
+                block.prev_free_block.next_free_block is not block
+                or block.next_free_block.prev_free_block is not block
+            ):
+                _swa_queue_block_diag(
+                    "broken_link_free_block_touch",
+                    block,
+                    "BlockPool.touch",
+                    self.free_block_queue,
+                )
+        elif block.ref_cnt > 0 and (
+            block.prev_free_block is not None or block.next_free_block is not None
+        ):
+            _swa_queue_block_diag(
+                "linked_inuse_block_touch",
+                block,
+                "BlockPool.touch",
+                self.free_block_queue,
+            )
 
     try:
         return _orig_block_pool_touch(self, blocks)
     except Exception:
         _check_free_queue(self.free_block_queue, "BlockPool.touch:exception")
+        if _audit_and_rebuild_free_queue_if_ref_cnt_ok(
+            self, "BlockPool.touch:exception"
+        ):
+            return _orig_block_pool_touch(self, blocks)
         raise
+
+
+def _ascend_get_new_blocks(self: BlockPool, num_blocks: int) -> list[KVCacheBlock]:
+    try:
+        return _orig_block_pool_get_new_blocks(self, num_blocks)
+    except Exception as exc:
+        if isinstance(exc, ValueError) and str(exc).startswith("Cannot get "):
+            raise
+        _check_free_queue(
+            self.free_block_queue,
+            "BlockPool.get_new_blocks:exception",
+            requested_n=num_blocks,
+        )
+        if _audit_and_rebuild_free_queue_if_ref_cnt_ok(
+            self, "BlockPool.get_new_blocks:exception"
+        ):
+            return _orig_block_pool_get_new_blocks(self, num_blocks)
+        raise
+
+
+def _ascend_kv_cache_manager_init(self: KVCacheManager, *args, **kwargs) -> None:
+    _orig_kv_cache_manager_init(self, *args, **kwargs)
+    setattr(self.block_pool, _KV_CACHE_MANAGER_ATTR, weakref.ref(self))
+    setattr(self, _REF_AUDIT_STEP_ATTR, 0)
+
+
+def _ascend_kv_cache_manager_new_step_starts(self: KVCacheManager) -> None:
+    _orig_kv_cache_manager_new_step_starts(self)
+    step = getattr(self, _REF_AUDIT_STEP_ATTR, 0) + 1
+    setattr(self, _REF_AUDIT_STEP_ATTR, step)
+    if step % _REF_AUDIT_INTERVAL != 0:
+        return
+    audit = _audit_ref_cnt_against_req_to_blocks(
+        self,
+        f"KVCacheManager.new_step_starts:step={step}",
+    )
+    if (
+        audit["ok"]
+        and len(_debug_free_queue_ids(self.block_pool.free_block_queue))
+        != self.block_pool.get_num_free_blocks()
+    ):
+        _rebuild_free_queue_from_ref_cnt(
+            self.block_pool,
+            f"KVCacheManager.new_step_starts:step={step}:debug_count_drift",
+        )
 
 
 _orig_free_queue_popleft = FreeKVCacheBlockQueue.popleft
@@ -688,8 +965,14 @@ def _get_kv_cache_config_deepseek_v4(
 
 BlockPool.free_blocks = _ascend_free_blocks
 BlockPool.touch = _ascend_touch
+BlockPool.get_new_blocks = _ascend_get_new_blocks
 vllm.v1.core.block_pool.BlockPool.free_blocks = _ascend_free_blocks
 vllm.v1.core.block_pool.BlockPool.touch = _ascend_touch
+vllm.v1.core.block_pool.BlockPool.get_new_blocks = _ascend_get_new_blocks
+KVCacheManager.__init__ = _ascend_kv_cache_manager_init
+KVCacheManager.new_step_starts = _ascend_kv_cache_manager_new_step_starts
+vllm.v1.core.kv_cache_manager.KVCacheManager.__init__ = _ascend_kv_cache_manager_init
+vllm.v1.core.kv_cache_manager.KVCacheManager.new_step_starts = _ascend_kv_cache_manager_new_step_starts
 FreeKVCacheBlockQueue.__init__ = _ascend_free_queue_init
 FreeKVCacheBlockQueue.popleft = _ascend_free_queue_popleft
 FreeKVCacheBlockQueue.popleft_n = _ascend_free_queue_popleft_n
