@@ -37,6 +37,7 @@ _DEBUG_QUEUE_ATTR = "_ascend_debug_free_block_ids"
 _DEBUG_QUEUE_DRIFT_COUNT_ATTR = "_ascend_debug_free_queue_drift_count"
 _DEBUG_QUEUE_LAST_DRIFT_ATTR = "_ascend_debug_free_queue_last_drift"
 _DEBUG_QUEUE_EVENT_COUNTS_ATTR = "_ascend_debug_free_queue_event_counts"
+_CONNECTOR_DELAY_FREE_EPOCHS_ATTR = "_ascend_connector_delay_free_epochs"
 _KV_CACHE_MANAGER_ATTR = "_ascend_kv_cache_manager"
 _REF_AUDIT_STEP_ATTR = "_ascend_ref_audit_step"
 _REF_AUDIT_MISMATCH_REPORTS_ATTR = "_ascend_ref_audit_mismatch_reports"
@@ -47,13 +48,42 @@ _REF_AUDIT_INTERVAL = 1000
 _REF_AUDIT_SAMPLE_LIMIT = 16
 _REF_AUDIT_REPORT_FIRST_N = 5
 _REF_AUDIT_REPORT_EVERY = 100
+_DEBUG_BLOCK_EPOCHS_BY_OBJECT_ID: dict[int, int] = {}
+_DEBUG_BLOCK_EPOCH_WHERE_BY_OBJECT_ID: dict[int, str] = {}
+
+
+def _get_block_epoch(block: KVCacheBlock) -> int:
+    return _DEBUG_BLOCK_EPOCHS_BY_OBJECT_ID.get(id(block), 0)
+
+
+def _get_block_epoch_where(block: KVCacheBlock) -> str | None:
+    return _DEBUG_BLOCK_EPOCH_WHERE_BY_OBJECT_ID.get(id(block))
+
+
+def _bump_block_epoch(block: KVCacheBlock, where: str) -> None:
+    if block.is_null:
+        return
+    block_object_id = id(block)
+    _DEBUG_BLOCK_EPOCHS_BY_OBJECT_ID[block_object_id] = (
+        _DEBUG_BLOCK_EPOCHS_BY_OBJECT_ID.get(block_object_id, 0) + 1
+    )
+    _DEBUG_BLOCK_EPOCH_WHERE_BY_OBJECT_ID[block_object_id] = where
+
+
+def _bump_block_epochs(blocks: Iterable[KVCacheBlock], where: str) -> None:
+    seen_block_ids: set[int] = set()
+    for block in blocks:
+        if block.is_null or block.block_id in seen_block_ids:
+            continue
+        seen_block_ids.add(block.block_id)
+        _bump_block_epoch(block, where)
 
 
 def _queue_block_summary(block: KVCacheBlock) -> str:
     prev_id = block.prev_free_block.block_id if block.prev_free_block is not None else None
     next_id = block.next_free_block.block_id if block.next_free_block is not None else None
     return (
-        f"block_id={block.block_id} ref_cnt={block.ref_cnt} "
+        f"block_id={block.block_id} epoch={_get_block_epoch(block)} ref_cnt={block.ref_cnt} "
         f"is_null={block.is_null} prev_free_block={prev_id} next_free_block={next_id}"
     )
 
@@ -164,6 +194,135 @@ def _debug_stack_summary() -> str:
         path = "/".join(frame.filename.rsplit("/", 3)[-3:])
         stack.append(f"{path}:{frame.lineno}:{frame.name}")
     return f"debug_stack={stack}"
+
+
+def _request_block_epoch_snapshot(
+    kv_cache_manager: KVCacheManager,
+    request_id: str,
+) -> dict[int, int]:
+    snapshot: dict[int, int] = {}
+    block_groups = kv_cache_manager.coordinator.get_blocks(request_id)
+    for blocks in block_groups:
+        for block in blocks:
+            if block.is_null:
+                continue
+            snapshot.setdefault(block.block_id, _get_block_epoch(block))
+    return snapshot
+
+
+def _epoch_snapshot_sample(snapshot: dict[int, int]) -> list[str]:
+    return [
+        f"block_id={block_id}:epoch={epoch}"
+        for block_id, epoch in list(snapshot.items())[:_REF_AUDIT_SAMPLE_LIMIT]
+    ]
+
+
+def _find_block_owner_sample(
+    kv_cache_manager: KVCacheManager,
+    block_id: int,
+) -> list[str]:
+    samples: list[str] = []
+    for group_idx, manager in enumerate(
+        kv_cache_manager.coordinator.single_type_managers
+    ):
+        for req_id, blocks in manager.req_to_blocks.items():
+            for block_idx, block in enumerate(blocks):
+                if block.is_null or block.block_id != block_id:
+                    continue
+                samples.append(f"group={group_idx}:req={req_id}:index={block_idx}")
+                if len(samples) >= _REF_AUDIT_SAMPLE_LIMIT:
+                    return samples
+    return samples
+
+
+def _connector_epoch_mismatch_sample(
+    kv_cache_manager: KVCacheManager,
+    saved: dict[int, int],
+    current: dict[int, int],
+) -> list[str]:
+    block_pool = kv_cache_manager.block_pool
+    samples: list[str] = []
+    for block_id, saved_epoch in saved.items():
+        current_epoch = current.get(block_id)
+        if current_epoch == saved_epoch:
+            continue
+        block = (
+            block_pool.blocks[block_id]
+            if 0 <= block_id < len(block_pool.blocks)
+            else None
+        )
+        if block is None:
+            samples.append(
+                f"block_id={block_id}:saved_epoch={saved_epoch}:"
+                f"current_epoch={current_epoch}:missing_block=True"
+            )
+        else:
+            samples.append(
+                f"block_id={block_id}:saved_epoch={saved_epoch}:"
+                f"current_epoch={current_epoch}:ref_cnt={block.ref_cnt}:"
+                f"is_linked={_is_block_linked(block)}:"
+                f"in_debug_free_queue={_is_block_in_debug_free_queue(block_pool, block)}:"
+                f"last_epoch_where={_get_block_epoch_where(block)}:"
+                f"owners={_find_block_owner_sample(kv_cache_manager, block_id)}"
+            )
+        if len(samples) >= _REF_AUDIT_SAMPLE_LIMIT:
+            break
+    return samples
+
+
+def _connector_delay_free_epochs(scheduler) -> dict[str, dict[int, int]]:
+    epochs = getattr(scheduler, _CONNECTOR_DELAY_FREE_EPOCHS_ATTR, None)
+    if epochs is None:
+        epochs = {}
+        setattr(scheduler, _CONNECTOR_DELAY_FREE_EPOCHS_ATTR, epochs)
+    return epochs
+
+
+def _record_connector_delay_free_epochs(scheduler, request) -> None:
+    snapshot = _request_block_epoch_snapshot(
+        scheduler.kv_cache_manager,
+        request.request_id,
+    )
+    if not snapshot:
+        return
+    _connector_delay_free_epochs(scheduler)[request.request_id] = snapshot
+
+
+def _drop_connector_delay_free_epochs(scheduler, request_id: str) -> None:
+    epochs = getattr(scheduler, _CONNECTOR_DELAY_FREE_EPOCHS_ATTR, None)
+    if epochs:
+        epochs.pop(request_id, None)
+
+
+def _check_connector_delay_free_epochs(scheduler, request, where: str) -> None:
+    epochs = getattr(scheduler, _CONNECTOR_DELAY_FREE_EPOCHS_ATTR, None)
+    if not epochs:
+        return
+    saved = epochs.get(request.request_id)
+    if not saved:
+        return
+    current = _request_block_epoch_snapshot(
+        scheduler.kv_cache_manager,
+        request.request_id,
+    )
+    mismatch_count = sum(
+        1
+        for block_id, saved_epoch in saved.items()
+        if current.get(block_id) != saved_epoch
+    )
+    if mismatch_count == 0:
+        return
+    logger.warning(
+        "SWA_BLOCK_DIAG connector_delayed_free_epoch_mismatch "
+        f"where={where} req_id={request.request_id} "
+        f"request_status={getattr(request.status, 'name', request.status)} "
+        f"saved_block_count={len(saved)} current_block_count={len(current)} "
+        f"mismatch_count={mismatch_count} "
+        f"saved_epoch_sample={_epoch_snapshot_sample(saved)} "
+        f"current_epoch_sample={_epoch_snapshot_sample(current)} "
+        f"mismatch_samples={_connector_epoch_mismatch_sample(scheduler.kv_cache_manager, saved, current)} "
+        f"{_debug_stack_summary()}"
+    )
 
 
 def _free_queue_count_snapshot(queue: FreeKVCacheBlockQueue) -> dict[str, int]:
@@ -618,17 +777,30 @@ def _ascend_free_blocks(
             )
             continue
         filtered_blocks.append(block)
+    before_ref_cnt = {
+        id(block): block.ref_cnt for block in filtered_blocks if not block.is_null
+    }
     try:
         _orig_block_pool_free_blocks(self, filtered_blocks, prepend)
     except Exception:
         _check_free_queue(self.free_block_queue, "BlockPool.free_blocks:exception")
         _audit_ref_cnt_for_free_queue_issue(self, "BlockPool.free_blocks:exception")
         raise
+    for block in filtered_blocks:
+        if (
+            not block.is_null
+            and before_ref_cnt.get(id(block), 0) > 0
+            and block.ref_cnt == 0
+        ):
+            _bump_block_epoch(block, "BlockPool.free_blocks:live_to_free")
 
 
 def _ascend_touch(self: BlockPool, blocks: Sequence[KVCacheBlock]) -> None:
     seen_block_ids: set[int] = set()
+    before_ref_cnt: dict[int, int] = {}
     for block in blocks:
+        if not block.is_null:
+            before_ref_cnt.setdefault(id(block), block.ref_cnt)
         if not block.is_null and block.block_id in seen_block_ids:
             _swa_queue_block_diag(
                 "duplicate_touch_batch", block, "BlockPool.touch", self.free_block_queue
@@ -665,16 +837,27 @@ def _ascend_touch(self: BlockPool, blocks: Sequence[KVCacheBlock]) -> None:
             )
 
     try:
-        return _orig_block_pool_touch(self, blocks)
+        result = _orig_block_pool_touch(self, blocks)
     except Exception:
         _check_free_queue(self.free_block_queue, "BlockPool.touch:exception")
         _audit_ref_cnt_for_free_queue_issue(self, "BlockPool.touch:exception")
         raise
+    bumped_block_ids: set[int] = set()
+    for block in blocks:
+        if (
+            not block.is_null
+            and block.block_id not in bumped_block_ids
+            and before_ref_cnt.get(id(block)) == 0
+            and block.ref_cnt > 0
+        ):
+            bumped_block_ids.add(block.block_id)
+            _bump_block_epoch(block, "BlockPool.touch:free_to_live")
+    return result
 
 
 def _ascend_get_new_blocks(self: BlockPool, num_blocks: int) -> list[KVCacheBlock]:
     try:
-        return _orig_block_pool_get_new_blocks(self, num_blocks)
+        blocks = _orig_block_pool_get_new_blocks(self, num_blocks)
     except Exception as exc:
         if isinstance(exc, ValueError) and str(exc).startswith("Cannot get "):
             where = "BlockPool.get_new_blocks:cannot_get"
@@ -701,6 +884,8 @@ def _ascend_get_new_blocks(self: BlockPool, num_blocks: int) -> list[KVCacheBloc
         )
         _audit_ref_cnt_for_free_queue_issue(self, "BlockPool.get_new_blocks:exception")
         raise
+    _bump_block_epochs(blocks, "BlockPool.get_new_blocks:free_to_live")
+    return blocks
 
 
 def _ascend_kv_cache_manager_init(self: KVCacheManager, *args, **kwargs) -> None:
@@ -840,6 +1025,29 @@ def _ascend_free_queue_append_n(self: FreeKVCacheBlockQueue, blocks: list[KVCach
     _log_free_queue_operation_drift(
         self, where, before, len(filtered_blocks), len(filtered_blocks), "after"
     )
+
+
+def _ascend_scheduler_connector_finished(self, request):
+    connector_delay_free_blocks, kv_xfer_params = _orig_scheduler_connector_finished(
+        self, request
+    )
+    if connector_delay_free_blocks:
+        _record_connector_delay_free_epochs(self, request)
+    else:
+        _drop_connector_delay_free_epochs(self, request.request_id)
+    return connector_delay_free_blocks, kv_xfer_params
+
+
+def _ascend_scheduler_free_blocks(self, request):
+    _check_connector_delay_free_epochs(
+        self,
+        request,
+        "Scheduler._free_blocks:before",
+    )
+    try:
+        return _orig_scheduler_free_blocks(self, request)
+    finally:
+        _drop_connector_delay_free_epochs(self, request.request_id)
 
 
 _orig_resolve_kv_cache_block_sizes = vllm.v1.core.kv_cache_utils.resolve_kv_cache_block_sizes
@@ -1072,6 +1280,12 @@ def _get_kv_cache_config_deepseek_v4(
     return num_blocks, kv_cache_tensors
 
 
+import vllm.v1.core.sched.scheduler  # noqa: E402
+from vllm.v1.core.sched.scheduler import Scheduler  # noqa: E402
+
+_orig_scheduler_connector_finished = Scheduler._connector_finished
+_orig_scheduler_free_blocks = Scheduler._free_blocks
+
 BlockPool.free_blocks = _ascend_free_blocks
 BlockPool.touch = _ascend_touch
 BlockPool.get_new_blocks = _ascend_get_new_blocks
@@ -1094,6 +1308,10 @@ vllm.v1.core.kv_cache_utils.FreeKVCacheBlockQueue.popleft_n = _ascend_free_queue
 vllm.v1.core.kv_cache_utils.FreeKVCacheBlockQueue.remove = _ascend_free_queue_remove
 vllm.v1.core.kv_cache_utils.FreeKVCacheBlockQueue.prepend_n = _ascend_free_queue_prepend_n
 vllm.v1.core.kv_cache_utils.FreeKVCacheBlockQueue.append_n = _ascend_free_queue_append_n
+Scheduler._connector_finished = _ascend_scheduler_connector_finished
+Scheduler._free_blocks = _ascend_scheduler_free_blocks
+vllm.v1.core.sched.scheduler.Scheduler._connector_finished = _ascend_scheduler_connector_finished
+vllm.v1.core.sched.scheduler.Scheduler._free_blocks = _ascend_scheduler_free_blocks
 vllm.v1.core.kv_cache_utils.resolve_kv_cache_block_sizes = _ascend_resolve_kv_cache_block_sizes
 vllm.v1.core.kv_cache_utils.group_and_unify_kv_cache_specs = group_and_unify_kv_cache_specs
 vllm.v1.core.kv_cache_utils._get_kv_cache_groups_uniform_groups = _get_kv_cache_groups_uniform_groups
