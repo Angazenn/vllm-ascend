@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Ascend project
 import math
+import traceback
 import weakref
 from collections import OrderedDict, defaultdict
 from collections.abc import Iterable, Sequence
@@ -41,6 +42,7 @@ _REF_AUDIT_STEP_ATTR = "_ascend_ref_audit_step"
 _REF_AUDIT_MISMATCH_REPORTS_ATTR = "_ascend_ref_audit_mismatch_reports"
 _DEBUG_QUEUE_FULL_LIMIT = 256
 _DEBUG_QUEUE_EDGE_LIMIT = 32
+_DEBUG_QUEUE_STACK_LIMIT = 12
 _REF_AUDIT_INTERVAL = 1000
 _REF_AUDIT_SAMPLE_LIMIT = 16
 _REF_AUDIT_REPORT_FIRST_N = 5
@@ -155,10 +157,94 @@ def _debug_free_queue_summary(
     return msg
 
 
+def _debug_stack_summary() -> str:
+    frames = traceback.extract_stack(limit=_DEBUG_QUEUE_STACK_LIMIT + 2)[:-2]
+    stack = []
+    for frame in frames:
+        path = "/".join(frame.filename.rsplit("/", 3)[-3:])
+        stack.append(f"{path}:{frame.lineno}:{frame.name}")
+    return f"debug_stack={stack}"
+
+
+def _free_queue_count_snapshot(queue: FreeKVCacheBlockQueue) -> dict[str, int]:
+    debug_free_blocks = len(_debug_free_queue_ids(queue))
+    return {
+        "num_free_blocks": queue.num_free_blocks,
+        "debug_free_blocks": debug_free_blocks,
+        "free_block_count_drift": queue.num_free_blocks - debug_free_blocks,
+    }
+
+
+def _count_linked_free_queue_blocks(queue: FreeKVCacheBlockQueue) -> tuple[int, str | None]:
+    curr_block = queue.fake_free_list_head.next_free_block
+    if curr_block is None:
+        return 0, "missing_head_next"
+
+    real_count = 0
+    seen_block_ids: set[int] = set()
+    while curr_block is not queue.fake_free_list_tail:
+        if curr_block is None:
+            return real_count, "linked_list_reached_none"
+        if curr_block.block_id in seen_block_ids:
+            return real_count, "linked_list_cycle_or_duplicate"
+        seen_block_ids.add(curr_block.block_id)
+        real_count += 1
+        curr_block = curr_block.next_free_block
+    return real_count, None
+
+
+def _log_free_queue_operation_drift(
+    queue: FreeKVCacheBlockQueue,
+    where: str,
+    before: dict[str, int],
+    expected_num_free_delta: int,
+    expected_debug_free_delta: int,
+    phase: str,
+    force: bool = False,
+) -> None:
+    after = _free_queue_count_snapshot(queue)
+    actual_num_free_delta = after["num_free_blocks"] - before["num_free_blocks"]
+    actual_debug_free_delta = after["debug_free_blocks"] - before["debug_free_blocks"]
+    before_drift = before["free_block_count_drift"]
+    after_drift = after["free_block_count_drift"]
+    num_delta_mismatch = actual_num_free_delta != expected_num_free_delta
+    debug_delta_mismatch = actual_debug_free_delta != expected_debug_free_delta
+    drift_shifted = before_drift != after_drift
+    # Existing unchanged drift is reported by _warn_debug_count_drift.
+    # This boundary log is for operation-caused drift shifts or failures.
+    if (
+        not force
+        and not num_delta_mismatch
+        and not debug_delta_mismatch
+        and not drift_shifted
+    ):
+        return
+
+    linked_free_blocks, linked_free_issue = _count_linked_free_queue_blocks(queue)
+    logger.warning(
+        "SWA_BLOCK_DIAG free_queue_operation_drift "
+        f"where={where} phase={phase} "
+        f"expected_num_free_delta={expected_num_free_delta} "
+        f"expected_debug_free_delta={expected_debug_free_delta} "
+        f"actual_num_free_delta={actual_num_free_delta} "
+        f"actual_debug_free_delta={actual_debug_free_delta} "
+        f"before_num_free_blocks={before['num_free_blocks']} "
+        f"after_num_free_blocks={after['num_free_blocks']} "
+        f"before_debug_free_blocks={before['debug_free_blocks']} "
+        f"after_debug_free_blocks={after['debug_free_blocks']} "
+        f"before_free_block_count_drift={before_drift} "
+        f"after_free_block_count_drift={after_drift} "
+        f"after_linked_free_blocks={linked_free_blocks} "
+        f"after_linked_free_issue={linked_free_issue} "
+        f"{_debug_free_queue_summary(queue)} "
+        f"{_debug_stack_summary()}"
+    )
+
+
 def _warn_debug_count_drift(queue: FreeKVCacheBlockQueue, where: str) -> None:
-    debug_ids = _debug_free_queue_ids(queue)
-    debug_free_blocks = len(debug_ids)
-    free_block_count_drift = queue.num_free_blocks - debug_free_blocks
+    snapshot = _free_queue_count_snapshot(queue)
+    debug_free_blocks = snapshot["debug_free_blocks"]
+    free_block_count_drift = snapshot["free_block_count_drift"]
     if free_block_count_drift == 0:
         setattr(queue, _DEBUG_QUEUE_DRIFT_COUNT_ATTR, 0)
         setattr(queue, _DEBUG_QUEUE_LAST_DRIFT_ATTR, None)
@@ -175,7 +261,8 @@ def _warn_debug_count_drift(queue: FreeKVCacheBlockQueue, where: str) -> None:
         f"num_free_blocks={queue.num_free_blocks} debug_free_blocks={debug_free_blocks} "
         f"free_block_count_drift={free_block_count_drift} "
         f"previous_free_block_count_drift={last_drift} "
-        f"{_debug_free_queue_summary(queue)}"
+        f"{_debug_free_queue_summary(queue)} "
+        f"{_debug_stack_summary()}"
     )
 
 
@@ -213,6 +300,7 @@ def _debug_note_insert(
     prepend: bool = False,
 ) -> None:
     if not blocks:
+        _warn_debug_count_drift(queue, where)
         return
     debug_ids = _debug_free_queue_ids(queue)
     if prepend:
@@ -442,46 +530,21 @@ def _audit_ref_cnt_against_req_to_blocks(
     }
 
 
-def _rebuild_free_queue_from_ref_cnt(block_pool: BlockPool, where: str) -> None:
-    for block in block_pool.blocks:
-        block.prev_free_block = None
-        block.next_free_block = None
-
-    free_blocks = [
-        block for block in block_pool.blocks if block.ref_cnt == 0 and not block.is_null
-    ]
-    block_pool.free_block_queue = FreeKVCacheBlockQueue(free_blocks)
-    logger.warning(
-        "SWA_BLOCK_DIAG free_queue_rebuilt "
-        f"where={where} total_blocks={len(block_pool.blocks)} "
-        f"free_blocks={len(free_blocks)}"
+def _count_ref_cnt_free_blocks(block_pool: BlockPool) -> int:
+    return sum(
+        1 for block in block_pool.blocks if block.ref_cnt == 0 and not block.is_null
     )
 
 
-def _audit_and_rebuild_free_queue_if_ref_cnt_ok(
-    block_pool: BlockPool,
-    where: str,
-) -> bool:
+def _audit_ref_cnt_for_free_queue_issue(block_pool: BlockPool, where: str) -> None:
     kv_cache_manager = _get_attached_kv_cache_manager(block_pool)
     if kv_cache_manager is None:
         logger.warning(
-            "SWA_BLOCK_DIAG free_queue_rebuild_skipped "
+            "SWA_BLOCK_DIAG ref_cnt_audit_skipped "
             f"where={where} reason=missing_kv_cache_manager"
         )
-        return False
-
-    audit = _audit_ref_cnt_against_req_to_blocks(kv_cache_manager, where, force_log=True)
-    if not audit["ok"]:
-        logger.warning(
-            "SWA_BLOCK_DIAG free_queue_rebuild_skipped "
-            f"where={where} reason=ref_cnt_audit_mismatch "
-            f"mismatch_count={audit['mismatch_count']} "
-            f"invalid_req_block_refs={audit['invalid_req_block_refs']}"
-        )
-        return False
-
-    _rebuild_free_queue_from_ref_cnt(block_pool, where)
-    return True
+        return
+    _audit_ref_cnt_against_req_to_blocks(kv_cache_manager, where, force_log=True)
 
 
 def _dedupe_free_blocks(
@@ -559,10 +622,7 @@ def _ascend_free_blocks(
         _orig_block_pool_free_blocks(self, filtered_blocks, prepend)
     except Exception:
         _check_free_queue(self.free_block_queue, "BlockPool.free_blocks:exception")
-        if _audit_and_rebuild_free_queue_if_ref_cnt_ok(
-            self, "BlockPool.free_blocks:exception"
-        ):
-            return
+        _audit_ref_cnt_for_free_queue_issue(self, "BlockPool.free_blocks:exception")
         raise
 
 
@@ -608,10 +668,7 @@ def _ascend_touch(self: BlockPool, blocks: Sequence[KVCacheBlock]) -> None:
         return _orig_block_pool_touch(self, blocks)
     except Exception:
         _check_free_queue(self.free_block_queue, "BlockPool.touch:exception")
-        if _audit_and_rebuild_free_queue_if_ref_cnt_ok(
-            self, "BlockPool.touch:exception"
-        ):
-            return _orig_block_pool_touch(self, blocks)
+        _audit_ref_cnt_for_free_queue_issue(self, "BlockPool.touch:exception")
         raise
 
 
@@ -620,16 +677,29 @@ def _ascend_get_new_blocks(self: BlockPool, num_blocks: int) -> list[KVCacheBloc
         return _orig_block_pool_get_new_blocks(self, num_blocks)
     except Exception as exc:
         if isinstance(exc, ValueError) and str(exc).startswith("Cannot get "):
+            where = "BlockPool.get_new_blocks:cannot_get"
+            _check_free_queue(
+                self.free_block_queue,
+                where,
+                requested_n=num_blocks,
+            )
+            ref_cnt_free_blocks = _count_ref_cnt_free_blocks(self)
+            logger.warning(
+                "SWA_BLOCK_DIAG free_queue_cannot_get_blocks "
+                f"where={where} requested_n={num_blocks} "
+                f"num_free_blocks={self.get_num_free_blocks()} "
+                f"ref_cnt_free_blocks={ref_cnt_free_blocks} "
+                f"{_debug_free_queue_summary(self.free_block_queue, requested_n=num_blocks)} "
+                f"{_debug_stack_summary()}"
+            )
+            _audit_ref_cnt_for_free_queue_issue(self, where)
             raise
         _check_free_queue(
             self.free_block_queue,
             "BlockPool.get_new_blocks:exception",
             requested_n=num_blocks,
         )
-        if _audit_and_rebuild_free_queue_if_ref_cnt_ok(
-            self, "BlockPool.get_new_blocks:exception"
-        ):
-            return _orig_block_pool_get_new_blocks(self, num_blocks)
+        _audit_ref_cnt_for_free_queue_issue(self, "BlockPool.get_new_blocks:exception")
         raise
 
 
@@ -645,19 +715,10 @@ def _ascend_kv_cache_manager_new_step_starts(self: KVCacheManager) -> None:
     setattr(self, _REF_AUDIT_STEP_ATTR, step)
     if step % _REF_AUDIT_INTERVAL != 0:
         return
-    audit = _audit_ref_cnt_against_req_to_blocks(
+    _audit_ref_cnt_against_req_to_blocks(
         self,
         f"KVCacheManager.new_step_starts:step={step}",
     )
-    if (
-        audit["ok"]
-        and len(_debug_free_queue_ids(self.block_pool.free_block_queue))
-        != self.block_pool.get_num_free_blocks()
-    ):
-        _rebuild_free_queue_from_ref_cnt(
-            self.block_pool,
-            f"KVCacheManager.new_step_starts:step={step}:debug_count_drift",
-        )
 
 
 _orig_free_queue_popleft = FreeKVCacheBlockQueue.popleft
@@ -677,60 +738,108 @@ def _ascend_free_queue_init(
 
 
 def _ascend_free_queue_popleft(self: FreeKVCacheBlockQueue) -> KVCacheBlock:
+    where = "FreeKVCacheBlockQueue.popleft"
+    before = _free_queue_count_snapshot(self)
+    _warn_debug_count_drift(self, f"{where}:before")
     try:
         block = _orig_free_queue_popleft(self)
     except Exception:
-        _check_free_queue(self, "FreeKVCacheBlockQueue.popleft:exception")
+        _warn_debug_count_drift(self, f"{where}:exception")
+        _check_free_queue(self, f"{where}:exception")
+        _log_free_queue_operation_drift(
+            self, where, before, -1, 0, "exception", force=True
+        )
         raise
-    _debug_note_popleft(self, [block], "FreeKVCacheBlockQueue.popleft")
+    _debug_note_popleft(self, [block], where)
+    _log_free_queue_operation_drift(self, where, before, -1, -1, "after")
     return block
 
 
 def _ascend_free_queue_popleft_n(self: FreeKVCacheBlockQueue, n: int) -> list[KVCacheBlock]:
+    where = "FreeKVCacheBlockQueue.popleft_n"
+    before = _free_queue_count_snapshot(self)
+    _warn_debug_count_drift(self, f"{where}:before")
     try:
         blocks = _orig_free_queue_popleft_n(self, n)
     except Exception:
-        _check_free_queue(self, "FreeKVCacheBlockQueue.popleft_n:exception", requested_n=n)
+        _warn_debug_count_drift(self, f"{where}:exception")
+        _check_free_queue(self, f"{where}:exception", requested_n=n)
+        _log_free_queue_operation_drift(
+            self, where, before, -n, 0, "exception", force=True
+        )
         raise
-    _debug_note_popleft(self, blocks, "FreeKVCacheBlockQueue.popleft_n")
+    _debug_note_popleft(self, blocks, where)
+    _log_free_queue_operation_drift(self, where, before, -n, -len(blocks), "after")
     return blocks
 
 
 def _ascend_free_queue_remove(self: FreeKVCacheBlockQueue, block: KVCacheBlock) -> None:
+    where = "FreeKVCacheBlockQueue.remove"
+    before = _free_queue_count_snapshot(self)
+    _warn_debug_count_drift(self, f"{where}:before")
     if block.prev_free_block is None or block.next_free_block is None:
-        _swa_queue_block_diag("invalid_free_queue_remove", block, "FreeKVCacheBlockQueue.remove", self)
+        _swa_queue_block_diag("invalid_free_queue_remove", block, where, self)
     elif block.prev_free_block.next_free_block is not block or block.next_free_block.prev_free_block is not block:
-        _swa_queue_block_diag("broken_link_free_queue_remove", block, "FreeKVCacheBlockQueue.remove", self)
+        _swa_queue_block_diag("broken_link_free_queue_remove", block, where, self)
     try:
         _orig_free_queue_remove(self, block)
     except Exception:
-        _check_free_queue(self, "FreeKVCacheBlockQueue.remove:exception", block=block)
+        _warn_debug_count_drift(self, f"{where}:exception")
+        _check_free_queue(self, f"{where}:exception", block=block)
+        _log_free_queue_operation_drift(
+            self, where, before, -1, 0, "exception", force=True
+        )
         raise
-    _debug_note_remove(self, block, "FreeKVCacheBlockQueue.remove")
+    _debug_note_remove(self, block, where)
+    _log_free_queue_operation_drift(self, where, before, -1, -1, "after")
 
 
 def _ascend_free_queue_prepend_n(self: FreeKVCacheBlockQueue, blocks: list[KVCacheBlock]) -> None:
-    filtered_blocks = _filter_queue_insert_blocks(blocks, "FreeKVCacheBlockQueue.prepend_n", self)
+    where = "FreeKVCacheBlockQueue.prepend_n"
+    before = _free_queue_count_snapshot(self)
+    _warn_debug_count_drift(self, f"{where}:before")
+    filtered_blocks = _filter_queue_insert_blocks(blocks, where, self)
     if not filtered_blocks:
+        _debug_note_insert(self, filtered_blocks, f"{where}:filtered_empty", prepend=True)
+        _log_free_queue_operation_drift(self, where, before, 0, 0, "filtered_empty")
         return
     try:
         _orig_free_queue_prepend_n(self, filtered_blocks)
     except Exception:
-        _check_free_queue(self, "FreeKVCacheBlockQueue.prepend_n:exception")
+        _warn_debug_count_drift(self, f"{where}:exception")
+        _check_free_queue(self, f"{where}:exception")
+        _log_free_queue_operation_drift(
+            self, where, before, len(filtered_blocks), 0, "exception", force=True
+        )
         raise
-    _debug_note_insert(self, filtered_blocks, "FreeKVCacheBlockQueue.prepend_n", prepend=True)
+    _debug_note_insert(self, filtered_blocks, where, prepend=True)
+    _log_free_queue_operation_drift(
+        self, where, before, len(filtered_blocks), len(filtered_blocks), "after"
+    )
 
 
 def _ascend_free_queue_append_n(self: FreeKVCacheBlockQueue, blocks: list[KVCacheBlock]) -> None:
-    filtered_blocks = _filter_queue_insert_blocks(blocks, "FreeKVCacheBlockQueue.append_n", self)
+    where = "FreeKVCacheBlockQueue.append_n"
+    before = _free_queue_count_snapshot(self)
+    _warn_debug_count_drift(self, f"{where}:before")
+    filtered_blocks = _filter_queue_insert_blocks(blocks, where, self)
     if not filtered_blocks:
+        _debug_note_insert(self, filtered_blocks, f"{where}:filtered_empty")
+        _log_free_queue_operation_drift(self, where, before, 0, 0, "filtered_empty")
         return
     try:
         _orig_free_queue_append_n(self, filtered_blocks)
     except Exception:
-        _check_free_queue(self, "FreeKVCacheBlockQueue.append_n:exception")
+        _warn_debug_count_drift(self, f"{where}:exception")
+        _check_free_queue(self, f"{where}:exception")
+        _log_free_queue_operation_drift(
+            self, where, before, len(filtered_blocks), 0, "exception", force=True
+        )
         raise
-    _debug_note_insert(self, filtered_blocks, "FreeKVCacheBlockQueue.append_n")
+    _debug_note_insert(self, filtered_blocks, where)
+    _log_free_queue_operation_drift(
+        self, where, before, len(filtered_blocks), len(filtered_blocks), "after"
+    )
 
 
 _orig_resolve_kv_cache_block_sizes = vllm.v1.core.kv_cache_utils.resolve_kv_cache_block_sizes

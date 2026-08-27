@@ -71,8 +71,19 @@ def test_popleft_n_exception_warning_includes_debug_expected_ids(
         queue.popleft_n(5)
 
     warning_text = "\n".join(messages)
+    assert "SWA_BLOCK_DIAG free_queue_debug_count_mismatch" in warning_text
+    assert "where=FreeKVCacheBlockQueue.popleft_n:before" in warning_text
+    assert "where=FreeKVCacheBlockQueue.popleft_n:exception" in warning_text
     assert "SWA_BLOCK_DIAG free_queue_mismatch" in warning_text
     assert "where=FreeKVCacheBlockQueue.popleft_n:exception" in warning_text
+    assert "SWA_BLOCK_DIAG free_queue_operation_drift" in warning_text
+    assert "phase=exception" in warning_text
+    assert "before_num_free_blocks=5" in warning_text
+    assert "after_num_free_blocks=0" in warning_text
+    assert "before_debug_free_blocks=3" in warning_text
+    assert "after_debug_free_blocks=3" in warning_text
+    assert "after_linked_free_blocks=1" in warning_text
+    assert "after_linked_free_issue=linked_list_reached_none" in warning_text
     assert "debug_block_ids=[1, 2, 3]" in warning_text
     assert "debug_expected_pop_block_ids=[1, 2, 3]" in warning_text
     assert "requested_n=5" in warning_text
@@ -116,6 +127,8 @@ def test_debug_count_drift_warning_logs_on_drift_change(
     assert "previous_free_block_count_drift=1" in warning_text
     assert "free_block_count_drift=-1" in warning_text
     assert "previous_free_block_count_drift=None" in warning_text
+    assert "debug_stack=[" in warning_text
+    assert "test_debug_count_drift_warning_logs_on_drift_change" in warning_text
 
 
 def test_valid_remove_does_not_warn_missing_remove(
@@ -193,7 +206,28 @@ def test_middle_duplicate_insert_is_guarded_before_queue_corruption(
     ]
 
 
-def test_get_new_blocks_rebuilds_free_queue_when_ref_cnt_audit_matches(
+def test_append_n_filtered_empty_still_checks_debug_count_drift(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    queue = FreeKVCacheBlockQueue([KVCacheBlock(i) for i in range(1, 4)])
+    middle_block = queue.fake_free_list_head.next_free_block.next_free_block
+    assert middle_block is not None
+    queue.num_free_blocks = 4
+
+    messages = _collect_warning_messages(monkeypatch)
+    queue.append_n([middle_block])
+
+    warning_text = "\n".join(messages)
+    assert "SWA_BLOCK_DIAG debug_duplicate_free_queue_insert" in warning_text
+    assert "SWA_BLOCK_DIAG free_queue_debug_count_mismatch" in warning_text
+    assert "where=FreeKVCacheBlockQueue.append_n:before" in warning_text
+    assert "free_block_count_drift=1" in warning_text
+    assert "SWA_BLOCK_DIAG free_queue_operation_drift" not in warning_text
+    assert "_ascend_free_queue_append_n" in warning_text
+    assert _free_block_ids(queue) == [1, 2, 3]
+
+
+def test_get_new_blocks_logs_and_raises_when_ref_cnt_audit_matches(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     pool = BlockPool(num_gpu_blocks=5, enable_caching=True, hash_block_size=16)
@@ -205,14 +239,54 @@ def test_get_new_blocks_rebuilds_free_queue_when_ref_cnt_audit_matches(
     pool.free_block_queue.num_free_blocks = 4
 
     messages = _collect_warning_messages(monkeypatch)
-    blocks = pool.get_new_blocks(2)
-
-    assert [block.block_id for block in blocks] == [1, 2]
-    assert _free_block_ids(pool.free_block_queue) == [3, 4]
+    with pytest.raises(AssertionError):
+        pool.get_new_blocks(2)
 
     warning_text = "\n".join(messages)
-    assert "SWA_BLOCK_DIAG free_queue_rebuilt" in warning_text
+    assert "SWA_BLOCK_DIAG free_queue_mismatch" in warning_text
     assert "where=BlockPool.get_new_blocks:exception" in warning_text
+    assert "SWA_BLOCK_DIAG free_queue_rebuilt" not in warning_text
+
+
+def test_get_new_blocks_logs_cannot_get_without_rebuild_when_free_count_is_too_low(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    pool = BlockPool(num_gpu_blocks=5, enable_caching=True, hash_block_size=16)
+    _attach_fake_kv_cache_manager(pool)
+
+    pool.free_block_queue.num_free_blocks = 1
+
+    messages = _collect_warning_messages(monkeypatch)
+    with pytest.raises(ValueError, match="Cannot get 2 free blocks"):
+        pool.get_new_blocks(2)
+
+    warning_text = "\n".join(messages)
+    assert "SWA_BLOCK_DIAG free_queue_cannot_get_blocks" in warning_text
+    assert "where=BlockPool.get_new_blocks:cannot_get" in warning_text
+    assert "requested_n=2" in warning_text
+    assert "num_free_blocks=1" in warning_text
+    assert "ref_cnt_free_blocks=4" in warning_text
+    assert "debug_stack=[" in warning_text
+    assert "SWA_BLOCK_DIAG free_queue_rebuilt" not in warning_text
+
+
+def test_get_new_blocks_does_not_rebuild_when_capacity_is_really_low(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    pool = BlockPool(num_gpu_blocks=5, enable_caching=True, hash_block_size=16)
+    live_blocks = pool.get_new_blocks(3)
+    _attach_fake_kv_cache_manager(pool, {"req": live_blocks})
+
+    messages = _collect_warning_messages(monkeypatch)
+    with pytest.raises(ValueError, match="Cannot get 2 free blocks"):
+        pool.get_new_blocks(2)
+
+    warning_text = "\n".join(messages)
+    assert "SWA_BLOCK_DIAG free_queue_cannot_get_blocks" in warning_text
+    assert "where=BlockPool.get_new_blocks:cannot_get" in warning_text
+    assert "requested_n=2" in warning_text
+    assert "ref_cnt_free_blocks=1" in warning_text
+    assert "SWA_BLOCK_DIAG free_queue_rebuilt" not in warning_text
 
 
 def test_get_new_blocks_does_not_rebuild_when_ref_cnt_audit_mismatches(
@@ -233,5 +307,4 @@ def test_get_new_blocks_does_not_rebuild_when_ref_cnt_audit_mismatches(
 
     warning_text = "\n".join(messages)
     assert "SWA_BLOCK_DIAG ref_cnt_audit_mismatch" in warning_text
-    assert "SWA_BLOCK_DIAG free_queue_rebuild_skipped" in warning_text
-    assert "reason=ref_cnt_audit_mismatch" in warning_text
+    assert "SWA_BLOCK_DIAG free_queue_rebuilt" not in warning_text
