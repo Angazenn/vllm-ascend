@@ -1,5 +1,6 @@
 import importlib
 import math
+from collections import defaultdict
 from typing import Any, cast
 
 import vllm.envs as envs
@@ -42,6 +43,17 @@ from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.config_data import
     infer_group_cache_families,
     normalize_block_ids_by_group,
 )
+
+
+_DIAG_LOG_FIRST_N = 5
+_DIAG_LOG_EVERY_N = 100
+_diag_log_counts: defaultdict[str, int] = defaultdict(int)
+
+
+def _should_log_diag(kind: str) -> bool:
+    _diag_log_counts[kind] += 1
+    count = _diag_log_counts[kind]
+    return count <= _DIAG_LOG_FIRST_N or count % _DIAG_LOG_EVERY_N == 0
 
 
 class KVPoolScheduler:
@@ -1051,13 +1063,33 @@ class KVPoolScheduler:
             self._delayed_free_req_ids.discard(request.request_id)
             return False, None
         tracker = self._request_trackers.get(request.request_id)
-        if tracker is None or tracker.num_saved_tokens <= 0:
+        if tracker is None:
+            if block_ids and _should_log_diag("ascend_store_request_finished_missing_tracker"):
+                logger.warning(
+                    "SWA_BLOCK_DIAG ascend_store_request_finished_missing_tracker "
+                    "where=KVPoolScheduler.request_finished req_id=%s block_count=%d",
+                    request.request_id,
+                    len(block_ids),
+                )
+            self._delayed_free_req_ids.discard(request.request_id)
+            return False, None
+        if tracker.num_saved_tokens <= 0:
             self._delayed_free_req_ids.discard(request.request_id)
             return False, None
         delay_free_blocks = len(block_ids) > 0
         if delay_free_blocks:
             self._delayed_free_req_ids.add(request.request_id)
-            logger.debug("Delaying free of %d blocks for request %s", len(block_ids), request.request_id)
+            logger.info("Delaying free of %d blocks for request %s", len(block_ids), request.request_id)
+            if _should_log_diag("ascend_store_delay_free_request"):
+                logger.warning(
+                    "SWA_BLOCK_DIAG ascend_store_delay_free_request "
+                    "where=KVPoolScheduler.request_finished req_id=%s block_count=%d "
+                    "num_saved_tokens=%d delayed_pending_count=%d",
+                    request.request_id,
+                    len(block_ids),
+                    tracker.num_saved_tokens,
+                    len(self._delayed_free_req_ids),
+                )
         else:
             self._delayed_free_req_ids.discard(request.request_id)
         return delay_free_blocks, None
@@ -1081,14 +1113,39 @@ class KVPoolScheduler:
             return False, None
         block_ids = cast(tuple[list[int], ...], self.get_sw_clipped_blocks(block_ids))
         valid_group_block_ids = [group_block_ids for group_block_ids in block_ids if group_block_ids]
+        if (
+            tracker is None
+            and valid_group_block_ids
+            and _should_log_diag("ascend_store_delay_free_without_tracker")
+        ):
+            logger.warning(
+                "SWA_BLOCK_DIAG ascend_store_delay_free_without_tracker "
+                "where=KVPoolScheduler.request_finished_all_groups req_id=%s "
+                "valid_group_count=%d group_block_counts=%s",
+                request.request_id,
+                len(valid_group_block_ids),
+                [len(group_block_ids) for group_block_ids in valid_group_block_ids],
+            )
         delay_free_blocks = bool(valid_group_block_ids)
         if delay_free_blocks:
             self._delayed_free_req_ids.add(request.request_id)
-            logger.debug(
+            logger.info(
                 "Delaying free of %d KV cache groups for request %s",
                 len(valid_group_block_ids),
                 request.request_id,
             )
+            if _should_log_diag("ascend_store_delay_free_request"):
+                logger.warning(
+                    "SWA_BLOCK_DIAG ascend_store_delay_free_request "
+                    "where=KVPoolScheduler.request_finished_all_groups req_id=%s "
+                    "valid_group_count=%d group_block_counts=%s num_saved_tokens=%s "
+                    "delayed_pending_count=%d",
+                    request.request_id,
+                    len(valid_group_block_ids),
+                    [len(group_block_ids) for group_block_ids in valid_group_block_ids],
+                    None if tracker is None else tracker.num_saved_tokens,
+                    len(self._delayed_free_req_ids),
+                )
         else:
             self._delayed_free_req_ids.discard(request.request_id)
         return delay_free_blocks, None
@@ -1098,6 +1155,16 @@ class KVPoolScheduler:
 
     def update_finished_sending(self, finished_sending: set[str] | None) -> None:
         if finished_sending:
+            unexpected_req_ids = finished_sending - self._delayed_free_req_ids
+            if unexpected_req_ids and _should_log_diag("ascend_store_unexpected_finished_sending"):
+                logger.warning(
+                    "SWA_BLOCK_DIAG ascend_store_unexpected_finished_sending "
+                    "where=KVPoolScheduler.update_finished_sending "
+                    "unexpected_count=%d unexpected_sample=%s delayed_pending_count=%d",
+                    len(unexpected_req_ids),
+                    list(unexpected_req_ids)[:8],
+                    len(self._delayed_free_req_ids),
+                )
             self._delayed_free_req_ids.difference_update(finished_sending)
 
     def update_finished_recving(self, finished_recving: set[str] | None) -> None:

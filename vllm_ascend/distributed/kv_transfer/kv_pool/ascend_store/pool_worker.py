@@ -3,6 +3,7 @@ from __future__ import annotations
 import importlib
 import math
 import threading
+from collections import defaultdict
 from collections.abc import Generator
 from typing import Any
 
@@ -75,6 +76,15 @@ from vllm_ascend.memcache_comm_fence import (
 # read lease before batch_copy(G2L); the lease must cover the asynchronous
 # multi-layer load time.
 LAYERWISE_READ_LEASE_TTL_MS = 5 * 60 * 1000
+_DIAG_LOG_FIRST_N = 5
+_DIAG_LOG_EVERY_N = 100
+_diag_log_counts: defaultdict[str, int] = defaultdict(int)
+
+
+def _should_log_diag(kind: str) -> bool:
+    _diag_log_counts[kind] += 1
+    count = _diag_log_counts[kind]
+    return count <= _DIAG_LOG_FIRST_N or count % _DIAG_LOG_EVERY_N == 0
 
 
 class KVPoolWorker:
@@ -1599,6 +1609,16 @@ class KVPoolWorker:
                 done_sending = set()
             else:
                 stale_finished_req_ids = finished_req_ids - meta.delayed_free_req_ids
+                if stale_finished_req_ids and _should_log_diag("ascend_store_worker_stale_finished_req_ids"):
+                    logger.warning(
+                        "SWA_BLOCK_DIAG ascend_store_worker_stale_finished_req_ids "
+                        "where=KVPoolWorker.get_finished stale_count=%d stale_sample=%s "
+                        "finished_count=%d delayed_free_count=%d",
+                        len(stale_finished_req_ids),
+                        list(stale_finished_req_ids)[:8],
+                        len(finished_req_ids),
+                        len(meta.delayed_free_req_ids),
+                    )
                 self.kv_send_thread.discard_finished_requests(stale_finished_req_ids)
                 done_sending = self.kv_send_thread.get_and_clear_finished_requests(meta.delayed_free_req_ids)
         else:

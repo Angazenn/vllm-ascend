@@ -187,10 +187,23 @@ class KVCacheTaskTracker:
         while self.delayed_free_requests:
             request_id = next(iter(self.delayed_free_requests))
             delay_start_time = self.delayed_free_requests[request_id]
-            if current_time - delay_start_time > envs.VLLM_MOONCAKE_ABORT_REQUEST_TIMEOUT:
+            age_s = current_time - delay_start_time
+            if age_s > envs.VLLM_MOONCAKE_ABORT_REQUEST_TIMEOUT:
+                delayed_pending_count = len(self.delayed_free_requests)
+                reqs_to_process_count = len(self.reqs_to_process)
                 self.delayed_free_requests.popitem(last=False)
                 self.reqs_to_process.discard(request_id)
                 expired_requests.add(request_id)
+                logger.warning(
+                    "SWA_BLOCK_DIAG mooncake_hybrid_force_free_delayed_request "
+                    "req_id=%s age_s=%.3f timeout_s=%s "
+                    "delayed_pending_count=%d reqs_to_process_count=%d",
+                    request_id,
+                    age_s,
+                    envs.VLLM_MOONCAKE_ABORT_REQUEST_TIMEOUT,
+                    delayed_pending_count,
+                    reqs_to_process_count,
+                )
                 logger.info(
                     "Force freed expired request: %s. "
                     "Reason: Request exceeded timeout threshold (%s seconds). "
