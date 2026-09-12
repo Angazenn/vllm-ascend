@@ -2,7 +2,9 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """NPU checks for serving metadata, cache ownership, and shared miss buffers."""
 
+from dataclasses import replace
 from types import SimpleNamespace
+from unittest.mock import Mock
 
 import pytest
 import torch
@@ -83,6 +85,102 @@ def test_layer_ownership_request_reuse_and_shared_miss_buffers():
     runtime.invalidate()
     _, invalidated, _ = runtime.prepare_lim("owner-a", batch, 16384, metadata.seq_lens.device)
     assert invalidated.cpu().tolist() == [-2, -2]
+
+
+def test_eager_buffers_preserve_queued_results_without_device_tensor_construction(monkeypatch):
+    manager, metadata = fixture()
+    batch = make_mtp_batch(metadata, manager)
+    runtime = GeneralizedMtpRuntime(manager)
+    _, states, outputs = runtime.prepare_lim("owner", batch, 16384, metadata.seq_lens.device)
+    pointers = [states.data_ptr(), *(tensor.data_ptr() for tensor in outputs)]
+    torch.npu.synchronize()
+    snapshots = []
+    expected = []
+
+    def unexpected_sync(*args, **kwargs):
+        raise AssertionError("eager LIM preparation must not construct a device tensor or synchronize")
+
+    with monkeypatch.context() as patch:
+        patch.setattr(torch, "tensor", unexpected_sync)
+        patch.setattr(torch.npu, "synchronize", unexpected_sync)
+        for iteration in range(24):
+            count = 1 if iteration % 3 == 1 else 2
+            current = replace(
+                batch,
+                pool_rows=batch.pool_rows[:count],
+                prefix_lengths=batch.prefix_lengths[:count],
+                cache_sizes=batch.cache_sizes[:count],
+                num_tokens=1 if count == 1 else 5,
+            )
+            manager.nano_mtp_slot_generations[2] += 1
+            _, states, outputs = runtime.prepare_lim("owner", current, 16384, metadata.seq_lens.device)
+            assert [states.data_ptr(), *(tensor.data_ptr() for tensor in outputs)] == pointers
+            assert runtime.copy_metadata(current) is outputs
+            assert all(tensor.is_contiguous() for tensor in outputs)
+            assert outputs[3].shape == (count, 32768)
+            assert outputs[0].shape == (current.num_tokens, 1, 2048)
+            # Queue consumers before the next prepare reuses the same stream's
+            # device scratch. All snapshots must retain their own values.
+            outputs[3].fill_(iteration)
+            snapshots.append((states.clone(), outputs[3][:, :2].clone()))
+            expected.append(([-2] + [-1] * (count - 1), [[iteration] * 2] * count))
+    torch.npu.synchronize()
+    for (states, misses), (expected_states, expected_misses) in zip(snapshots, expected):
+        assert states.cpu().tolist() == expected_states
+        assert misses.cpu().tolist() == expected_misses
+    runtime.invalidate()
+    with pytest.raises(RuntimeError, match="before its indexer owner"):
+        runtime.copy_metadata(batch)
+
+
+def test_eager_pending_upload_uses_another_pinned_buffer_instead_of_waiting():
+    manager, metadata = fixture()
+    batch = make_mtp_batch(metadata, manager)
+    runtime = GeneralizedMtpRuntime(manager)
+    runtime.prepare_lim("owner", batch, 16384, metadata.seq_lens.device)
+    torch.npu.synchronize()
+    buffers = next(iter(runtime.eager_buffers.values()))
+    staging, values, event = buffers.uploads[0]
+    assert staging.is_pinned()
+    old_values = values.copy()
+    pending = Mock(wraps=event)
+    pending.query.return_value = False
+    pending.synchronize.side_effect = AssertionError("must not wait for a staging slot")
+    buffers.uploads[0] = (staging, values, pending)
+    _, states, _ = runtime.prepare_lim("owner", batch, 16384, metadata.seq_lens.device)
+    snapshot = states.clone()
+    assert len(buffers.uploads) == 2
+    assert buffers.uploads[-1][0].data_ptr() != staging.data_ptr()
+    assert (values == old_values).all()
+    pending.synchronize.assert_not_called()
+    # The real first event was completed above: permit reuse and verify that
+    # the completed slot, rather than an in-flight slot, is recycled.
+    pending.query.return_value = True
+    manager.nano_mtp_slot_generations[2] += 1
+    _, reused, _ = runtime.prepare_lim("owner", batch, 16384, metadata.seq_lens.device)
+    assert buffers.uploads[-1][0].data_ptr() == staging.data_ptr()
+    torch.npu.synchronize()
+    assert snapshot.cpu().tolist() == [-1, -1]
+    assert reused.cpu().tolist() == [-2, -1]
+
+
+def test_eager_scratch_is_private_to_each_execution_stream():
+    manager, metadata = fixture()
+    batch = make_mtp_batch(metadata, manager)
+    runtime = GeneralizedMtpRuntime(manager)
+    stream = torch.npu.current_stream(metadata.seq_lens.device)
+    other = torch.npu.Stream(device=metadata.seq_lens.device)
+    _, first_states, first_outputs = runtime.prepare_lim("first", batch, 16384, metadata.seq_lens.device)
+    first_outputs[3].fill_(17)
+    other.wait_stream(stream)
+    with torch.npu.stream(other):
+        _, other_states, other_outputs = runtime.prepare_lim("second", batch, 16384, metadata.seq_lens.device)
+        other_outputs[3].fill_(23)
+    assert first_states.data_ptr() != other_states.data_ptr()
+    assert all(left.data_ptr() != right.data_ptr() for left, right in zip(first_outputs, other_outputs))
+    torch.npu.synchronize()
+    assert first_outputs[3].eq(17).all().item()
+    assert other_outputs[3].eq(23).all().item()
 
 
 def test_batch_metadata_survives_builder_buffer_reuse():

@@ -6,6 +6,7 @@ Registered host KV supplies sparse misses and bounded circular HBM tails.
 Colocated execution may additionally retain a full device cache for prefill.
 """
 
+from collections import deque
 from collections.abc import Sequence
 from dataclasses import dataclass
 
@@ -170,6 +171,51 @@ def make_mtp_batch(
     )
 
 
+class EagerMtpBuffers:
+    """Stream-owned LIM scratch and pinned uploads for sequential eager calls.
+
+    All LIM and shared copy-SFA consumers must be enqueued before the next
+    prepare on this stream, matching GeneralizedMtpRuntime's existing output
+    lifetime. Stream order protects device scratch; upload events separately
+    protect pinned memory from being overwritten by the CPU.
+    """
+
+    def __init__(self, requests, tokens, device):
+        self.states = torch.empty(requests, dtype=torch.int32, device=device)
+        self.outputs = tuple(
+            torch.empty(shape, dtype=torch.int32, device=device)
+            for shape in (
+                (tokens, 1, TOPK),
+                (tokens, 1, TOPK),
+                (tokens,),
+                (requests, LIM_MISS_CAPACITY),
+                (requests, LIM_MISS_CAPACITY),
+                (requests,),
+            )
+        )
+        self.uploads = deque()
+
+    def upload_states(self, states, stream):
+        if self.uploads and self.uploads[0][2].query():
+            staging, values, done = self.uploads.popleft()
+        else:
+            # Eager execution can enqueue several drafts while earlier work
+            # is still running. Grow to the number of in-flight uploads rather
+            # than synchronizing the host when a fixed ring would wrap.
+            staging = torch.empty(self.states.shape, dtype=torch.int32, device="cpu", pin_memory=True)
+            values = staging.numpy()
+            done = torch.npu.Event()
+        values.fill(REQUEST_STATE_NON_OFFLOAD)
+        values[: len(states)] = states
+        self.states.copy_(staging, non_blocking=True)
+        done.record(stream)
+        self.uploads.append((staging, values, done))
+        return self.states[: len(states)]
+
+    def output_views(self, requests, tokens):
+        return tuple(tensor[: tokens if index < 3 else requests] for index, tensor in enumerate(self.outputs))
+
+
 class GeneralizedMtpRuntime:
     def __init__(self, manager):
         self.manager = manager
@@ -177,6 +223,7 @@ class GeneralizedMtpRuntime:
         self.residents = {}
         self.outputs = None
         self.output_batch = None
+        self.eager_buffers = {}
 
     def invalidate(self):
         # A prefill or mixed step may rewrite cached tokens or recycle rows.
@@ -186,6 +233,8 @@ class GeneralizedMtpRuntime:
     def prepare_lim(self, layer_name, batch, source_capacity, device):
         if batch.graph_buffers is not None:
             return batch.graph_buffers.lim_inputs(layer_name)
+        if torch.npu.is_current_stream_capturing():
+            raise RuntimeError("Captured LIM calls require prepared graph buffers")
         manager = self.manager
         mapping = self.maps.get(layer_name)
         if mapping is None:
@@ -208,20 +257,22 @@ class GeneralizedMtpRuntime:
             states.append(REQUEST_STATE_STEADY if ready else REQUEST_STATE_FIRST_OFFLOAD)
             resident[pool] = (owner, cache, prefix)
         count, tokens = len(batch.pool_rows), batch.num_tokens
-
-        def empty(shape):
-            return torch.empty(shape, dtype=torch.int32, device=device)
-
-        self.outputs = (
-            empty((tokens, 1, TOPK)),
-            empty((tokens, 1, TOPK)),
-            empty((tokens,)),
-            empty((count, LIM_MISS_CAPACITY)),
-            empty((count, LIM_MISS_CAPACITY)),
-            empty((count,)),
-        )
+        stream = torch.npu.current_stream(device)
+        key = (stream.device, stream.npu_stream)
+        buffers = self.eager_buffers.get(key)
+        if buffers is None:
+            buffers = EagerMtpBuffers(
+                max(count, manager.max_num_reqs),
+                max(tokens, manager.max_num_reqs * 7, getattr(manager, "max_num_topk_rows", 0)),
+                device,
+            )
+            self.eager_buffers[key] = buffers
+        if buffers.states.numel() < count or buffers.outputs[0].shape[0] < tokens:
+            raise ValueError("Eager LIM batch exceeds its configured request/query capacity")
+        state_tensor = buffers.upload_states(states, stream)
+        self.outputs = buffers.output_views(count, tokens)
         self.output_batch = batch
-        return mapping, torch.tensor(states, dtype=torch.int32, device=device), self.outputs
+        return mapping, state_tensor, self.outputs
 
     def require_outputs(self, batch):
         if batch.graph_buffers is not None:
