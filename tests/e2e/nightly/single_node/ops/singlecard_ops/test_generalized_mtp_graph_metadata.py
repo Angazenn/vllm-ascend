@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Persistent metadata and scratch ownership across NPU graph replays."""
 
+from dataclasses import replace
 from types import SimpleNamespace
 from unittest.mock import Mock
 
@@ -62,12 +63,12 @@ def test_graph_padding_owns_private_rows_and_fixed_tail_storage():
     torch.testing.assert_close(buffers.batch.tail_destinations[valid], batch.tail_destinations)
     scratch_destinations = buffers.batch.tail_destinations[-256:]
     assert int(scratch_destinations.min().cpu()) >= manager.max_num_reqs * (8192 + 256)
-    buffers.prepare_layer("owner")
+    buffers.prepare_layers(("owner",))
     assert buffers.layers["owner"][1].cpu().tolist() == [-2, -2, -3]
-    buffers.prepare_layer("owner")
+    buffers.prepare_layers(("owner",))
     assert buffers.layers["owner"][1].cpu().tolist() == [-1, -1, -3]
     manager.nano_mtp_slot_generations[2] += 1
-    buffers.prepare_layer("owner")
+    buffers.prepare_layers(("owner",))
     assert buffers.layers["owner"][1].cpu().tolist() == [-2, -1, -3]
     assert set(buffers.runtime.residents["owner"]) == {0, 2}
 
@@ -75,22 +76,22 @@ def test_graph_padding_owns_private_rows_and_fixed_tail_storage():
 def test_graph_padding_becomes_a_new_live_request_after_slot_reuse():
     manager, metadata, buffers = fixture()
     buffers.update(make_mtp_batch(metadata, manager))
-    buffers.prepare_layer("owner")
+    buffers.prepare_layers(("owner",))
     metadata.num_decodes = 1
     buffers.update(make_mtp_batch(metadata, manager))
-    buffers.prepare_layer("owner")
+    buffers.prepare_layers(("owner",))
     assert buffers.layers["owner"][1].cpu().tolist() == [-1, -3, -3]
     assert buffers.batch.pool_rows == [2, 4, 5]
     manager.topk_buffer_slot_manager.req2slot = {"a": 2, "new-b": 0}
     manager.nano_mtp_slot_generations[0] += 1
     metadata.num_decodes = 2
     buffers.update(make_mtp_batch(metadata, manager))
-    buffers.prepare_layer("owner")
+    buffers.prepare_layers(("owner",))
     assert buffers.layers["owner"][1].cpu().tolist() == [-1, -2, -3]
     # An existing request also resets if its aligned prefix shrinks.
     metadata.seq_lens[0] -= manager.block_size
     buffers.update(make_mtp_batch(metadata, manager))
-    buffers.prepare_layer("owner")
+    buffers.prepare_layers(("owner",))
     assert buffers.layers["owner"][1].cpu().tolist() == [-2, -1, -3]
 
 
@@ -98,7 +99,7 @@ def test_graph_capture_uses_only_private_nonoffload_rows():
     manager, metadata, buffers = fixture()
     batch = make_mtp_batch(metadata, manager)
     buffers.update(batch, is_capture=True)
-    buffers.prepare_layer("owner")
+    buffers.prepare_layers(("owner",))
     assert buffers.batch.pool_rows == [3, 4, 5]
     assert buffers.layers["owner"][1].cpu().tolist() == [-3, -3, -3]
     assert not buffers.active_mask.any().item()
@@ -106,7 +107,7 @@ def test_graph_capture_uses_only_private_nonoffload_rows():
     assert buffers.runtime.residents["owner"] == {}
     # Capture must not mark live rows warm before the first actual decode.
     buffers.update(batch)
-    buffers.prepare_layer("owner")
+    buffers.prepare_layers(("owner",))
     assert buffers.layers["owner"][1].cpu().tolist() == [-2, -2, -3]
 
 
@@ -114,7 +115,7 @@ def test_runtime_dummy_keeps_residency_and_graph_checks_on_cpu(monkeypatch):
     manager, metadata, buffers = fixture()
     real = make_mtp_batch(metadata, manager)
     buffers.update(real)
-    buffers.prepare_layer("owner")
+    buffers.prepare_layers(("owner",))
     residents = dict(buffers.runtime.residents["owner"])
     dummy_metadata = SimpleNamespace(
         num_input_tokens=12, seq_lens=metadata.seq_lens, block_table=metadata.block_table
@@ -131,7 +132,7 @@ def test_runtime_dummy_keeps_residency_and_graph_checks_on_cpu(monkeypatch):
         assert eligible_graph_steps([{"owner": SimpleNamespace(mtp_batch=dummy)}])
         assert buffers.accepts(dummy)
         buffers.update(dummy, is_dummy=True)
-        buffers.prepare_layer("owner")
+        buffers.prepare_layers(("owner",))
     assert buffers.batch.pool_rows == [3, 4, 5]
     assert buffers.active_requests == 0
     assert not buffers.active_mask.any().item()
@@ -139,7 +140,7 @@ def test_runtime_dummy_keeps_residency_and_graph_checks_on_cpu(monkeypatch):
     assert buffers.layers["owner"][1].cpu().tolist() == [-3, -3, -3]
     assert buffers.runtime.residents["owner"] == residents
     buffers.update(real)
-    buffers.prepare_layer("owner")
+    buffers.prepare_layers(("owner",))
     assert buffers.layers["owner"][1].cpu().tolist() == [-1, -1, -3]
 
 
@@ -397,3 +398,135 @@ def test_graph_owns_separate_indexer_mappings_and_refreshes_them():
     assert snapshots[0][2].count_nonzero().item() == 0
     torch.testing.assert_close(snapshots[1], indexer.slot_mapping)
     torch.testing.assert_close(graphs.steps[0]["main"].block_table[:2], batch.source_block_table)
+
+
+def test_batched_states_preserve_per_layer_residency_and_captured_addresses(monkeypatch):
+    manager, metadata, buffers = fixture()
+    batch = make_mtp_batch(metadata, manager)
+    names = ("layer_a", "layer_b")
+    buffers.update(batch, is_capture=True)
+    buffers.prepare_layers(names)
+    states = [buffers.layers[name][1] for name in names]
+    pointers = [state.data_ptr() for state in states]
+    assert all(pointer % 32 == 0 for pointer in pointers)
+    assert all(state.is_contiguous() and state.shape == (3,) for state in states)
+    assert len({state.untyped_storage().data_ptr() for state in states}) == 1
+    snapshots = [torch.empty_like(state) for state in states]
+    torch.npu.synchronize()
+    graph = torch.npu.NPUGraph()
+    with torch.npu.graph(graph):
+        for snapshot, state in zip(snapshots, states):
+            snapshot.copy_(state)
+    torch.npu.synchronize()
+
+    original_copy = torch.Tensor.copy_
+    uploads = []
+
+    def count_state_uploads(destination, source, *args, **kwargs):
+        if destination is buffers.request_states:
+            assert source.is_pinned() and kwargs.get("non_blocking")
+            uploads.append(source.data_ptr())
+        return original_copy(destination, source, *args, **kwargs)
+
+    monkeypatch.setattr(torch.Tensor, "copy_", count_state_uploads)
+
+    def replay(expected, *, is_dummy=False):
+        before = len(uploads)
+        buffers.update(batch, is_dummy=is_dummy)
+        buffers.prepare_layers(names)
+        assert len(uploads) == before + 1
+        graph.replay()
+        torch.npu.synchronize()
+        assert [state.data_ptr() for state in states] == pointers
+        assert [snapshot.cpu().tolist() for snapshot in snapshots] == expected
+
+    replay([[-2, -2, -3], [-2, -2, -3]])
+    # One layer has lost residency; another pool has a new generation.
+    del buffers.runtime.residents["layer_b"][2]
+    manager.nano_mtp_slot_generations[0] += 1
+    replay([[-1, -2, -3], [-2, -2, -3]])
+    residents = {name: dict(value) for name, value in buffers.runtime.residents.items()}
+    replay([[-3, -3, -3], [-3, -3, -3]], is_dummy=True)
+    assert buffers.runtime.residents == residents
+    replay([[-1, -1, -3], [-1, -1, -3]])
+    assert len(set(uploads)) == 2
+    with pytest.raises(ValueError, match="layer order changed"):
+        buffers.prepare_layers(tuple(reversed(names)))
+
+
+def test_batched_pinned_states_are_not_overwritten_while_upload_is_pending():
+    manager, metadata, buffers = fixture()
+    buffers.update(make_mtp_batch(metadata, manager), is_capture=True)
+    names = ("layer_a", "layer_b")
+    buffers.prepare_layers(names)
+    # Force the pending-event branch while retaining its real NPU wait.
+    pending = Mock(wraps=buffers.request_state_uploads[0])
+    pending.query.return_value = False
+    buffers.request_state_uploads[0] = pending
+    snapshots = []
+    expected = []
+    for iteration in range(24):
+        count = (2, 0, 1)[iteration % 3]
+        buffers.active_requests = count
+        # Use real pool identities without an intervening synchronous update.
+        buffers.batch.pool_rows[:2] = [2, 0]
+        manager.nano_mtp_slot_generations[2] += 1
+        manager.nano_mtp_slot_generations[0] += 1
+        buffers.prepare_layers(names)
+        snapshots.append([buffers.layers[name][1].clone() for name in names])
+        expected.append([[-2] * count + [-3] * (3 - count)] * len(names))
+    torch.npu.synchronize()
+    assert pending.synchronize.call_count > 0
+    assert [[tensor.cpu().tolist() for tensor in snapshot] for snapshot in snapshots] == expected
+
+
+def test_shared_indexer_uploads_are_deduplicated_and_alias_splits_rejected(monkeypatch):
+    import vllm_ascend.distributed.kv_transfer.sparse_kv_offload.generalized_mtp_graph as graph_module
+
+    manager, source, buffers = fixture()
+    indexer = AscendSFAIndexerMetadata(
+        source.block_table, torch.arange(12, dtype=torch.int32, device=source.seq_lens.device)
+    )
+    independent = replace(indexer)
+    flags = SimpleNamespace(mtp_graph_dummy=False)
+    step = {"a": indexer, "b": indexer, "independent": independent, "flags": flags}
+    graphs = MtpGraphMetadataSet(buffers.runtime, [step])
+    owned = graphs.steps[0]["a"]
+    assert graphs.steps[0]["b"] is owned
+    assert graphs.steps[0]["independent"] is not owned
+    pointers = (owned.block_table.data_ptr(), owned.slot_mapping.data_ptr())
+    original_update = graph_module.update_graph_metadata
+    calls = []
+
+    def count_updates(destination, incoming, **kwargs):
+        calls.append(destination)
+        return original_update(destination, incoming, **kwargs)
+
+    monkeypatch.setattr(graph_module, "update_graph_metadata", count_updates)
+    graphs.update([step])
+    assert len(calls) == 2
+    snapshots = [torch.empty_like(owned.block_table), torch.empty_like(owned.slot_mapping)]
+    torch.npu.synchronize()
+    graph = torch.npu.NPUGraph()
+    with torch.npu.graph(graph):
+        snapshots[0].copy_(owned.block_table)
+        snapshots[1].copy_(owned.slot_mapping)
+    torch.npu.synchronize()
+    for dummy in (False, True, False):
+        incoming = replace(indexer, block_table=source.block_table[:1] + 17, slot_mapping=indexer.slot_mapping[:4] + 9)
+        step.update(a=incoming, b=incoming)
+        flags.mtp_graph_dummy = dummy
+        calls.clear()
+        graphs.update([step])
+        assert len(calls) == 2
+        graph.replay()
+        torch.npu.synchronize()
+        assert pointers == (owned.block_table.data_ptr(), owned.slot_mapping.data_ptr())
+        torch.testing.assert_close(snapshots[0][:1], incoming.block_table)
+        assert snapshots[0][1:].count_nonzero().item() == 0
+        assert snapshots[1][4:].cpu().tolist() == [-1] * 8
+        assert snapshots[1][:4].cpu().tolist() == ([-1] * 4 if dummy else [9, 10, 11, 12])
+    split = {**step, "b": replace(step["a"])}
+    assert not graphs.accepts([split])
+    with pytest.raises(ValueError, match="captured request/query capacity"):
+        graphs.update([split])

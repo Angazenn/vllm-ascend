@@ -27,6 +27,11 @@ from .generalized_mtp import (
 from .nano_cache import KV_COMPONENTS, TAIL_BLOCKS, CopyDescriptors
 
 
+# Keep each layer's int32 state vector aligned to an Ascend data block.
+REQUEST_STATE_ALIGNMENT = 8
+REQUEST_STATE_STAGING_BUFFERS = 2
+
+
 class MtpGraphBuffers:
     """One fixed request/query capacity, owned by one captured draft step.
 
@@ -52,6 +57,12 @@ class MtpGraphBuffers:
             raise ValueError("MTP graph padding requires a private hot-cache row per request")
         self.layers = {}
         self.tail_copies = {}
+        self.layer_names = ()
+        self.request_states = None
+        self.request_states_cpu = []
+        self.request_states_numpy = []
+        self.request_state_uploads = [None] * REQUEST_STATE_STAGING_BUFFERS
+        self.next_state_buffer = 0
 
         def zeros(shape, dtype=torch.int32):
             return torch.zeros(shape, dtype=dtype, device=device)
@@ -153,48 +164,83 @@ class MtpGraphBuffers:
         graph.tail_destinations.copy_(torch.tensor(destinations, dtype=torch.int64, device=self.device))
         self.tail_valid.copy_(valid.flatten())
 
-    def prepare_layer(self, layer_name):
-        """Update lifecycle state before replay; allocate only before capture."""
+    def _allocate_layers(self, layer_names):
+        """Allocate aligned state views once, before any layer is captured."""
         runtime, manager = self.runtime, self.manager
-        mapping = runtime.maps.get(layer_name)
-        if mapping is None:
-            mapping = torch.full(
-                (manager.max_num_topk_rows, self.source_capacity),
-                INVALID_SLOT,
-                dtype=torch.int32,
-                device=self.device,
-            )
-            runtime.maps[layer_name] = mapping
-        if mapping.shape != (manager.max_num_topk_rows, self.source_capacity):
-            raise ValueError("MTP graph map capacity changed after allocation")
-        if layer_name not in self.layers:
-            self.layers[layer_name] = (mapping, torch.empty(self.requests, dtype=torch.int32, device=self.device))
+        stride = (
+            (self.requests + REQUEST_STATE_ALIGNMENT - 1) // REQUEST_STATE_ALIGNMENT * REQUEST_STATE_ALIGNMENT
+        )
+        shape = (len(layer_names), stride)
+        self.request_states = torch.empty(shape, dtype=torch.int32, device=self.device)
+        self.request_states_cpu = [
+            torch.empty(shape, dtype=torch.int32, device="cpu", pin_memory=True)
+            for _ in range(REQUEST_STATE_STAGING_BUFFERS)
+        ]
+        self.request_states_numpy = [states.numpy() for states in self.request_states_cpu]
+        for index, layer_name in enumerate(layer_names):
+            mapping = runtime.maps.get(layer_name)
+            if mapping is None:
+                mapping = torch.full(
+                    (manager.max_num_topk_rows, self.source_capacity),
+                    INVALID_SLOT,
+                    dtype=torch.int32,
+                    device=self.device,
+                )
+                runtime.maps[layer_name] = mapping
+            if mapping.shape != (manager.max_num_topk_rows, self.source_capacity):
+                raise ValueError("MTP graph map capacity changed after allocation")
+            self.layers[layer_name] = (mapping, self.request_states[index, : self.requests])
             self.tail_copies[layer_name] = CopyDescriptors(
                 self.requests * TAIL_BLOCKS * KV_COMPONENTS,
                 self.device,
             )
-        owners = {slot: req for req, slot in manager.topk_buffer_slot_manager.req2slot.items()}
-        resident = runtime.residents.setdefault(layer_name, {})
-        states = []
-        for row, (pool, prefix, cache) in enumerate(
-            zip(
-                self.batch.pool_rows,
-                self.batch.prefix_lengths,
-                self.batch.cache_sizes,
+        self.layer_names = layer_names
+
+    def prepare_layers(self, layer_names, *, owners=None):
+        """Evaluate per-layer residency, then upload all states in one copy."""
+        if torch.npu.is_current_stream_capturing():
+            raise RuntimeError("MTP request states must be prepared before capture/replay")
+        layer_names = tuple(layer_names)
+        if self.request_states is None:
+            self._allocate_layers(layer_names)
+        elif layer_names != self.layer_names:
+            raise ValueError("MTP graph layer order changed after allocation")
+
+        index = self.next_state_buffer
+        upload = self.request_state_uploads[index]
+        # A stream dependency does not protect pinned memory from CPU writes.
+        # Wait only if this staging buffer's previous H2D is still reading it.
+        if upload is not None and not upload.query():
+            upload.synchronize()
+        states = self.request_states_numpy[index]
+        # Padding is not a new request: -3 emits zero misses and uses private
+        # HBM. Reset every row, including active-to-dummy transitions.
+        states.fill(REQUEST_STATE_NON_OFFLOAD)
+        manager = self.manager
+        if owners is None:
+            owners = {slot: req for req, slot in manager.topk_buffer_slot_manager.req2slot.items()}
+        requests = [
+            (pool, (owners[pool], manager.nano_mtp_slot_generations.get(pool, 0)), cache, prefix)
+            for pool, prefix, cache in zip(
+                self.batch.pool_rows[: self.active_requests],
+                self.batch.prefix_lengths[: self.active_requests],
+                self.batch.cache_sizes[: self.active_requests],
             )
-        ):
-            if row >= self.active_requests:
-                # Padding is not a new request: -2 would emit C misses on
-                # every replay and force batch-wide first-fill H2D. -3 emits
-                # zero request and per-query misses, using private HBM only.
-                states.append(REQUEST_STATE_NON_OFFLOAD)
-                continue
-            owner = (owners[pool], manager.nano_mtp_slot_generations.get(pool, 0))
-            previous = resident.get(pool)
-            ready = previous is not None and previous[:2] == (owner, cache) and previous[2] <= prefix
-            states.append(REQUEST_STATE_STEADY if ready else REQUEST_STATE_FIRST_OFFLOAD)
-            resident[pool] = (owner, cache, prefix)
-        self.layers[layer_name][1].copy_(torch.tensor(states, dtype=torch.int32, device=self.device))
+        ]
+        for layer_index, layer_name in enumerate(layer_names):
+            resident = self.runtime.residents.setdefault(layer_name, {})
+            for row, (pool, owner, cache, prefix) in enumerate(requests):
+                previous = resident.get(pool)
+                ready = previous is not None and previous[:2] == (owner, cache) and previous[2] <= prefix
+                states[layer_index, row] = REQUEST_STATE_STEADY if ready else REQUEST_STATE_FIRST_OFFLOAD
+                resident[pool] = (owner, cache, prefix)
+
+        self.request_states.copy_(self.request_states_cpu[index], non_blocking=True)
+        if upload is None:
+            upload = torch.npu.Event()
+            self.request_state_uploads[index] = upload
+        upload.record(torch.npu.current_stream(self.device))
+        self.next_state_buffer = (index + 1) % REQUEST_STATE_STAGING_BUFFERS
 
     def lim_inputs(self, layer_name):
         if layer_name not in self.layers:
@@ -268,7 +314,8 @@ class MtpGraphMetadataSet:
             captured = {}
             seen = {}
             groups = []
-            indexers = {}
+            indexers = []
+            seen_indexers = {}
             for layer_name, metadata in step.items():
                 # A model can mix sparse SFA and ordinary attention layers in
                 # one metadata dictionary. Only SFA offload metadata owns an
@@ -276,16 +323,19 @@ class MtpGraphMetadataSet:
                 # metadata instead of rejecting the entire graph.
                 if not hasattr(metadata, "mtp_batch"):
                     if isinstance(metadata, AscendSFAIndexerMetadata):
-                        owned_indexer = clone_graph_metadata(metadata)
-                        # Later replays can contain more requests than the
-                        # first live batch. Keep all indexer table rows stable.
-                        owned_indexer.block_table = metadata.block_table.new_zeros(
-                            (runtime.manager.max_num_reqs, metadata.block_table.shape[1]),
-                        )
-                        rows = min(metadata.block_table.shape[0], runtime.manager.max_num_reqs)
-                        owned_indexer.block_table[:rows].copy_(metadata.block_table[:rows])
-                        indexers[layer_name] = owned_indexer
-                        captured[layer_name] = indexers[layer_name]
+                        if id(metadata) not in seen_indexers:
+                            owned_indexer = clone_graph_metadata(metadata)
+                            # Keep table addresses stable when the batch grows.
+                            owned_indexer.block_table = metadata.block_table.new_zeros(
+                                (runtime.manager.max_num_reqs, metadata.block_table.shape[1]),
+                            )
+                            rows = min(metadata.block_table.shape[0], runtime.manager.max_num_reqs)
+                            owned_indexer.block_table[:rows].copy_(metadata.block_table[:rows])
+                            seen_indexers[id(metadata)] = (owned_indexer, [])
+                            indexers.append(seen_indexers[id(metadata)])
+                        owned_indexer, names = seen_indexers[id(metadata)]
+                        names.append(layer_name)
+                        captured[layer_name] = owned_indexer
                     else:
                         captured[layer_name] = metadata
                     continue
@@ -323,6 +373,11 @@ class MtpGraphMetadataSet:
     def accepts(self, metadata_steps):
         if len(metadata_steps) != len(self.steps):
             return False
+        for indexers, step in zip(self.indexer_steps, metadata_steps):
+            for _, names in indexers:
+                # A captured shared buffer cannot represent divergent inputs.
+                if names[0] not in step or any(step.get(name) is not step[names[0]] for name in names):
+                    return False
         for groups, step in zip(self.groups, metadata_steps):
             for _, buffers, names in groups:
                 if any(name not in step for name in names) or not buffers.accepts(step[names[0]].mtp_batch):
@@ -333,13 +388,15 @@ class MtpGraphMetadataSet:
         if not self.accepts(metadata_steps):
             raise ValueError("MTP graph metadata does not match its captured request/query capacity")
         for indexers, step in zip(self.indexer_steps, metadata_steps):
-            for name, owned in indexers.items():
-                update_graph_metadata(owned, step[name])
-                if any(
-                    getattr(metadata, "mtp_graph_capture", False) or getattr(metadata, "mtp_graph_dummy", False)
-                    for metadata in step.values()
-                ):
+            is_inactive = any(
+                getattr(metadata, "mtp_graph_capture", False) or getattr(metadata, "mtp_graph_dummy", False)
+                for metadata in step.values()
+            )
+            for owned, names in indexers:
+                update_graph_metadata(owned, step[names[0]])
+                if is_inactive:
                     owned.slot_mapping.fill_(-1)
+        owners = {slot: req for req, slot in self.runtime.manager.topk_buffer_slot_manager.req2slot.items()}
         for groups, step in zip(self.groups, metadata_steps):
             for owned, buffers, names in groups:
                 incoming = step[names[0]]
@@ -359,8 +416,7 @@ class MtpGraphMetadataSet:
                 owned.slot_mapping[active_tokens:].fill_(-1)
                 if owned.main_slot_mapping is not None:
                     owned.main_slot_mapping[active_tokens:].fill_(-1)
-                for layer_name in names:
-                    buffers.prepare_layer(layer_name)
+                buffers.prepare_layers(names, owners=owners)
 
 
 def eligible_graph_steps(metadata_steps):

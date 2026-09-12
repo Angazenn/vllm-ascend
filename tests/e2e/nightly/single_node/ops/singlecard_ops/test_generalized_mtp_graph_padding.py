@@ -190,8 +190,11 @@ def test_padded_rows_generate_no_host_transfers_on_graph_replay(registered_pool,
     output = torch.empty_like(query)
     scale = 1 / math.sqrt(576)
     buffers.update(make_mtp_batch(metadata, manager), is_capture=True)
-    buffers.prepare_layer("owner")
+    buffers.prepare_layers(("other_layer", "owner"))
     mapping, states, outputs = buffers.lim_inputs("owner")
+    # Exercise the actual ACLNN input with a nonzero offset into the matrix.
+    assert states.storage_offset() > 0 and states.is_contiguous()
+    assert states.data_ptr() % 32 == 0
     descriptors = buffers.tail_copies["owner"]
 
     def chain():
@@ -273,7 +276,7 @@ def test_padded_rows_generate_no_host_transfers_on_graph_replay(registered_pool,
         if reset:
             manager.nano_mtp_slot_generations[0] += 1
         buffers.update(make_mtp_batch(metadata, manager), is_dummy=count == 0)
-        buffers.prepare_layer("owner")
+        buffers.prepare_layers(("other_layer", "owner"))
         current_states = states.cpu().tolist()
         live_before = [tensor[:REQUESTS].clone() for tensor in hbm] if count == 0 else None
         graph.replay()
