@@ -995,6 +995,21 @@ class AscendSFAIndexerMetadataBuilder(AttentionMetadataBuilder[AscendSFAIndexerM
         # graph capture and runtime rebuild update the exact same storage.
         return ("slot_mapping", common_attn_metadata.slot_mapping.data_ptr())
 
+    @staticmethod
+    def _mask_nano_slot_mapping(common_attn_metadata: CommonAttentionMetadata, slot_mapping: torch.Tensor) -> None:
+        # Only nano prepares request state. Keep ordinary SFA metadata unchanged.
+        if getattr(common_attn_metadata, "nano_request_state", None) is None:
+            return
+        # Indexer and main KV have independent cache layouts. Protect this
+        # group's own persistent mapping once, before cache-write metadata and
+        # model forward. No per-layer active tensor is needed.
+        count = common_attn_metadata.num_reqs
+        ends = common_attn_metadata.query_start_loc[1 : count + 1]
+        positions = torch.arange(slot_mapping.numel(), dtype=torch.int32, device=slot_mapping.device)
+        rows = torch.searchsorted(ends.contiguous(), positions, right=True).clamp_max(count - 1)
+        active = (common_attn_metadata.req_topk_buffer_generations[rows] >= 0) & (positions < ends[-1])
+        slot_mapping.masked_fill_(~active, -1)
+
     def _build(
         self,
         common_attn_metadata: CommonAttentionMetadata,
@@ -1035,6 +1050,7 @@ class AscendSFAIndexerMetadataBuilder(AttentionMetadataBuilder[AscendSFAIndexerM
                 num_input_tokens,
                 buffer_key,
             )
+        self._mask_nano_slot_mapping(common_attn_metadata, slot_mapping)
         input_positions = common_attn_metadata.positions[:num_input_tokens].long()
         block_size = self.kernel_block_size
 

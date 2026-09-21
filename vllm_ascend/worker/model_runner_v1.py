@@ -141,6 +141,7 @@ from vllm_ascend.attention.mla_v1 import AscendMLABackend
 from vllm_ascend.attention.utils import (
     AscendCommonAttentionMetadata,
     get_sfa_qsfa_packed_head_dim,
+    split_decodes_and_prefills,
     using_paged_attention,
 )
 
@@ -3301,6 +3302,35 @@ class NPUModelRunner(GPUModelRunner):
             return {}
         return getter() or {}
 
+    def _prepare_nano_request_state(
+        self, metadata: AscendCommonAttentionMetadata, draft_index: int | None = None
+    ) -> None:
+        if not self.sparse_kv_offload_enabled or not self.sparse_kv_offload_config.use_nano:
+            return
+        spec = self.speculative_config
+        steps = spec.num_speculative_tokens if spec is not None else 0
+        kv_transfer = self.vllm_config.kv_transfer_config
+        is_consumer = kv_transfer is not None and kv_transfer.is_kv_consumer and not kv_transfer.is_kv_producer
+        _, num_prefills, _, _ = split_decodes_and_prefills(
+            metadata, decode_threshold=1 + steps, treat_short_extends_as_decodes=is_consumer
+        )
+        enabled = (num_prefills == 0 or metadata.offload_dummy) and 1 <= metadata.max_query_len <= 7
+        draft_model_config = getattr(spec, "draft_model_config", None)
+        draft_hf = draft_model_config.hf_config if draft_model_config is not None else None
+        self.input_batch.prepare_nano_request_state(
+            metadata,
+            enabled=enabled,
+            hot_tokens=self.sparse_kv_offload_config.topk_buffer_size,
+            num_draft_steps=steps,
+            num_mtp_layers=max(1, getattr(draft_hf, "num_nextn_predict_layers", 1)),
+            draft_index=draft_index,
+            reuse_topk=(
+                draft_index is not None
+                and draft_index > 0
+                and getattr(draft_hf, "index_share_for_mtp_iteration", False)
+            ),
+        )
+
     def _prepare_nano_request_slots(self, num_reqs: int, padded_reqs: int, *, dummy: bool) -> None:
         if self._offload_pool_slots is None:
             return
@@ -3641,6 +3671,7 @@ class NPUModelRunner(GPUModelRunner):
             offload_dummy=offload_dummy,
             mm_req_doc_ranges=req_doc_ranges,
         )
+        self._prepare_nano_request_state(cm_base)
 
         if logits_indices is not None and self.cache_config.kv_sharing_fast_prefill:
             cm_base.num_logits_indices = logits_indices.size(0)

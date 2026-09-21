@@ -82,6 +82,13 @@ class NPUInputBatch(InputBatch):
         self.device = device
         self.pin_memory = pin_memory
         self.vocab_size = vocab_size
+        # Nano request lifecycle is shared by all target layers. Draft layers
+        # have separate history, and each draft step has a stable output address.
+        # Allocate only when nano metadata is first prepared, before capture.
+        self.nano_request_states: torch.Tensor | None = None
+        self.nano_last_generation: torch.Tensor | None = None
+        self.nano_last_prefix: torch.Tensor | None = None
+        self.nano_last_cache: torch.Tensor | None = None
 
         self._req_ids: list[str | None] = []
         self.req_id_to_index: dict[str, int] = {}
@@ -256,3 +263,76 @@ class NPUInputBatch(InputBatch):
         # (e.g. penalties).
         self.sampled_token_ids_cpu: torch.Tensor | None = None
         self.async_copy_ready_event: torch.Event | None = None
+
+    def prepare_nano_request_state(
+        self,
+        metadata,
+        *,
+        enabled: bool,
+        hot_tokens: int,
+        num_draft_steps: int,
+        num_mtp_layers: int,
+        draft_index: int | None = None,
+        reuse_topk: bool = False,
+    ) -> None:
+        """Prepare one shared LIM state vector before a model step.
+
+        GPU sequence lengths remain authoritative after async MTP rejection.
+        Keep history on device rather than copying lengths back to the CPU.
+        The target uses history bank 0; physical MTP layers use separate banks.
+        """
+        step = 0 if draft_index is None else draft_index + 1
+        if getattr(metadata, "nano_state_step", None) == step:
+            return
+        capacity = self.max_num_reqs + 2
+        if self.nano_request_states is None:
+            with torch.inference_mode(False):
+                self.nano_request_states = torch.full(
+                    (1 + num_draft_steps, capacity), -3, dtype=torch.int32, device=self.device
+                )
+                self.nano_last_generation = torch.full(
+                    (1 + num_mtp_layers, 2 * capacity), -1, dtype=torch.int64, device=self.device
+                )
+                self.nano_last_prefix = torch.zeros(
+                    (1 + num_mtp_layers, 2 * capacity), dtype=torch.int32, device=self.device
+                )
+                self.nano_last_cache = torch.zeros_like(self.nano_last_prefix)
+                self.nano_padding_pools = torch.arange(capacity, 2 * capacity, dtype=torch.int64, device=self.device)
+        assert self.nano_last_generation is not None
+        assert self.nano_last_prefix is not None
+        assert self.nano_last_cache is not None
+        bank = 0 if draft_index is None else 1 + draft_index % num_mtp_layers
+        count = metadata.num_reqs
+        state = self.nano_request_states[step, :count]
+        metadata.nano_request_state = state
+        metadata.nano_state_step = step
+        if not enabled:
+            # Prefill/mixed/fallback execution can overwrite the resident arena.
+            self.nano_last_generation[bank].fill_(-1)
+            state.fill_(-3)
+            return
+        if reuse_topk:
+            # These draft steps do not execute LIM. In particular, do not let
+            # their speculative prefixes hide a rollback from the next step 0.
+            state.fill_(-3)
+            return
+
+        generations = metadata.req_topk_buffer_generations[:count]
+        widths = metadata.query_start_loc[1 : count + 1] - metadata.query_start_loc[:count]
+        active = (generations >= 0) & (widths > 0)
+        seq_lens = torch.where(active, metadata.seq_lens[:count], widths)
+        prefix = torch.div((seq_lens - widths).clamp_min(0), 128, rounding_mode="floor") * 128
+        is_short = prefix < hot_tokens
+        cache = torch.where(active, torch.where(is_short, 0, prefix.clamp_max(hot_tokens)), 2048)
+        pools = torch.where(
+            active, metadata.req_topk_buffer_slots[:count].to(torch.int64), self.nano_padding_pools[:count]
+        )
+        ready = (
+            (self.nano_last_generation[bank, pools] == generations)
+            & (self.nano_last_cache[bank, pools] == cache)
+            & (self.nano_last_prefix[bank, pools] <= prefix)
+        )
+        state.copy_(torch.where(active, torch.where(is_short, -3, torch.where(ready, -1, -2)), -3))
+        self.nano_last_generation[bank].scatter_(0, pools, generations)
+        self.nano_last_prefix[bank].scatter_(0, pools, prefix)
+        self.nano_last_cache[bank].scatter_(0, pools, cache)

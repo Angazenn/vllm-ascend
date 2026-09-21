@@ -161,10 +161,8 @@ class AscendSFAKVOffloadMetadataBuilder(AscendSFAMetadataBuilder):
                 ("prefix_lens", torch.int32),
                 ("cache_tokens", torch.int32),
                 ("logical_lens", torch.int32),
+                ("reuse_logical_lens", torch.int32),
                 ("pool_entries", torch.int32),
-                ("generations", torch.int64),
-                ("active", torch.bool),
-                ("is_short", torch.bool),
             )
         }
         self.nano_hbm_block_table = torch.empty(
@@ -175,7 +173,6 @@ class AscendSFAKVOffloadMetadataBuilder(AscendSFAMetadataBuilder):
         tokens = vllm_config.scheduler_config.max_num_batched_tokens
         self.nano_token_positions = torch.arange(tokens, dtype=torch.int64, device=device)
         self.nano_device_slots = torch.empty((steps, tokens), dtype=torch.int64, device=device)
-        self.nano_token_active = torch.empty((steps, tokens), dtype=torch.bool, device=device)
         self.nano_tail_src = torch.empty((steps, requests, 2), dtype=torch.int64, device=device)
         self.nano_tail_dst = torch.empty_like(self.nano_tail_src)
         self.nano_tail_lengths = torch.empty((steps, requests, 2), dtype=torch.int32, device=device)
@@ -217,10 +214,11 @@ class AscendSFAKVOffloadMetadataBuilder(AscendSFAMetadataBuilder):
         # Row slots ride on every batch (prefill included): the colocate
         # prefill path D2Ds each chunk's new KV into the rows at exec_kv time.
         row_slots = getattr(common_attn_metadata, "req_topk_buffer_slots", None)
-        metadata.nano_prefill_pool_slots = (
-            row_slots[: common_attn_metadata.num_reqs] if row_slots is not None else None
-        )
+        metadata.nano_prefill_pool_slots = row_slots[: common_attn_metadata.num_reqs] if row_slots is not None else None
         if metadata.nano_enabled:
+            if common_attn_metadata.nano_request_state is None:
+                raise RuntimeError("nano request state must be prepared by the input batch before attention metadata")
+            metadata.nano_request_state = common_attn_metadata.nano_request_state[: common_attn_metadata.num_reqs]
             # Include graph padding in the operator batch. These addresses
             # remain fixed from capture through replay; only device contents
             # change. Real rows are identified by allocation generation, not
@@ -248,27 +246,27 @@ class AscendSFAKVOffloadMetadataBuilder(AscendSFAMetadataBuilder):
             # [0, logical) and ignores the TopK; 0 < C < 2048 computes
             # NOTHING. Short rows must therefore pass C = 0; the row content
             # arrives via the PD dense D2D or the eager full-row fill.
-            cache = torch.where(
-                active, torch.where(is_short, 0, prefix.clamp_max(self.nano_hot_tokens)), 2048
-            )
+            cache = torch.where(active, torch.where(is_short, 0, prefix.clamp_max(self.nano_hot_tokens)), 2048)
             safe_pools = torch.where(active, pools[:count], self.nano_rows[:count] + self.nano_pool_capacity)
             # Dense mode (C == 0) attends the whole sequence: logical = seq.
             # Offload rows keep hot + tail.
             logical = torch.where(
                 active,
                 torch.where(is_short, seq_lens, cache + seq_lens - prefix),
-                cache,
+                0,
             )
+            # Reused MTP selections keep the dense extent or the saved hot
+            # budget, without appending later draft tokens. Inactive rows
+            # have no visible KV, so copy-SFA itself writes zero output.
+            reuse_logical = torch.where(active, torch.where(is_short, seq_lens, cache), 0)
             for name, value in (
                 ("query_ends", ends),
                 ("seq_lens", seq_lens),
                 ("prefix_lens", prefix),
                 ("cache_tokens", cache),
                 ("logical_lens", logical),
+                ("reuse_logical_lens", reuse_logical),
                 ("pool_entries", safe_pools),
-                ("generations", generations[:count]),
-                ("active", active),
-                ("is_short", is_short),
             ):
                 buffer = self.nano_vectors[name][draft_index, :count]
                 buffer.copy_(value)
@@ -337,6 +335,9 @@ class AscendSFAKVOffloadMetadataBuilder(AscendSFAMetadataBuilder):
                 count - 1
             )
             token_active = active[token_rows] & (positions < ends[-1])
+            # The runner/proposer owns this step's persistent slot mapping.
+            # Protect host-cache writes once before any layer consumes it.
+            metadata.slot_mapping.masked_fill_(~token_active[: metadata.slot_mapping.numel()], -1)
             logical_positions = seq_lens[token_rows] - widths[token_rows] + positions - starts[token_rows]
             # SP token padding in an eager draft can extend beyond the
             # final query end without adding a request row. It also needs a
@@ -352,9 +353,7 @@ class AscendSFAKVOffloadMetadataBuilder(AscendSFAMetadataBuilder):
                 self.nano_hot_tokens + logical_positions % 256,
             )
             self.nano_device_slots[draft_index, :tokens].copy_(device_slots)
-            self.nano_token_active[draft_index, :tokens].copy_(token_active)
             metadata.nano_device_slots = self.nano_device_slots[draft_index, :tokens]
-            metadata.nano_token_active = self.nano_token_active[draft_index, :tokens]
             metadata.num_prefills = 0
             metadata.num_decodes = count
             # Query boundaries already have an exact CPU mirror. Only
@@ -444,10 +443,6 @@ class AscendSFAKVOffloadImpl(AscendSFAImpl):
             requests = self.vllm_config.scheduler_config.max_num_seqs + 2
             tokens = self.vllm_config.scheduler_config.max_num_batched_tokens
             device = torch.device("npu")
-            self.nano_states = torch.full((requests,), -3, dtype=torch.int32, device=device)
-            self.nano_last_generation = torch.full((requests * 2,), -1, dtype=torch.int64, device=device)
-            self.nano_last_prefix = torch.zeros(requests * 2, dtype=torch.int32, device=device)
-            self.nano_last_cache = torch.zeros_like(self.nano_last_prefix)
             if not self.skip_topk:
                 source_capacity = cdiv(self.vllm_config.model_config.max_model_len, 128) * 128
                 self.nano_slot_map = torch.full(
@@ -595,11 +590,9 @@ class AscendSFAKVOffloadImpl(AscendSFAImpl):
         self._current_layer_name = layer_name
         self._nano_metadata = attn_metadata
         if self.use_nano and attn_metadata is not None and not attn_metadata.nano_enabled:
-            # The fallback arena overlaps persistent nano rows. Force a cold
-            # fill after prefill/mixed/fallback execution, including owners
-            # whose source-to-slot maps otherwise still look valid.
+            # Input-batch metadata preparation invalidates residency history
+            # once for fallback execution; only layer-local TopK reuse resets here.
             self.nano_reuse_request_count = 0
-            self.nano_last_generation.fill_(-1)
         try:
             return super().forward(layer_name, hidden_states, kv_cache, attn_metadata, output)
         finally:
@@ -610,65 +603,16 @@ class AscendSFAKVOffloadImpl(AscendSFAImpl):
         indexer_metadata.topk_selector = (
             self._nano_select if attn_metadata.nano_enabled and not self.skip_topk else None
         )
-        if attn_metadata.nano_enabled:
-            # Mask cache writes for every inactive graph/dummy query. This
-            # operation is captured and uses the replay's active-row tensor.
-            slots = indexer_metadata.slot_mapping
-            active = attn_metadata.nano_token_active[: slots.numel()]
-            indexer_metadata.slot_mapping = torch.where(active, slots, -1)
-
-    def _prepare_nano_lim_state(self, metadata) -> None:
-        count = metadata.nano_pool_entries.numel()
-        pools = metadata.nano_pool_entries.to(torch.int64)
-        generations = metadata.nano_generations
-        prefix = metadata.nano_prefix_lens
-        cache = metadata.nano_cache_tokens
-        is_short = metadata.nano_is_short
-        gen_match = self.nano_last_generation[pools] == generations
-        ready = gen_match & (self.nano_last_cache[pools] == cache) & (self.nano_last_prefix[pools] <= prefix)
-        # Short rows always run -3 (dense layout, C == 0): row content is
-        # guaranteed by the PD dense D2D or the eager full-row fill, so no -2
-        # rebuild is needed - and a -2 rebuild would emit a *compacted* slot
-        # assignment that the C == 0 dense read cannot interpret. Long rows
-        # keep the -2/-1 lifecycle; the short -> long transition flips cache
-        # (0 -> hot) and naturally takes -2 once, then -1.
-        state = torch.where(
-            metadata.nano_active,
-            torch.where(is_short, -3, torch.where(ready, -1, -2)),
-            -3,
-        )
-        self.nano_states[:count].copy_(state)
-        self.nano_last_generation.scatter_(0, pools, generations)
-        self.nano_last_prefix.scatter_(0, pools, prefix)
-        self.nano_last_cache.scatter_(0, pools, cache)
 
     def _nano_select(self, query, weights, indexer, indexer_metadata):
         metadata = self._nano_metadata
         count = metadata.nano_pool_entries.numel()
         tokens = metadata.num_decode_tokens
-        self._prepare_nano_lim_state(metadata)
+        request_state = metadata.nano_request_state
         prefix = metadata.nano_prefix_lens
         cache = metadata.nano_cache_tokens
         index_cache = indexer.k_cache.kv_cache[0].view(-1, 128, 1, 128)
         table = indexer_metadata.block_table[:count].contiguous()
-        if table.shape[1] * 128 != self.nano_slot_map.shape[1]:
-            # The scheduler may pad its logical block-table width. This is
-            # fixed after initialization, before any graph capture.
-            if torch.npu.is_current_stream_capturing():
-                raise RuntimeError("nano indexer block-table layout must be initialized before graph capture")
-            self.nano_slot_map = torch.full(
-                (self.nano_slot_map.shape[0], table.shape[1] * 128), -(1 << 31), dtype=torch.int32, device=query.device
-            )
-            self.nano_last_generation.fill_(-1)
-            # -3 never reads the slot map, so freshly allocated rows keep short
-            # requests on the dense path; long rows take the -2 rebuild.
-            self.nano_states[:count].copy_(
-                torch.where(
-                    metadata.nano_active,
-                    torch.where(metadata.nano_is_short, -3, -2),
-                    -3,
-                )
-            )
         if self.nano_key_scale is None:
             self.nano_key_scale = torch.empty(index_cache.shape[:3], dtype=torch.float32, device=query.device)
             self.nano_query_scale = torch.empty(
@@ -685,7 +629,7 @@ class AscendSFAKVOffloadImpl(AscendSFAImpl):
             metadata.nano_seq_lens,
             prefix,
             cache,
-            self.nano_states[:count],
+            request_state,
             metadata.nano_pool_entries,
             self.nano_slot_map,
             self.nano_topk_src[:tokens],
@@ -702,8 +646,8 @@ class AscendSFAKVOffloadImpl(AscendSFAImpl):
         # -3 step-0 selections reach up to seq-1 (dst == src), so the reuse
         # extent must be seq with a zero copy-SFA budget; long rows reuse
         # exactly the saved C budget.
-        self.nano_reuse_logical_lens[:count].copy_(torch.where(metadata.nano_is_short, metadata.nano_seq_lens, cache))
-        self.nano_reuse_cache_tokens[:count].copy_(torch.where(metadata.nano_is_short, 0, cache))
+        self.nano_reuse_logical_lens[:count].copy_(metadata.nano_reuse_logical_lens)
+        self.nano_reuse_cache_tokens[:count].copy_(cache)
         return self.nano_topk_src[:tokens]
 
     def bind_nano_kv_cache(self, manager, layer_name) -> None:
@@ -781,7 +725,7 @@ class AscendSFAKVOffloadImpl(AscendSFAImpl):
             float(self.scale),
             out,
         )
-        return torch.where(metadata.nano_token_active[:tokens, None, None], out[:, :heads], 0).contiguous()
+        return out[:, :heads].contiguous()
 
     def _compute_kv_only(
         self,
@@ -832,7 +776,6 @@ class AscendSFAKVOffloadImpl(AscendSFAImpl):
                 ):
                     rows = cache_tensor.view(-1, cache_tensor.shape[-1])
                     rows.index_copy_(0, device_slots[: value.shape[0]], value.reshape(value.shape[0], -1))
-                slots = torch.where(attn_metadata.nano_token_active[: slots.numel()], slots, -1)
             manager.offload_new_kv(
                 layer_name=layer_name,
                 slot_mapping=slots,

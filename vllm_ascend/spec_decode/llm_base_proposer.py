@@ -829,6 +829,8 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
                     if self.dcp_size > 1 and draft_index > 0:
                         assert self.block_table_tensor_clone is not None, "block_table_tensor_clone is not init"
                         common_attn_metadata.block_table_tensor = self.block_table_tensor_clone[:num_reqs]
+                    if getattr(self.runner, "sparse_kv_offload_enabled", False):
+                        self.runner._prepare_nano_request_state(common_attn_metadata, draft_index)
                     per_layer_attn_metadata = self._build_multi_group_graph_capture_metadata(
                         common_attn_metadata, draft_index
                     )
@@ -2131,6 +2133,8 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
                 draft_index=draft_index,
                 seq_lens_cpu=ori_seq_len_cpu,
             )
+        if getattr(self.runner, "sparse_kv_offload_enabled", False):
+            self.runner._prepare_nano_request_state(common_attn_metadata, draft_index)
         attn_metadata = attn_metadata_builder.build_for_drafting(
             common_attn_metadata,
             draft_index,
@@ -2525,6 +2529,8 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
     ):
         # FIXME(woosuk): The below two ops cause synchronization. Optimize.
         assert len(self.draft_attn_groups) > 0
+        if getattr(self.runner, "sparse_kv_offload_enabled", False):
+            self.runner._prepare_nano_request_state(common_attn_metadata, draft_index=0)
         per_layer_attn_metadata: dict[str, Any] = {}
         # One DSA cache dict shared by all attn groups within this decode step.
         # DSpark draft layers span multiple kv-cache groups; every group gets
