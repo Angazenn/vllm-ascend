@@ -5,6 +5,7 @@
 from types import SimpleNamespace
 from unittest.mock import patch
 
+import pytest
 import torch
 import torch_npu  # noqa: F401
 
@@ -81,8 +82,10 @@ def populate(builder, cm, draft_index=None, *, reuse_topk=False):
     prepare_state(builder, cm, draft_index, reuse_topk=reuse_topk)
     metadata = SimpleNamespace(slot_mapping=cm.slot_mapping[: cm.num_input_tokens])
     with patch(MODULE + ".split_decodes_and_prefills", return_value=(cm.num_reqs, 0, cm.num_input_tokens, 0)):
-        if draft_index is None:
-            builder._populate_offload_metadata(metadata, cm)
+        if draft_index in (None, 0):
+            # The proposer uses ordinary build() for draft step 0 too.
+            with patch(MODULE + ".AscendSFAMetadataBuilder.build", return_value=metadata):
+                metadata = builder.build(0, cm)
         else:
             with patch(MODULE + ".AscendSFAMetadataBuilder.build_for_drafting", return_value=metadata):
                 metadata = builder.build_for_drafting(cm, draft_index=draft_index)
@@ -230,11 +233,12 @@ def test_runner_prepares_target_and_reusing_draft_state():
         assert builder.input_batch.nano_last_prefix[1, 1].item() == 10240
 
 
-def test_lim_consumes_shared_state_without_modifying_it():
+@pytest.mark.parametrize("draft_index", [None, 0, 1, 2], ids=["target", "draft0", "draft1", "draft2"])
+def test_lim_consumes_shared_state_without_modifying_it(draft_index):
     builder = make_builder()
     cm = common([4, 8, 12], [10371, 500, 0], pools=(1, 0, 0), generations=(11, 12, -1))
-    populate(builder, cm)
-    metadata = populate(builder, cm)
+    populate(builder, cm, draft_index=draft_index)
+    metadata = populate(builder, cm, draft_index=draft_index)
     assert metadata.nano_request_state.cpu().tolist() == [-1, -3, -3]
     impl = AscendSFAKVOffloadImpl.__new__(AscendSFAKVOffloadImpl)
     impl._nano_metadata = metadata
@@ -249,7 +253,8 @@ def test_lim_consumes_shared_state_without_modifying_it():
         ("nano_reuse_logical_lens", (3,)),
         ("nano_reuse_cache_tokens", (3,)),
     ):
-        setattr(impl, name, torch.empty(shape, dtype=torch.int32, device="npu"))
+        setattr(impl, name, torch.full(shape, -999, dtype=torch.int32, device="npu"))
+    impl.nano_reuse_request_count = 0
     impl.nano_key_scale = None
     indexer = SimpleNamespace(
         k_cache=SimpleNamespace(kv_cache=[torch.empty((1, 128, 1, 128), dtype=torch.bfloat16, device="npu")])
@@ -260,9 +265,50 @@ def test_lim_consumes_shared_state_without_modifying_it():
         impl._nano_select(query, weights, indexer, SimpleNamespace(block_table=cm.block_table_tensor))
         assert lim.call_args.args[10].data_ptr() == metadata.nano_request_state.data_ptr()
         assert metadata.nano_request_state.cpu().tolist() == [-1, -3, -3]
-    assert builder.input_batch.nano_last_generation[0, 1].item() == 11
-    assert impl.nano_reuse_logical_lens.cpu().tolist() == [8192, 500, 0]
-    assert impl.nano_reuse_cache_tokens.cpu().tolist() == [8192, 0, 2048]
+    bank = 0 if draft_index is None else 1
+    assert builder.input_batch.nano_last_generation[bank, 1].item() == 11
+    if draft_index == 0:
+        assert impl.nano_reuse_request_count == 3
+        assert impl.nano_reuse_logical_lens.cpu().tolist() == [8192, 500, 0]
+        assert impl.nano_reuse_cache_tokens.cpu().tolist() == [8192, 0, 2048]
+    else:
+        assert impl.nano_reuse_request_count == 0
+        assert impl.nano_reuse_logical_lens.cpu().tolist() == [-999] * 3
+        assert impl.nano_reuse_cache_tokens.cpu().tolist() == [-999] * 3
+
+
+def test_reuse_extent_is_prepared_once_per_draft_round():
+    builder = make_builder()
+    storage = builder.nano_vectors["reuse_logical_lens"]
+    storage.fill_(-999)
+    cm = common([4, 8, 12], [500, 10371, 0], pools=(1, 0, 0), generations=(11, 12, -1))
+    target = populate(builder, cm)
+    assert target.nano_reuse_logical_lens is None
+    assert (storage == -999).all().item()
+
+    first = populate(builder, cm, draft_index=0)
+    assert first.nano_reuse_logical_lens.cpu().tolist() == [500, 8192, 0]
+    address = first.nano_reuse_logical_lens.data_ptr()
+    saved = storage.clone()
+    for step in (1, 2):
+        later = populate(
+            builder,
+            common([1, 2, 3], [500 + step, 10371 + step, 0], pools=(1, 0, 0), generations=(11, 12, -1)),
+            draft_index=step,
+            reuse_topk=True,
+        )
+        assert later.nano_reuse_logical_lens is None
+        torch.testing.assert_close(storage, saved)
+
+    # A new round refreshes step 0 in place, including changed activity.
+    next_cm = common([4, 8, 12], [504, 10375, 0], pools=(1, 0, 0), generations=(11, 12, -1))
+    assert populate(builder, next_cm).nano_reuse_logical_lens is None
+    torch.testing.assert_close(storage, saved)
+    next_cm.req_topk_buffer_generations[1] = -1
+    next_first = populate(builder, next_cm, draft_index=0)
+    assert next_first.nano_reuse_logical_lens.data_ptr() == address
+    assert next_first.nano_reuse_logical_lens.cpu().tolist() == [504, 0, 0]
+    assert (storage[1:] == -999).all().item()
 
 
 def test_short_row_dense_geometry_in_mixed_batch():
@@ -275,7 +321,7 @@ def test_short_row_dense_geometry_in_mixed_batch():
     # sequence; long rows keep the full hot budget.
     assert metadata.nano_cache_tokens.cpu().tolist() == [0, 8192]
     assert metadata.nano_logical_lens.cpu().tolist() == [5000, 8323]
-    assert metadata.nano_reuse_logical_lens.cpu().tolist() == [5000, 8192]
+    assert metadata.nano_reuse_logical_lens is None
     # Short row: identity block table for every stride block, zero tail, and
     # front-to-back device slots (token p -> row slot p).
     stride_blocks = 8192 // 128 + 2
@@ -319,15 +365,19 @@ def test_tiny_row_stays_minus3_without_legal_init():
         assert populate(builder, cm).nano_request_state.cpu().tolist() == [-3]
 
 
-def test_inactive_capture_becomes_active_on_graph_replay():
+@pytest.mark.parametrize("draft_index", [None, 0], ids=["target", "draft0"])
+def test_inactive_capture_becomes_active_on_graph_replay(draft_index):
     builder = make_builder()
     cm = common([4, 8], [0, 0], pools=(0, 0), generations=(-1, -1))
-    metadata = populate(builder, cm)
+    metadata = populate(builder, cm, draft_index=draft_index)
     # Private pools 4 and 5; positive cache budgets avoid copy-SFA's cold-fill predicate.
     assert metadata.nano_pool_entries.cpu().tolist() == [4, 5]
     assert metadata.nano_cache_tokens.cpu().tolist() == [2048, 2048]
     assert metadata.nano_logical_lens.cpu().tolist() == [0, 0]
-    assert metadata.nano_reuse_logical_lens.cpu().tolist() == [0, 0]
+    if draft_index == 0:
+        assert metadata.nano_reuse_logical_lens.cpu().tolist() == [0, 0]
+    else:
+        assert metadata.nano_reuse_logical_lens is None
     assert metadata.nano_tail_lengths.count_nonzero().item() == 0
     assert metadata.nano_device_slots.min().item() >= 4 * (8192 + 256)
     # Model capture only consumes the persistent state address. Metadata
@@ -338,7 +388,10 @@ def test_inactive_capture_becomes_active_on_graph_replay():
     with torch.npu.graph(graph):
         observed[0].copy_(metadata.nano_request_state)
         observed[1].copy_(metadata.nano_logical_lens)
-        observed[2].copy_(metadata.nano_reuse_logical_lens)
+        if metadata.nano_reuse_logical_lens is not None:
+            observed[2].copy_(metadata.nano_reuse_logical_lens)
+        else:
+            observed[2].zero_()
         observed_slots.copy_(metadata.slot_mapping)
     graph.replay()
     assert observed.cpu().tolist() == [[-3, -3], [0, 0], [0, 0]]
@@ -348,19 +401,21 @@ def test_inactive_capture_becomes_active_on_graph_replay():
     cm.req_topk_buffer_slots[0] = 1
     # Real scheduling regenerates mappings before metadata preparation.
     cm.slot_mapping.copy_(torch.arange(16, dtype=torch.int64, device="npu") + 256)
-    populate(builder, cm)
+    populate(builder, cm, draft_index=draft_index)
     graph.replay()
-    assert observed.cpu().tolist() == [[-2, -3], [8323, 0], [8192, 0]]
+    reuse = [8192, 0] if draft_index == 0 else [0, 0]
+    assert observed.cpu().tolist() == [[-2, -3], [8323, 0], reuse]
     assert observed_slots.cpu().tolist() == [256, 257, 258, 259, -1, -1, -1, -1]
-    populate(builder, cm)
+    populate(builder, cm, draft_index=draft_index)
     graph.replay()
-    assert observed.cpu().tolist() == [[-1, -3], [8323, 0], [8192, 0]]
+    assert observed.cpu().tolist() == [[-1, -3], [8323, 0], reuse]
     cm.req_topk_buffer_generations.fill_(-1)
-    populate(builder, cm)
+    populate(builder, cm, draft_index=draft_index)
     graph.replay()
     assert observed.cpu().tolist() == [[-3, -3], [0, 0], [0, 0]]
     assert observed_slots.cpu().tolist() == [-1] * 8
-    assert builder.input_batch.nano_last_generation[0, 1].item() == 11
+    bank = 0 if draft_index is None else 1
+    assert builder.input_batch.nano_last_generation[bank, 1].item() == 11
 
 
 def test_eager_sp_padding_uses_private_tail_and_exact_query_count():
@@ -389,7 +444,7 @@ def test_main_and_indexer_slots_preserve_independent_layouts():
     assert index_slots.cpu().tolist() == [1024, 1025, -1, -1, 1028, -1, -1, -1]
     assert index_slots.data_ptr() == index_address
     assert metadata.nano_logical_lens.cpu().tolist() == [8195, 0, 500]
-    assert metadata.nano_reuse_logical_lens.cpu().tolist() == [8192, 0, 500]
+    assert metadata.nano_reuse_logical_lens is None
     assert metadata.nano_tail_lengths[1].count_nonzero().item() == 0
 
     # Without nano request-state preparation the normal indexer is unchanged.
@@ -430,7 +485,7 @@ def test_runner_pool_ownership_survives_compaction_and_dummy_run():
 
 def test_draft_metadata_remains_valid_until_its_step_executes():
     builder = make_builder()
-    first = populate(builder, common([4, 8], [10371, 8324]))
+    first = populate(builder, common([4, 8], [10371, 8324]), draft_index=0)
     saved = {
         name: value.clone()
         for name, value in vars(first).items()
@@ -443,6 +498,10 @@ def test_draft_metadata_remains_valid_until_its_step_executes():
     torch.npu.synchronize()
     for name, expected in saved.items():
         torch.testing.assert_close(getattr(first, name), expected)
+        if name == "nano_reuse_logical_lens":
+            assert second.nano_reuse_logical_lens is None
+            assert third.nano_reuse_logical_lens is None
+            continue
         addresses = {getattr(md, name).data_ptr() for md in (first, second, third)}
         assert len(addresses) == 3, name
     assert first.nano_query_ends.cpu().tolist() == [4, 8]
@@ -455,7 +514,7 @@ def test_draft_metadata_remains_valid_until_its_step_executes():
     with torch.npu.graph(graph):
         observed.copy_(first.nano_query_ends)
     for ends, lengths in (([4, 5], [10374, 8327]), ([4, 8], [10375, 8328])):
-        populate(builder, common(ends, lengths))
+        populate(builder, common(ends, lengths), draft_index=0)
         populate(builder, common([1, 2], [10376, 8329]), draft_index=1)
         populate(builder, common([1, 2], [10377, 8330]), draft_index=2)
         graph.replay()

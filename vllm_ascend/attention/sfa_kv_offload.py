@@ -211,6 +211,7 @@ class AscendSFAKVOffloadMetadataBuilder(AscendSFAMetadataBuilder):
             and (num_prefills == 0 or common_attn_metadata.offload_dummy)
             and 1 <= common_attn_metadata.max_query_len <= 7
         )
+        metadata.nano_reuse_logical_lens = None
         # Row slots ride on every batch (prefill included): the colocate
         # prefill path D2Ds each chunk's new KV into the rows at exec_kv time.
         row_slots = getattr(common_attn_metadata, "req_topk_buffer_slots", None)
@@ -255,22 +256,25 @@ class AscendSFAKVOffloadMetadataBuilder(AscendSFAMetadataBuilder):
                 torch.where(is_short, seq_lens, cache + seq_lens - prefix),
                 0,
             )
-            # Reused MTP selections keep the dense extent or the saved hot
-            # budget, without appending later draft tokens. Inactive rows
-            # have no visible KV, so copy-SFA itself writes zero output.
-            reuse_logical = torch.where(active, torch.where(is_short, seq_lens, cache), 0)
             for name, value in (
                 ("query_ends", ends),
                 ("seq_lens", seq_lens),
                 ("prefix_lens", prefix),
                 ("cache_tokens", cache),
                 ("logical_lens", logical),
-                ("reuse_logical_lens", reuse_logical),
                 ("pool_entries", safe_pools),
             ):
                 buffer = self.nano_vectors[name][draft_index, :count]
                 buffer.copy_(value)
                 setattr(metadata, "nano_" + name, buffer)
+            # Draft step 0 also enters through build(), so use the runner's
+            # state slot: 0 is target, 1 is draft step 0. Later drafts retain
+            # this selection's dense extent or hot budget, with no new tail.
+            if common_attn_metadata.nano_state_step == 1:
+                reuse_logical = torch.where(active, torch.where(is_short, seq_lens, cache), 0)
+                buffer = self.nano_vectors["reuse_logical_lens"][draft_index, :count]
+                buffer.copy_(reuse_logical)
+                metadata.nano_reuse_logical_lens = buffer
             cache_blocks = cache[:, None] // 128
             blocks = self.nano_blocks[None, :]
             physical = safe_pools[:, None] * self.nano_stride_blocks
@@ -639,15 +643,13 @@ class AscendSFAKVOffloadImpl(AscendSFAImpl):
             self.nano_miss_dst[:count],
             self.nano_misses[:count],
         )
-        # MTP draft step 0 owns the only LIM invocation. Preserve its cache
-        # budget so later draft steps can reuse the compacted LIM outputs
-        # without rebuilding source-to-slot metadata.
-        self.nano_reuse_request_count = count
-        # -3 step-0 selections reach up to seq-1 (dst == src), so the reuse
-        # extent must be seq with a zero copy-SFA budget; long rows reuse
-        # exactly the saved C budget.
-        self.nano_reuse_logical_lens[:count].copy_(metadata.nano_reuse_logical_lens)
-        self.nano_reuse_cache_tokens[:count].copy_(cache)
+        if metadata.nano_reuse_logical_lens is not None:
+            # Only draft step 0 saves the selection for later MTP forwards.
+            # Target layers consume their current metadata directly.
+            self.nano_reuse_request_count = count
+            # Dense short rows retain seq with C == 0; long rows retain C.
+            self.nano_reuse_logical_lens[:count].copy_(metadata.nano_reuse_logical_lens)
+            self.nano_reuse_cache_tokens[:count].copy_(cache)
         return self.nano_topk_src[:tokens]
 
     def bind_nano_kv_cache(self, manager, layer_name) -> None:

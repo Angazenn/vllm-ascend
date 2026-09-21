@@ -368,7 +368,8 @@ class AscendSFAMetadata:
     nano_prefix_lens: torch.Tensor | None = None
     nano_cache_tokens: torch.Tensor | None = None
     nano_logical_lens: torch.Tensor | None = None
-    # Step-0 selection extent saved for later MTP steps; zero for padding.
+    # Only draft step 0 populates this extent; later MTP steps use its saved
+    # implementation buffers. Target metadata leaves it unset.
     nano_reuse_logical_lens: torch.Tensor | None = None
     nano_pool_entries: torch.Tensor | None = None
     nano_request_state: torch.Tensor | None = None
