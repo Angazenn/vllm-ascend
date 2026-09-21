@@ -5,6 +5,7 @@
 from types import SimpleNamespace
 from unittest.mock import patch
 
+import pytest
 import torch
 import torch_npu  # noqa: F401
 
@@ -16,21 +17,21 @@ from vllm_ascend.attention.sfa_kv_offload import (
 MODULE = "vllm_ascend.attention.sfa_kv_offload"
 
 
-def make_builder():
+def make_builder(query_width=4, hot_tokens=8192):
     builder = AscendSFAKVOffloadMetadataBuilder.__new__(AscendSFAKVOffloadMetadataBuilder)
     builder.use_nano = True
-    builder.decode_threshold = 4
+    builder.decode_threshold = query_width
     builder.is_pd_decode_consumer = True
     config = SimpleNamespace(
         scheduler_config=SimpleNamespace(max_num_seqs=2, max_num_batched_tokens=16),
-        speculative_config=SimpleNamespace(num_speculative_tokens=3),
+        speculative_config=SimpleNamespace(num_speculative_tokens=query_width - 1),
         model_config=SimpleNamespace(
-            max_model_len=16384, hf_text_config=SimpleNamespace(kv_lora_rank=512, qk_rope_head_dim=64)
+            max_model_len=32768, hf_text_config=SimpleNamespace(kv_lora_rank=512, qk_rope_head_dim=64)
         ),
     )
     with patch(
         MODULE + ".get_ascend_config",
-        return_value=SimpleNamespace(sparse_kv_offload_config=SimpleNamespace(topk_buffer_size=8192)),
+        return_value=SimpleNamespace(sparse_kv_offload_config=SimpleNamespace(topk_buffer_size=hot_tokens)),
     ):
         builder._init_nano_metadata_buffers(config, torch.device("npu"))
     return builder
@@ -66,9 +67,9 @@ def populate(builder, cm, draft_index=None):
     return metadata
 
 
-def make_impl():
+def make_impl(hot_tokens=8192):
     impl = AscendSFAKVOffloadImpl.__new__(AscendSFAKVOffloadImpl)
-    impl.nano_hot_tokens = 8192
+    impl.nano_hot_tokens = hot_tokens
     impl.nano_states = torch.empty(4, dtype=torch.int32, device="npu")
     impl.nano_last_generation = torch.full((8,), -1, dtype=torch.int64, device="npu")
     impl.nano_last_prefix = torch.zeros(8, dtype=torch.int32, device="npu")
@@ -203,22 +204,26 @@ def test_tiny_row_stays_minus3_without_legal_init():
         assert impl.nano_states[:1].cpu().tolist() == [-3]
 
 
-def test_inactive_capture_becomes_active_on_graph_replay():
-    builder, impl = make_builder(), make_impl()
-    cm = common([4, 8], [0, 0], pools=(0, 0), generations=(-1, -1))
+@pytest.mark.parametrize("query_width,hot_tokens", [(4, 8192), (8, 16384)])
+def test_inactive_capture_becomes_active_on_graph_replay(query_width, hot_tokens):
+    builder, impl = make_builder(query_width, hot_tokens), make_impl(hot_tokens)
+    cm = common([query_width, 2 * query_width], [0, 0], pools=(0, 0), generations=(-1, -1))
+    cm.max_query_len = query_width
+    cm.block_table_tensor = torch.arange(2 * 256, dtype=torch.int32, device="npu").reshape(2, 256)
     metadata = populate(builder, cm)
+    assert metadata.nano_enabled
     # Private pools 4 and 5; positive cache budgets avoid copy-SFA's cold-fill predicate.
     assert metadata.nano_pool_entries.cpu().tolist() == [4, 5]
     assert metadata.nano_cache_tokens.cpu().tolist() == [2048, 2048]
     assert metadata.nano_tail_lengths.count_nonzero().item() == 0
-    assert metadata.nano_device_slots.min().item() >= 4 * (8192 + 256)
+    assert metadata.nano_device_slots.min().item() >= 4 * (hot_tokens + 256)
     for _ in range(3):
         impl._prepare_nano_lim_state(metadata)
     graph = torch.npu.NPUGraph()
     with torch.npu.graph(graph):
         impl._prepare_nano_lim_state(metadata)
     assert impl.nano_states[:2].cpu().tolist() == [-3, -3]
-    cm.seq_lens.copy_(torch.tensor([10371, 0], dtype=torch.int32, device="npu"))
+    cm.seq_lens.copy_(torch.tensor([hot_tokens + 2179, 0], dtype=torch.int32, device="npu"))
     cm.req_topk_buffer_generations[0] = 11
     cm.req_topk_buffer_slots[0] = 1
     populate(builder, cm)

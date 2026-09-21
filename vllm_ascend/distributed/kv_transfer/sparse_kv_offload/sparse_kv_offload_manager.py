@@ -302,20 +302,28 @@ def plan_sparse_kv_offload_memory(
     )
 
 
-def get_sparse_kv_offload_cpu_pool_size_bytes(
+def _get_host_kv_cache_specs(
     kv_cache_config: KVCacheConfig,
-) -> int:
-    """Return a safe upper bound for aligned host KV allocations."""
+) -> dict[str, KVCacheSpec]:
+    """Select explicit host caches; DSpark draft and indexer KV stay on device."""
     layer_specs: dict[str, KVCacheSpec] = {}
     for group in kv_cache_config.kv_cache_groups:
         if isinstance(group.kv_cache_spec, UniformTypeKVCacheSpecs):
             layer_specs.update(group.kv_cache_spec.kv_cache_specs)
         else:
             layer_specs.update((layer_name, group.kv_cache_spec) for layer_name in group.layer_names)
-    host_specs = [spec for spec in layer_specs.values() if getattr(spec, "store_on_host", False)]
+    host_specs = {name: spec for name, spec in layer_specs.items() if getattr(spec, "store_on_host", False)}
     if not host_specs:
         raise ValueError("Sparse KV offload requires host-resident KV cache specs")
-    raw_host_bytes = kv_cache_config.num_blocks * sum(spec.page_size_bytes for spec in host_specs)
+    return host_specs
+
+
+def get_sparse_kv_offload_cpu_pool_size_bytes(
+    kv_cache_config: KVCacheConfig,
+) -> int:
+    """Return a safe upper bound for aligned host KV allocations."""
+    host_specs = _get_host_kv_cache_specs(kv_cache_config)
+    raw_host_bytes = kv_cache_config.num_blocks * sum(spec.page_size_bytes for spec in host_specs.values())
     alignment_reserve_bytes = len(host_specs) * _CPU_CACHE_MAX_ALIGNMENT_OVERHEAD_PER_LAYER
     return raw_host_bytes + alignment_reserve_bytes
 
@@ -494,7 +502,7 @@ class SparseKVOffloadManager:
         self.tp_rank = get_tensor_model_parallel_rank()
         self.tp_size = get_tensor_model_parallel_world_size()
         self.tp_group = get_tp_group()
-        self.block_size = self._infer_group_block_sizes(self.kv_cache_config)
+        self.kv_cache_group_id, self.block_size = self._get_offload_kv_cache_group(self.kv_cache_config)
         self.topk_buffer_size = sparse_kv_offload_config.topk_buffer_size
         self.topk = sparse_kv_offload_config.topk
         self.use_fused_overlap = sparse_kv_offload_config.use_fused_overlap
@@ -573,15 +581,22 @@ class SparseKVOffloadManager:
         )
         return warmed_threads
 
-    def _infer_group_block_sizes(
-        self,
+    @staticmethod
+    def _get_offload_kv_cache_group(
         kv_cache_config: KVCacheConfig,
-    ) -> int:
-        assert len(kv_cache_config.kv_cache_groups) == 1, "Hybrid KV is not supported."
-        kv_cache_spec = kv_cache_config.kv_cache_groups[0].kv_cache_spec
-        if isinstance(kv_cache_spec, UniformTypeKVCacheSpecs):
-            kv_cache_spec = next(iter(kv_cache_spec.kv_cache_specs.values()))
-        return kv_cache_spec.block_size
+    ) -> tuple[int, int]:
+        host_specs = _get_host_kv_cache_specs(kv_cache_config)
+        host_groups = [
+            group_id
+            for group_id, group in enumerate(kv_cache_config.kv_cache_groups)
+            if any(name in host_specs for name in group.layer_names)
+        ]
+        block_sizes = {spec.block_size for spec in host_specs.values()}
+        # The per-step offload plan shares one block table across target layers.
+        # Device-only groups (such as a DSpark draft) need no offload plan.
+        if len(host_groups) != 1 or len(block_sizes) != 1:
+            raise ValueError("Sparse KV offload requires all host caches in one KV cache group with one block size")
+        return host_groups[0], block_sizes.pop()
 
     @staticmethod
     def _as_cache_tuple(cache_or_caches) -> tuple[torch.Tensor, ...]:
@@ -590,9 +605,11 @@ class SparseKVOffloadManager:
         return tuple(cache_or_caches)
 
     def _register_offload_layers(self, kv_caches: dict[str, torch.Tensor]) -> None:
-        self.offload_layer_names = [layer_name for layer_name in kv_caches if "indexer" not in layer_name]
-        if not self.offload_layer_names:
-            raise ValueError("Sparse KV offload did not find SFA KV cache layers.")
+        host_specs = _get_host_kv_cache_specs(self.kv_cache_config)
+        missing_layers = host_specs.keys() - kv_caches.keys()
+        if missing_layers:
+            raise ValueError(f"Sparse KV offload is missing host caches: {sorted(missing_layers)}")
+        self.offload_layer_names = [layer_name for layer_name in kv_caches if layer_name in host_specs]
 
         self.num_layers = len(self.offload_layer_names)
         self.layer_name_to_offload_id = {

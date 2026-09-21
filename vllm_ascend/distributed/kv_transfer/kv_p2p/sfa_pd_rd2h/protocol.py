@@ -3,9 +3,10 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any
 
+import regex as re
 from vllm.distributed.kv_transfer.kv_connector.v1.base import (
     KVConnectorMetadata,
 )
@@ -22,7 +23,27 @@ SFAPD_PROTOCOL_VERSION = 1
 MF_META_ACK = b"mf_meta_ack"
 
 
-def infer_sfa_component_group_ids(kv_cache_config: Any) -> tuple[int, int]:
+def get_dspark_draft_layers(vllm_config: Any, kv_cache_config: Any) -> set[str]:
+    """Qwen3 DSpark numbers device-only draft layers after the target layers."""
+    spec = getattr(vllm_config, "speculative_config", None)
+    if spec is None or spec.method != "dspark":
+        return set()
+    target_layers = vllm_config.model_config.get_num_layers(vllm_config.parallel_config)
+    layers = {
+        name
+        for group in kv_cache_config.kv_cache_groups
+        for name in group.layer_names
+        if (match := re.search(r"layers\.(\d+)", name)) and int(match[1]) >= target_layers
+    }
+    if not layers:
+        raise ValueError("DSpark PD requires allocated draft context cache layers on both roles")
+    return layers
+
+
+def infer_sfa_component_group_ids(
+    kv_cache_config: Any,
+    excluded_layers: set[str] | None = None,
+) -> tuple[int, int]:
     """Return ``(main_group_id, indexer_group_id)`` from layer names.
 
     SFA layouts may keep main and indexer caches in separate groups or in one
@@ -36,7 +57,9 @@ def infer_sfa_component_group_ids(kv_cache_config: Any) -> tuple[int, int]:
     main_group_id = None
     indexer_group_id = None
     for group_id, group in enumerate(groups):
-        layer_names = list(getattr(group, "layer_names", ()) or ())
+        layer_names = [
+            name for name in (getattr(group, "layer_names", ()) or ()) if name not in (excluded_layers or ())
+        ]
         if indexer_group_id is None and any("indexer" in name.lower() for name in layer_names):
             indexer_group_id = group_id
         if main_group_id is None and any("indexer" not in name.lower() for name in layer_names):
@@ -63,6 +86,7 @@ class LayerMetadata:
     # indices and therefore do not own an indexer cache at all.
     main_tensor_count: int = 2
     has_indexer: bool = False
+    device_only: bool = False
 
 
 @dataclass
@@ -156,6 +180,7 @@ class SfaPDConsumerReqMeta:
     tail_block_index: int = 0
     kv_tokens: int = 0
     dense: bool = False
+    device_block_ids: dict[int, list[int]] = field(default_factory=dict)
 
 
 @dataclass
@@ -183,6 +208,7 @@ class SfaPDConsumerMetadata(KVConnectorMetadata):
         tail_block_index: int = 0,
         kv_tokens: int = 0,
         dense: bool = False,
+        device_block_ids: dict[int, list[int]] | None = None,
     ) -> None:
         self.requests.append(
             SfaPDConsumerReqMeta(
@@ -194,6 +220,7 @@ class SfaPDConsumerMetadata(KVConnectorMetadata):
                 tail_block_index=tail_block_index,
                 kv_tokens=kv_tokens,
                 dense=dense,
+                device_block_ids=device_block_ids or {},
             )
         )
 

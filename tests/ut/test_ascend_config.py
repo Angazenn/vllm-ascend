@@ -775,6 +775,75 @@ class TestShortRequestFirstConfig(TestBase):
 
 
 class TestSparseKVOffloadConfig(TestBase):
+    @staticmethod
+    def _nano_vllm_config(num_speculative_tokens=7, method="dspark", kv_transfer_config=None):
+        return SimpleNamespace(
+            model_config=SimpleNamespace(hf_text_config=SimpleNamespace(index_topk=2048)),
+            parallel_config=SimpleNamespace(
+                prefill_context_parallel_size=1,
+                decode_context_parallel_size=1,
+                pipeline_parallel_size=1,
+            ),
+            speculative_config=SimpleNamespace(method=method, num_speculative_tokens=num_speculative_tokens),
+            kv_transfer_config=kv_transfer_config,
+            use_v2_model_runner=False,
+        )
+
+    def test_nano_dspark_query_width_and_hot_budget(self):
+        for tokens, budget in ((7, 16384), (7, 32512), (13, 28672)):
+            with self.subTest(tokens=tokens, budget=budget):
+                config = SparseKVOffloadConfig.from_additional_config(
+                    self._nano_vllm_config(tokens),
+                    {
+                        "enabled": True,
+                        "keep_device_kv_cache": True,
+                        "fused_op_type": "nano",
+                        "topk_buffer_size": budget,
+                    },
+                )
+                self.assertTrue(config.use_nano)
+
+    def test_nano_rejects_unsupported_width_and_hot_budget(self):
+        for tokens, budget in ((14, 32512), (7, 8192), (7, 16512), (7, 32768)):
+            with self.subTest(tokens=tokens, budget=budget), self.assertRaises(ValueError):
+                SparseKVOffloadConfig.from_additional_config(
+                    self._nano_vllm_config(tokens),
+                    {
+                        "enabled": True,
+                        "keep_device_kv_cache": True,
+                        "fused_op_type": "nano",
+                        "topk_buffer_size": budget,
+                    },
+                )
+
+    def test_dspark_pd_requires_draft_context_transfer(self):
+        with self.assertRaisesRegex(ValueError, "DSpark PD requires"):
+            SparseKVOffloadConfig.from_additional_config(
+                self._nano_vllm_config(kv_transfer_config=SimpleNamespace(is_kv_consumer=True)),
+                {"enabled": True, "fused_op_type": "nano", "topk_buffer_size": 16384},
+            )
+
+    def test_dspark_pd_allows_explicit_context_transfer(self):
+        transfer = SimpleNamespace(
+            is_kv_consumer=True,
+            kv_connector="SfaRemoteD2HConnector",
+            kv_connector_extra_config={"dspark_draft_kv_transfer": True},
+        )
+        config = SparseKVOffloadConfig.from_additional_config(
+            self._nano_vllm_config(kv_transfer_config=transfer),
+            {"enabled": True, "fused_op_type": "nano", "topk_buffer_size": 16384},
+        )
+        self.assertTrue(config.enabled)
+        self.assertFalse(config.keep_device_kv_cache)
+
+    def test_mtp_pd_configuration_is_unchanged(self):
+        config = SparseKVOffloadConfig.from_additional_config(
+            self._nano_vllm_config(3, "mtp", SimpleNamespace(is_kv_consumer=True)),
+            {"enabled": True, "fused_op_type": "nano", "topk_buffer_size": 8192},
+        )
+        self.assertTrue(config.use_nano)
+        self.assertFalse(config.keep_device_kv_cache)
+
     def test_disabled_string_false_does_not_enter_enabled_path(self):
         config = SparseKVOffloadConfig.from_additional_config(SimpleNamespace(), {"enabled": "false"})
 

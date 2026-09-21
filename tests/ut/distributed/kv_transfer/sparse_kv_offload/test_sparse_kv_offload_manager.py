@@ -57,6 +57,59 @@ def _make_memory_plan_inputs(max_num_seqs=2):
 
 
 class TestSparseKVOffloadMemoryPlanning(unittest.TestCase):
+    def test_dspark_draft_cache_counts_against_device_budget(self):
+        specs, vllm_config, reserve = _make_memory_plan_inputs()
+        specs["draft.attn"] = _FakeKVCacheSpec(page_size_bytes=1536, max_blocks_per_request=100, store_on_host=False)
+        for keep_device in (False, True):
+            with self.subTest(keep_device=keep_device):
+                budget = plan_sparse_kv_offload_memory(
+                    specs, vllm_config, 100 * 2048, reserve + 1000 * 2048, keep_device
+                )
+                self.assertEqual(budget.npu_limit_blocks, 50 if keep_device else 100)
+                self.assertEqual(budget.planned_device_bytes, 100 * 2048)
+                self.assertEqual(budget.planned_host_bytes, budget.final_num_blocks * 2048)
+
+    def test_registration_excludes_device_draft_and_indexer(self):
+        specs, _, _ = _make_memory_plan_inputs()
+        for uniform in (False, True):
+            with self.subTest(uniform=uniform):
+                groups = (
+                    [
+                        SimpleNamespace(
+                            layer_names=list(specs),
+                            kv_cache_spec=UniformTypeKVCacheSpecs(block_size=128, kv_cache_specs=specs),
+                        )
+                    ]
+                    if uniform
+                    else [
+                        SimpleNamespace(layer_names=["device.0"], kv_cache_spec=specs["device.0"]),
+                        SimpleNamespace(layer_names=["host.0", "host.1"], kv_cache_spec=specs["host.0"]),
+                    ]
+                )
+                manager = SparseKVOffloadManager.__new__(SparseKVOffloadManager)
+                manager.kv_cache_config = SimpleNamespace(kv_cache_groups=groups)
+                manager.num_target_layers = 2
+                manager.tp_rank = 0
+                # Deliberately interleave resident caches with target caches.
+                caches = dict.fromkeys(["draft.attn", "host.0", "device.0", "host.1"])
+                manager._register_offload_layers(caches)
+                self.assertEqual(manager.offload_layer_names, ["host.0", "host.1"])
+                self.assertEqual(manager.mtp_layer_id, -1)
+                self.assertEqual(manager._get_offload_layer_id("host.1"), 1)
+                self.assertEqual(
+                    manager._get_offload_kv_cache_group(manager.kv_cache_config), (0 if uniform else 1, 128)
+                )
+                with self.assertRaisesRegex(ValueError, "missing host caches"):
+                    manager._register_offload_layers({"host.0": None})
+
+    def test_multiple_host_groups_cannot_share_one_offload_plan(self):
+        specs, _, _ = _make_memory_plan_inputs()
+        config = SimpleNamespace(
+            kv_cache_groups=[SimpleNamespace(layer_names=[name], kv_cache_spec=spec) for name, spec in specs.items()]
+        )
+        with self.assertRaisesRegex(ValueError, "one KV cache group"):
+            SparseKVOffloadManager._get_offload_kv_cache_group(config)
+
     def test_non_a3_is_rejected(self):
         with (
             patch.object(manager_module, "_SPARSE_KV_OFFLOAD_MANAGER", None),
@@ -260,7 +313,7 @@ class TestSparseKVOffloadMemoryPlanning(unittest.TestCase):
                 get_num_layers=MagicMock(return_value=1),
                 max_model_len=128,
             ),
-            parallel_config=SimpleNamespace(),
+            parallel_config=SimpleNamespace(data_parallel_index=0),
             scheduler_config=SimpleNamespace(
                 max_num_seqs=1,
                 max_num_batched_tokens=1,
@@ -271,6 +324,7 @@ class TestSparseKVOffloadMemoryPlanning(unittest.TestCase):
             topk_buffer_size=1,
             topk=1,
             use_fused_overlap=False,
+            use_nano=False,
             dram_size_per_dp_GB=dram_size_per_dp_gb,
         )
         return vllm_config, kv_cache_config, offload_config

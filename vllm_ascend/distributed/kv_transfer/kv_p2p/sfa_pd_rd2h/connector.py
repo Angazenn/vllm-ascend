@@ -68,6 +68,20 @@ class SfaRemoteD2HConnector(KVConnectorBase_V1, SupportsHMA):
         # SFA path is layer-wise on both sides.
         self.use_layerwise = vllm_config.kv_transfer_config.kv_connector_extra_config.get("use_layerwise", True)
         self.engine_id = vllm_config.kv_transfer_config.engine_id
+        spec = vllm_config.speculative_config
+        if spec is not None and spec.method == "dspark":
+            extra = vllm_config.kv_transfer_config.kv_connector_extra_config
+            if not extra.get("dspark_draft_kv_transfer", False):
+                raise ValueError("DSpark PD requires dspark_draft_kv_transfer=true on both P and D")
+            architectures = spec.draft_model_config.hf_config.architectures
+            if architectures != ["Qwen3DSparkModel"]:
+                raise ValueError("DSpark PD currently supports the Qwen3DSparkModel draft only")
+            if vllm_config.parallel_config.pipeline_parallel_size != 1:
+                raise ValueError("DSpark PD currently requires PP1")
+            if spec.draft_tensor_parallel_size != vllm_config.parallel_config.tensor_parallel_size:
+                raise ValueError("DSpark PD requires equal target and draft TP")
+            if self.is_producer and not vllm_config.model_config.enforce_eager:
+                raise ValueError("DSpark PD producer currently requires eager execution")
         # Decode offload is asymmetric: P exposes regular paged KV while D owns
         # the SparseKVOffloadManager CPU pool.
         from vllm_ascend.ascend_config import get_ascend_config, init_ascend_config

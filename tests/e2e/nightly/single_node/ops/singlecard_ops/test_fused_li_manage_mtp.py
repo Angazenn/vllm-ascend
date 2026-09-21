@@ -405,22 +405,42 @@ def test_generalized_lim_source_ids_cross_128k(state):
     assert (outputs[0] >= 131072).any().item()
 
 
-def test_generalized_lim_extended_routes_and_cache_budget():
-    # Exercise the upstream workspace/slot-codec extension independently
-    # from serving, whose currently supported MTP range stays unchanged.
+@pytest.mark.parametrize("cache_tokens", [28672, 32512, 32640])
+def test_generalized_lim_extended_routes_and_cache_budget(cache_tokens):
+    # Include serving-aligned budgets and the native maximum.
     args = argparse.Namespace(
-        source_capacity=65536, offload_len=49152, cache_tokens=32640, seed=47, dtype="bf16", heads=32, device="npu:0"
+        source_capacity=65536,
+        offload_len=49152,
+        cache_tokens=cache_tokens,
+        seed=47,
+        dtype="bf16",
+        heads=32,
+        device="npu:0",
     )
     case = build_case(args, q_values=[8, 14], states=[-2, -1])
     assert_correctness(case)
 
 
-def test_generalized_lim_copy_sfa_first_fill_and_replacement_chain():
+def test_generalized_lim_dspark_q8_hot_budget():
+    args = argparse.Namespace(
+        source_capacity=32768, offload_len=24576, cache_tokens=16384, seed=57, dtype="bf16", heads=32, device="npu:0"
+    )
+    case = build_case(args, q_values=[8, 8], states=[-2, -1])
+    assert_correctness(case)
+
+
+@pytest.mark.parametrize("query_counts,capacity,prefix", [([1, 3], 6144, 8192), ([8, 8], 16384, 24576)])
+def test_generalized_lim_copy_sfa_first_fill_and_replacement_chain(query_counts, capacity, prefix):
     """Share the pinned miss buffers and verify attention plus persistent KV contents."""
     args = argparse.Namespace(
-        source_capacity=16384, offload_len=8192, cache_tokens=6144, seed=27, dtype="bf16", heads=32, device="npu:0"
+        source_capacity=32768,
+        offload_len=prefix,
+        cache_tokens=capacity,
+        seed=27,
+        dtype="bf16",
+        heads=32,
+        device="npu:0",
     )
-    query_counts = [1, 3]
     case = build_case(args, q_values=query_counts, states=[-2, -2])
     batch, tokens, attention_heads = 2, sum(query_counts), 8
     capacity, prefix, tail = args.cache_tokens, args.offload_len, BLOCK
@@ -511,7 +531,7 @@ def test_generalized_lim_copy_sfa_first_fill_and_replacement_chain():
         torch.testing.assert_close(resident_kpe[:, capacity:], initial_kpe[:, capacity:], rtol=0, atol=0)
 
 
-@pytest.mark.parametrize("queries", [1, 4, 7])
+@pytest.mark.parametrize("queries", [1, 4, 7, 8])
 @pytest.mark.parametrize("use_graph", [False, True])
 def test_generalized_lim_padding_overwrites_old_selection_without_misses(queries, use_graph):
     """A former active row becomes a short causal dummy, with a private map."""

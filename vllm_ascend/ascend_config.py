@@ -1470,6 +1470,13 @@ class SparseKVOffloadConfig:
     Configuration for the Sparse KV cache offloading.
     """
 
+    # Native LIM accepts up to 14 causal query rows and 32640 hot tokens.
+    # Short sequences share the circular-tail layout, which needs a hot
+    # budget aligned to two 128-token blocks.
+    NANO_MAX_QUERY_ROWS: ClassVar[int] = 14
+    NANO_HOT_ALIGNMENT: ClassVar[int] = 256
+    NANO_MAX_HOT_TOKENS: ClassVar[int] = 32512
+
     enabled: bool = False
     topk_buffer_size: int = 4096
     dram_size_per_dp_GB: int = 128
@@ -1519,6 +1526,20 @@ class SparseKVOffloadConfig:
             raise ValueError("Sparse KV offload don't support context parallel now.")
         if parallel_config.pipeline_parallel_size > 1:
             raise ValueError("Sparse KV offload don't support pipeline parallel now.")
+        speculative_config = getattr(vllm_config, "speculative_config", None)
+        if (
+            speculative_config is not None
+            and speculative_config.method == "dspark"
+            and vllm_config.kv_transfer_config is not None
+        ):
+            transfer = vllm_config.kv_transfer_config
+            if getattr(transfer, "kv_connector", None) != "SfaRemoteD2HConnector" or not (
+                getattr(transfer, "kv_connector_extra_config", None) or {}
+            ).get("dspark_draft_kv_transfer", False):
+                raise ValueError(
+                    "DSpark PD requires SfaRemoteD2HConnector with dspark_draft_kv_transfer=true "
+                    "to transfer draft context in addition to target KV"
+                )
         if self.keep_device_kv_cache:
             logger.warning_once(
                 "Init sparse KV offload with keep_device_kv_cache enabled, "
@@ -1538,12 +1559,18 @@ class SparseKVOffloadConfig:
 
         self.topk = vllm_config.model_config.hf_text_config.index_topk
         if self.use_nano:
-            width = 1 + (vllm_config.speculative_config.num_speculative_tokens if vllm_config.speculative_config else 0)
-            if self.topk != 2048 or not 1 <= width <= 7:
-                raise ValueError("nano serving requires TopK=2048 and 1–7 query rows per request")
-            if not width * self.topk <= self.topk_buffer_size <= 16256 or self.topk_buffer_size % 256:
+            width = 1 + (speculative_config.num_speculative_tokens if speculative_config else 0)
+            if self.topk != 2048 or not 1 <= width <= self.NANO_MAX_QUERY_ROWS:
                 raise ValueError(
-                    "nano hot budget must be 256-aligned in [Q_max*2048, 16128]: "
+                    f"nano serving requires TopK=2048 and 1–{self.NANO_MAX_QUERY_ROWS} query rows per request"
+                )
+            if (
+                not width * self.topk <= self.topk_buffer_size <= self.NANO_MAX_HOT_TOKENS
+                or self.topk_buffer_size % self.NANO_HOT_ALIGNMENT
+            ):
+                raise ValueError(
+                    f"nano hot budget must be {self.NANO_HOT_ALIGNMENT}-aligned "
+                    f"in [Q_max*2048, {self.NANO_MAX_HOT_TOKENS}]: "
                     "the dense short-sequence layout only lines up with the circular "
                     "tail slots when topk_buffer_size is a multiple of 256"
                 )

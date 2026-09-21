@@ -52,6 +52,7 @@ class ConsumerReadState:
     topk_row_tokens: int = 0
     topk_hot_tokens: int = 0
     block_size: int = 128
+    device_blocks_by_req: dict[str, dict[int, list[int]]] = field(default_factory=dict)
 
 
 def _coalesce_desc(
@@ -206,6 +207,16 @@ class MembPullReadThread(threading.Thread):
                         unknown_layers = set(p_layer_meta) - set(self._state.layer_metadata)
                         if unknown_layers:
                             raise ValueError(f"MF_META contains layers unknown to D: {sorted(unknown_layers)}")
+                        expected_device = {
+                            name
+                            for name, meta in self._state.layer_metadata.items()
+                            if getattr(meta, "device_only", False)
+                        }
+                        received_device = {
+                            name for name, meta in p_layer_meta.items() if meta.get("device_only", False)
+                        }
+                        if expected_device != received_device:
+                            raise ValueError("DSpark P/D context cache layers do not match")
                         if len(msg) == 3:
                             pp_rank, pp_size = 0, 1
                         else:
@@ -519,9 +530,7 @@ class MembPullReadThread(threading.Thread):
             return
         offload_id = layer["offload_id"]
         if offload_id >= len(state.topk_k_bases) or offload_id >= len(state.topk_v_bases):
-            raise RuntimeError(
-                f"MembPull nano tail is missing topk buffer bases for {layer['layer_name']}"
-            )
+            raise RuntimeError(f"MembPull nano tail is missing topk buffer bases for {layer['layer_name']}")
         p_k_len = int(layer["p_k_len"])
         p_v_len = int(layer["p_v_len"])
         if p_k_len % state.block_size or p_v_len % state.block_size:
@@ -582,9 +591,7 @@ class MembPullReadThread(threading.Thread):
             )
         offload_id = layer["offload_id"]
         if offload_id >= len(state.topk_k_bases) or offload_id >= len(state.topk_v_bases):
-            raise RuntimeError(
-                f"MembPull nano dense is missing topk buffer bases for {layer['layer_name']}"
-            )
+            raise RuntimeError(f"MembPull nano dense is missing topk buffer bases for {layer['layer_name']}")
         p_k_len = int(layer["p_k_len"])
         p_v_len = int(layer["p_v_len"])
         if p_k_len % state.block_size or p_v_len % state.block_size:
@@ -872,6 +879,43 @@ class MembPullReadThread(threading.Thread):
             read_info["num_transfers"],
         )
 
+    def _read_device_context(self, layer_name, read_reqs, p_session, p_layer_meta, group_member_idx, ratio):
+        """Pull every rank's draft K/V; main MLA's TP block partition does not apply."""
+        if ratio != 1 or group_member_idx != 0:
+            raise ValueError("DSpark device-context transfer requires equal P/D TP")
+        local = self._state.layer_metadata[layer_name]
+        peer = (p_layer_meta if p_layer_meta is not None else self._p_layer_meta)[layer_name]
+        if not peer.get("device_only", False) or peer.get("has_indexer", False):
+            raise ValueError("Expected a device-only DSpark context cache on P")
+        p_lengths = [size * scale for size, scale in zip(peer["block_len"], peer["block_size_scale"])]
+        d_lengths = [size * scale for size, scale in zip(local.block_len, local.block_size_scale)]
+        if len(p_lengths) != 2 or p_lengths != d_lengths or len(peer["base_addrs"]) != 2:
+            raise ValueError(f"DSpark context block layout mismatch for {layer_name}: P={p_lengths}, D={d_lengths}")
+        group_id = local.tensor_group_idx[0]
+        local_ptrs, peer_ptrs, lengths = [], [], []
+        for ext_id, source_ids, indexer_ids, start, _ in read_reqs:
+            self._wait_for_dest_blocks(ext_id, layer_name)
+            destination_ids = self._state.device_blocks_by_req.get(ext_id, {}).get(group_id)
+            if indexer_ids or destination_ids is None or start < 0 or start + len(source_ids) > len(destination_ids):
+                raise ValueError(f"Invalid DSpark destination blocks for request {ext_id}, group {group_id}")
+            target_ids = destination_ids[start : start + len(source_ids)]
+            if any(block < 0 for block in source_ids) or any(
+                not 0 <= block < self._state.num_blocks for block in target_ids
+            ):
+                raise ValueError("DSpark context transfer block is out of range")
+            for source_id, target_id in zip(source_ids, target_ids):
+                for p_base, d_base, size in zip(peer["base_addrs"], local.kv_caches_base_addr, d_lengths):
+                    peer_ptrs.append(p_base + source_id * size)
+                    local_ptrs.append(d_base + target_id * size)
+                    lengths.append(size)
+        if local_ptrs:
+            ret = self.engine.batch_transfer_sync_read(p_session, local_ptrs, peer_ptrs, lengths)
+            if ret != 0:
+                raise RuntimeError(f"DSpark context read failed for {layer_name}, ret={ret}")
+            logger.debug(
+                "SFAPD read DSpark context: layer=%s, requests=%d, bytes=%d", layer_name, len(read_reqs), sum(lengths)
+            )
+
     def _do_read_batch(
         self,
         layer_name: str,
@@ -886,6 +930,10 @@ class MembPullReadThread(threading.Thread):
         if p_session is None:
             raise RuntimeError("MF_META not received before READ_READY_BATCH")
 
+        local_metadata = self._state.layer_metadata.get(layer_name)
+        if local_metadata is not None and getattr(local_metadata, "device_only", False):
+            self._read_device_context(layer_name, read_reqs, p_session, p_layer_meta, group_member_idx, ratio)
+            return
         layer = self._resolve_read_layer(layer_name, p_layer_meta)
         if layer is None:
             raise RuntimeError(f"MembPull cannot resolve P/D layout for {layer_name}")

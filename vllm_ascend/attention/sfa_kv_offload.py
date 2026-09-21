@@ -33,7 +33,7 @@ from vllm.forward_context import (
 from vllm.logger import logger
 from vllm.utils.math_utils import cdiv
 
-from vllm_ascend.ascend_config import get_ascend_config
+from vllm_ascend.ascend_config import SparseKVOffloadConfig, get_ascend_config
 from vllm_ascend.attention.attention_v1 import AscendAttentionState
 from vllm_ascend.attention.sfa_v1 import (
     AscendSFAImpl,
@@ -212,14 +212,12 @@ class AscendSFAKVOffloadMetadataBuilder(AscendSFAMetadataBuilder):
         metadata.nano_enabled = (
             self.use_nano
             and (num_prefills == 0 or common_attn_metadata.offload_dummy)
-            and 1 <= common_attn_metadata.max_query_len <= 7
+            and 1 <= common_attn_metadata.max_query_len <= SparseKVOffloadConfig.NANO_MAX_QUERY_ROWS
         )
         # Row slots ride on every batch (prefill included): the colocate
         # prefill path D2Ds each chunk's new KV into the rows at exec_kv time.
         row_slots = getattr(common_attn_metadata, "req_topk_buffer_slots", None)
-        metadata.nano_prefill_pool_slots = (
-            row_slots[: common_attn_metadata.num_reqs] if row_slots is not None else None
-        )
+        metadata.nano_prefill_pool_slots = row_slots[: common_attn_metadata.num_reqs] if row_slots is not None else None
         if metadata.nano_enabled:
             # Include graph padding in the operator batch. These addresses
             # remain fixed from capture through replay; only device contents
@@ -248,9 +246,7 @@ class AscendSFAKVOffloadMetadataBuilder(AscendSFAMetadataBuilder):
             # [0, logical) and ignores the TopK; 0 < C < 2048 computes
             # NOTHING. Short rows must therefore pass C = 0; the row content
             # arrives via the PD dense D2D or the eager full-row fill.
-            cache = torch.where(
-                active, torch.where(is_short, 0, prefix.clamp_max(self.nano_hot_tokens)), 2048
-            )
+            cache = torch.where(active, torch.where(is_short, 0, prefix.clamp_max(self.nano_hot_tokens)), 2048)
             safe_pools = torch.where(active, pools[:count], self.nano_rows[:count] + self.nano_pool_capacity)
             # Dense mode (C == 0) attends the whole sequence: logical = seq.
             # Offload rows keep hot + tail.

@@ -29,6 +29,7 @@ from vllm_ascend.distributed.kv_transfer.kv_p2p.sfa_pd_rd2h.protocol import (
     BATCH_KV_TRANSFER_PARAMS,
     SfaPDConsumerMetadata,
     SfaPDProducerMetadata,
+    get_dspark_draft_layers,
     get_external_request_id,
     infer_sfa_component_group_ids,
 )
@@ -239,7 +240,14 @@ class SFAPDRD2HScheduler:
         if kv_cache_config is None:
             raise ValueError("SFAPDRD2HScheduler requires KVCacheConfig")
         self.block_size = [group_spec.kv_cache_spec.block_size for group_spec in kv_cache_config.kv_cache_groups]
-        self.main_group_idx, self.indexer_group_idx = infer_sfa_component_group_ids(kv_cache_config)
+        draft_layers = get_dspark_draft_layers(vllm_config, kv_cache_config)
+        self._draft_group_ids = {
+            gid
+            for gid, group in enumerate(kv_cache_config.kv_cache_groups)
+            if draft_layers and draft_layers.intersection(group.layer_names)
+        }
+        self._device_request_blocks: dict[str, dict[int, list[int]]] = {}
+        self.main_group_idx, self.indexer_group_idx = infer_sfa_component_group_ids(kv_cache_config, draft_layers)
 
         self.side_channel_host = get_ip()
         # Control-plane port = kv_port + data_parallel_rank * tp_size. This MUST
@@ -316,7 +324,7 @@ class SFAPDRD2HScheduler:
             return
 
         block_ids_by_group = SFAPDRD2HProducerScheduler._normalize_block_ids(blocks.get_block_ids())
-        required_group = max(self.main_group_idx, self.indexer_group_idx)
+        required_group = max(self.main_group_idx, self.indexer_group_idx, *getattr(self, "_draft_group_ids", set()))
         if len(block_ids_by_group) <= required_group:
             raise RuntimeError(
                 "SFAPD D allocation did not provide all SFA KV cache groups: "
@@ -325,6 +333,10 @@ class SFAPDRD2HScheduler:
         main_block_ids = list(block_ids_by_group[self.main_group_idx])
         indexer_block_ids = list(block_ids_by_group[self.indexer_group_idx])
         self._request_trackers[request.request_id] = (main_block_ids, indexer_block_ids)
+        if getattr(self, "_draft_group_ids", None):
+            self._device_request_blocks[request.request_id] = {
+                gid: list(block_ids_by_group[gid]) for gid in self._draft_group_ids
+            }
         self._reqs_need_recv.add(request.request_id)
         allocator = getattr(self, "_nano_slot_allocator", None)
         if allocator is not None:
@@ -395,9 +407,10 @@ class SFAPDRD2HScheduler:
             if tracker is None:
                 continue
             main_block_ids, indexer_block_ids = tracker
+            device_blocks = getattr(self, "_device_request_blocks", {}).get(req_id, {})
             binding = getattr(self, "_nano_bindings", {}).get(req_id)
             if binding is None:
-                meta.add_request(req_id, main_block_ids, indexer_block_ids)
+                meta.add_request(req_id, main_block_ids, indexer_block_ids, device_block_ids=device_blocks)
             else:
                 pool_slot, tail_tokens, tail_block_index, kv_tokens, dense = binding
                 meta.add_request(
@@ -409,6 +422,7 @@ class SFAPDRD2HScheduler:
                     tail_block_index=tail_block_index,
                     kv_tokens=kv_tokens,
                     dense=dense,
+                    device_block_ids=device_blocks,
                 )
         self._reqs_need_recv.clear()
         return meta
@@ -423,6 +437,7 @@ class SFAPDRD2HScheduler:
     ) -> tuple[bool, dict[str, Any] | None]:
         # vLLM owns the block lifecycle; the connector only drops its lookup.
         self._request_trackers.pop(request.request_id, None)
+        getattr(self, "_device_request_blocks", {}).pop(request.request_id, None)
         self._reqs_need_recv.discard(request.request_id)
         nano_bindings = getattr(self, "_nano_bindings", None)
         if nano_bindings is not None:

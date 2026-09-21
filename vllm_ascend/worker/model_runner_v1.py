@@ -3367,7 +3367,7 @@ class NPUModelRunner(GPUModelRunner):
         manager = self.sparse_kv_offload_manager
         assert manager is not None
         block_size = self.cache_config.block_size
-        block_table = self.input_batch.block_table[0].get_numpy_array()
+        block_table = self.input_batch.block_table[manager.kv_cache_group_id].get_numpy_array()
         topk_k = manager.topk_buffers_k[0]
         stride_tokens = topk_k.shape[1]
         token_bytes = torch.tensor(
@@ -4916,6 +4916,13 @@ class NPUModelRunner(GPUModelRunner):
 
         for kv_cache_tensor in kv_cache_config.kv_cache_tensors:
             shared_layers = get_kv_cache_tensor_layers(kv_cache_tensor)
+            if (
+                self.sparse_kv_offload_enabled
+                and use_legacy_shared_by_layout
+                and len(shared_layers) > 1
+                and any(getattr(layer_kv_cache_spec[name], "store_on_host", False) for name in shared_layers)
+            ):
+                raise ValueError("Sparse KV offload requires private allocations for host KV cache layers")
             use_mamba = False
             use_compressed_cache = False
             for layer_name in shared_layers:
@@ -5106,35 +5113,20 @@ class NPUModelRunner(GPUModelRunner):
                             k_tensor_split_factor, v_tensor_split_factor = calc_split_factor(kv_head_dim_list)
                         k_tensor_size = int(kv_cache_tensor_size // k_tensor_split_factor)
                         v_tensor_size = int(kv_cache_tensor_size // v_tensor_split_factor)
-                    if self.sparse_kv_offload_enabled:
+                    if self.sparse_kv_offload_enabled and getattr(current_kv_cache_spec, "store_on_host", False):
                         assert self.use_sparse, "Sparse KV offload only support sparse attention."
                         assert not current_sparse_sfa_c8, "Sparse KV offload do not support sparse SFA C8."
                         assert v_tensor_size is not None
-                        if use_legacy_shared_by_layout:
-                            assert len(shared_layers) == 1, "Sparse KV offload do not support HMA."
-                            kv_cache_raw_tensors[layer_name] = (
-                                allocate_kv_cache_tensors_for_sparse_kv_offload(
-                                    k_tensor_size,
-                                    v_tensor_size,
-                                    alignment,
-                                    self.tp_rank,
-                                    self.sparse_kv_offload_config.keep_device_kv_cache,
-                                    self._allocate_int8_cache_tensor,
-                                )
-                            )
-                        else:
-                            for layer_name_inner in shared_layers:
-                                if "attn" in layer_name_inner and "linear_attn" not in layer_name_inner:
-                                    kv_cache_raw_tensors[layer_name_inner] = (
-                                        allocate_kv_cache_tensors_for_sparse_kv_offload(
-                                            k_tensor_size,
-                                            v_tensor_size,
-                                            alignment,
-                                            self.tp_rank,
-                                            self.sparse_kv_offload_config.keep_device_kv_cache,
-                                            self._allocate_int8_cache_tensor,
-                                        )
-                                    )
+                        # Packed descriptors may include a device-only draft.
+                        # Let the outer loop allocate each layer with its own spec.
+                        kv_cache_raw_tensors[layer_name] = allocate_kv_cache_tensors_for_sparse_kv_offload(
+                            k_tensor_size,
+                            v_tensor_size,
+                            alignment,
+                            self.tp_rank,
+                            self.sparse_kv_offload_config.keep_device_kv_cache,
+                            self._allocate_int8_cache_tensor,
+                        )
                         continue
                     if use_legacy_shared_by_layout:
                         # v0.28.0 and Ascend DSV4 descriptors alias physical
@@ -5160,7 +5152,8 @@ class NPUModelRunner(GPUModelRunner):
                     else:
                         # main: every layer owns its own region; give each layer a
                         # private (k, v) so block indices don't collide across layers.
-                        for layer_name_inner in shared_layers:
+                        allocation_layers = [layer_name] if self.sparse_kv_offload_enabled else shared_layers
+                        for layer_name_inner in allocation_layers:
                             if "attn" in layer_name_inner and "linear_attn" not in layer_name_inner:
                                 k_tensor = self._allocate_int8_cache_tensor(
                                     k_tensor_size,
@@ -5370,7 +5363,7 @@ class NPUModelRunner(GPUModelRunner):
                     current_sparse_sfa_c8 = self.use_sparse and kv_cache_spec_uses_sparse_sfa_c8(
                         current_kv_cache_spec
                     )
-                    if self.sparse_kv_offload_enabled:
+                    if self.sparse_kv_offload_enabled and getattr(current_kv_cache_spec, "store_on_host", False):
                         assert self.use_sparse, "Sparse KV offload only support sparse attention."
                         assert not current_sparse_sfa_c8, "Sparse KV offload do not support sparse SFA C8."
                         reshaped_tensors = reshape_kv_cache_tensors_for_sparse_kv_offload(
@@ -5882,6 +5875,12 @@ class NPUModelRunner(GPUModelRunner):
 
         kv_cache_spec: dict[str, KVCacheSpec] = {}
         attn_layers = get_layers_from_vllm_config(self.vllm_config, AttentionLayerBase)
+        drafter = getattr(self, "drafter", None)
+        device_draft_layers = (
+            set(drafter.attn_layer_names)
+            if self.sparse_kv_offload_enabled and isinstance(drafter, AscendDSparkProposer)
+            else set()
+        )
         from vllm.model_executor.models.deepseek_v2 import DeepseekV32IndexerCache
 
         # NOTE: Must process Attention/MLAAttention before MambaBase to maintain
@@ -5909,7 +5908,7 @@ class NPUModelRunner(GPUModelRunner):
                     kv_cache_spec[layer_name] = spec
                     attn_layer_names.add(layer_name)
             elif isinstance(attn_module, MLAAttention):
-                if self.use_sparse:
+                if self.use_sparse and layer_name not in device_draft_layers:
                     impl = attn_module.impl
                     cache_sparse_sfa_c8 = bool(
                         getattr(impl, "enable_sparse_sfa_c8", False)

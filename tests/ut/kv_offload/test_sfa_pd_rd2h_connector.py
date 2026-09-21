@@ -37,11 +37,9 @@ from vllm_ascend.distributed.kv_transfer.kv_p2p.sfa_pd_rd2h.protocol import (  #
     NanoTailDest,
     SendTask,
     SfaPDProducerReqMeta,
+    get_dspark_draft_layers,
     get_external_request_id,
     infer_sfa_component_group_ids,
-)
-from vllm_ascend.distributed.kv_transfer.sparse_kv_offload.nano_topk_slots import (  # noqa: E402
-    NanoTopkSlotAllocator,
 )
 from vllm_ascend.distributed.kv_transfer.kv_p2p.sfa_pd_rd2h.read_thread import (  # noqa: E402
     ConsumerReadState,
@@ -58,6 +56,9 @@ from vllm_ascend.distributed.kv_transfer.kv_p2p.sfa_pd_rd2h.send_thread import (
 from vllm_ascend.distributed.kv_transfer.kv_p2p.sfa_pd_rd2h.worker import (  # noqa: E402
     SFAPDRD2HConsumerWorker,
     SFAPDRD2HProducerWorker,
+)
+from vllm_ascend.distributed.kv_transfer.sparse_kv_offload.nano_topk_slots import (  # noqa: E402
+    NanoTopkSlotAllocator,
 )
 from vllm_ascend.distributed.kv_transfer.utils.memfabric_transfer_engine import (  # noqa: E402
     BACKEND_MEMFABRIC,
@@ -1588,6 +1589,7 @@ def test_consumer_worker_records_nano_slot_for_runner():
     worker = SFAPDRD2HConsumerWorker.__new__(SFAPDRD2HConsumerWorker)
     worker.request_map = {}
     worker._dest_blocks_by_req = {}
+    worker._device_blocks_by_req = {}
     worker._cpu_blocks_by_req = {}
     worker.nano_slots_by_req = {}
     worker._nano_tail_by_req = {}
@@ -1757,3 +1759,110 @@ def test_nano_dense_d2d_skips_chunk_outside_prompt_blocks():
     assert peer == []
     assert lengths == []
 
+
+def test_dspark_group_selection_excludes_draft_when_draft_group_is_first():
+    draft = "draft_model.model.layers.78.self_attn.attn"
+    target = "model.layers.0.self_attn"
+    config = SimpleNamespace(
+        speculative_config=SimpleNamespace(method="dspark"),
+        model_config=SimpleNamespace(get_num_layers=lambda parallel: 78),
+        parallel_config=SimpleNamespace(),
+    )
+    caches = SimpleNamespace(
+        kv_cache_groups=[
+            SimpleNamespace(layer_names=[draft]),
+            SimpleNamespace(layer_names=[target]),
+            SimpleNamespace(layer_names=[target + ".indexer"]),
+        ]
+    )
+    names = get_dspark_draft_layers(config, caches)
+    assert names == {draft}
+    assert infer_sfa_component_group_ids(caches, names) == (1, 2)
+
+
+@pytest.mark.parametrize("tp_rank", range(8))
+def test_dspark_draft_context_reads_all_blocks_on_every_rank(tp_rank):
+    thread = _make_read_thread()
+    thread.tp_rank = tp_rank
+    name = "draft_model.model.layers.78.self_attn.attn"
+    thread._state.layer_metadata[name] = LayerMetadata(
+        [2, 2],
+        [3000, 4000],
+        [10, 20],
+        [2, 2],
+        device_only=True,
+    )
+    thread._state.device_blocks_by_req = {"req-0": {2: [6, 3, 4]}}
+    thread._state.num_blocks = 10
+    thread.engine = MagicMock()
+    thread.engine.batch_transfer_sync_read.return_value = 0
+    metadata = {
+        name: {"base_addrs": [1000, 2000], "block_len": [20, 40], "block_size_scale": [1, 1], "device_only": True}
+    }
+    thread._do_read_batch(name, [("req-0", [1, 2], [], 1, 0)], p_session="P", p_layer_meta=metadata)
+    thread.engine.batch_transfer_sync_read.assert_called_once_with(
+        "P",
+        [3060, 4120, 3080, 4160],
+        [1020, 2040, 1040, 2080],
+        [20, 40, 20, 40],
+    )
+
+
+def test_dspark_context_rejects_short_destination_and_unequal_tp():
+    thread = _make_read_thread()
+    name = "draft_model.model.layers.78.self_attn.attn"
+    thread._state.layer_metadata[name] = LayerMetadata([2, 2], [3000, 4000], [10, 20], [1, 1], device_only=True)
+    thread._state.device_blocks_by_req = {"req-0": {2: [3]}}
+    thread.engine = MagicMock()
+    metadata = {
+        name: {"base_addrs": [1000, 2000], "block_len": [10, 20], "block_size_scale": [1, 1], "device_only": True}
+    }
+    with pytest.raises(ValueError, match="destination blocks"):
+        thread._do_read_batch(name, [("req-0", [1, 2], [], 0, 0)], p_session="P", p_layer_meta=metadata)
+    with pytest.raises(ValueError, match="equal P/D TP"):
+        thread._do_read_batch(name, [], p_session="P", p_layer_meta=metadata, ratio=2)
+    thread.engine.batch_transfer_sync_read.assert_not_called()
+
+
+def test_dspark_send_uses_draft_group_and_defers_done_until_draft_layer():
+    target, draft = "model.layers.77.self_attn", "draft_model.model.layers.78.self_attn.attn"
+    thread = MembPullSendingThread.__new__(MembPullSendingThread)
+    thread._state = ProducerSendState(
+        last_layer_idx=78,
+        p_session="P",
+        main_group_idx=0,
+        indexer_group_idx=0,
+        block_sizes=(16, 32),
+        layer_storage_slots={},
+        layer_metadata={
+            target: LayerMetadata([0, 0], [1000, 2000], [10, 20], [1, 1]),
+            draft: LayerMetadata([1, 1], [3000, 4000], [30, 30], [1, 1], device_only=True),
+        },
+    )
+    thread.last_layer_idx = 78
+    thread._p_save_events = {}
+    thread._pending_reads_by_layer = {}
+    thread._mf_meta_sent_paths = set()
+    thread._send_mf_meta = MagicMock()
+    thread.mark_layer_pending = MagicMock()
+    dealer, encoder = MagicMock(), MagicMock()
+    encoder.encode.side_effect = lambda item: item
+    thread._ensure_dealer = MagicMock(return_value=dealer)
+    req = SimpleNamespace(
+        local_block_ids=[[1, 2], [9]],
+        remote_cache_tokens=0,
+        local_transed_tokens=0,
+        local_computed_tokens=32,
+        chunk_finish=True,
+        remote_host="127.0.0.1",
+        remote_port=1234,
+        group_member_idx=0,
+        tp_ratio=1,
+    )
+    for idx, name in ((77, target), (78, draft)):
+        thread._process_send_task(SendTask({"req-0": req}, layer_idx=idx, layer_name=name), encoder)
+    target_msg, draft_msg = [call.args[0] for call in dealer.send.call_args_list]
+    assert target_msg[3] == [("req-0", [1, 2], [], 0, 0)]
+    assert target_msg[4] == []
+    assert draft_msg[3] == [("req-0", [9], [], 0, 0)]
+    assert draft_msg[4] == ["req-0"]

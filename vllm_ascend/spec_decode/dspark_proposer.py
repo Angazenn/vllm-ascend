@@ -23,8 +23,8 @@ from vllm_ascend.spec_decode.utils import DynamicSpecScheduler
 class AscendDSparkProposer(AscendDflashProposer):
     """DSpark block proposer.
 
-    DSpark uses vLLM's ``mtp`` method in user config, but its execution shape is
-    closer to DFlash: target hidden states prepopulate draft K/V, then one
+    DSpark uses the ``dspark`` speculative method. Like DFlash, target hidden
+    states prepopulate draft K/V, then one
     anchor-first query block emits all speculative tokens.
     """
 
@@ -104,6 +104,23 @@ class AscendDSparkProposer(AscendDflashProposer):
         self._per_group_query_slot_mapping_buffers: dict[int, torch.Tensor] = {}
         self._per_group_context_slot_mapping_buffers: dict[int, torch.Tensor] = {}
         self._context_slot_mapping_buffers: list[torch.Tensor | None] | None = None
+
+    def build_model_inputs_first_pass(self, num_input_tokens, context_slots) -> None:
+        # Context projection writes draft KV before its attention forward. Join
+        # outstanding P-side reads first; the regular attention entry fence is
+        # too late for these writes. This branch is absent on D and colocate.
+        transfer = self.vllm_config.kv_transfer_config
+        if (
+            transfer is not None
+            and transfer.is_kv_producer
+            and transfer.kv_connector_extra_config.get("dspark_draft_kv_transfer", False)
+        ):
+            from vllm.distributed.kv_transfer import get_kv_transfer_group
+
+            connector = get_kv_transfer_group()
+            for name in self.attn_layer_names:
+                connector.wait_for_layer_load(name)
+        super().build_model_inputs_first_pass(num_input_tokens, context_slots)
 
     def _compute_confidence(
         self,

@@ -20,6 +20,74 @@ model families:
 
 Other sparse-attention models have not been validated.
 
+### Experimental DSpark integration
+
+The initial GLM-5.2 integration isolates target sparse MLA caches from the
+DSpark draft caches. Only caches explicitly marked `store_on_host` enter
+the sparse-offload manager. Draft attention retains its own cache geometry
+and device allocation; draft KV bytes count against the device memory budget.
+The target uses the existing runner-owned nano metadata and fused LIM/copy-SFA
+operators. No separate DSpark offload runtime is introduced.
+
+Colocated execution uses `keep_device_kv_cache=true`. Prefill still needs
+the target's full device KV cache, so this configuration does **not** provide
+the memory savings needed for a 1M context. With
+`RedHatAI/GLM-5.2-speculator.dspark-preview`, five smoke requests passed in
+each of eager and `FULL_DECODE_ONLY` target modes, including short, 10K,
+29K, and concurrent mixed-length inputs. Their known answers passed; this
+does not establish benchmark accuracy or acceptance-rate parity.
+
+For a draft that produces seven speculative tokens, the target verifies eight
+query rows. The nano hot budget must therefore be at least `8 * 2048 = 16384`.
+The configuration fragments are:
+
+```json
+{
+  "speculative_config": {
+    "method": "dspark",
+    "model": "<compatible-GLM-5.2-DSpark-checkpoint>",
+    "num_speculative_tokens": 7
+  },
+  "additional_config": {
+    "sparse_kv_offload_config": {
+      "enabled": true,
+      "fused_op_type": "nano",
+      "topk_buffer_size": 16384,
+      "keep_device_kv_cache": true
+    }
+  }
+}
+```
+
+Supply `speculative_config` and `additional_config` through their corresponding
+`vllm serve` options or `LLM` arguments. Keep the dependency setup below.
+The generalized kernels accept up to 14 target query rows; serving requires
+a hot budget aligned to 256 tokens, at least `Q_max * 2048`, and at most 32512.
+The existing MTP3/8192 configuration remains valid.
+
+Validate eager execution first against the same DSpark checkpoint with offload
+disabled, including prompts below and above the hot budget, repeated requests,
+rejection near a block boundary, and mixed request lengths. Then validate
+`FULL_DECODE_ONLY` target replay and padded dummy batches. The DSpark draft
+keeps its existing eager execution path. Operator and metadata tests cover
+Q8 cold fill, replacement, and inactive-to-active replay; these tests alone do
+not establish end-to-end accuracy or acceptance rate.
+
+Experimental PD uses `SfaRemoteD2HConnector` with
+`kv_connector_extra_config.dspark_draft_kv_transfer=true` on **both** P and D.
+Both roles must load the same Qwen3 DSpark checkpoint, use equal target/draft TP
+and equal P/D TP, with PP1 and an eager producer. P projects each chunk's target
+features into its draft K/V; the existing pull protocol transfers those five
+rank-local device caches in addition to target MLA/indexer caches. Completion
+is advertised only after the final draft layer. P waits for outstanding reads
+before overwriting draft context, and D joins HBM visibility before decoding.
+No draft context is moved into the target's shared host pool.
+
+On D, `keep_device_kv_cache=false` keeps target MLA KV on the host while draft
+KV stays resident on device. This initial PD path requires end-to-end runtime
+validation. Capacity for DP2 TP8 and 1M input must account for the selected
+draft's full cache and cannot be inferred from target-only offload capacity.
+
 ## 1. Install Dependencies
 
 The installation steps are grouped by hardware. A3 and 950PR&950DT Products are supported.

@@ -220,7 +220,8 @@ class MembPullSendingThread(threading.Thread):
             return list(all_block_ids[start_block:end_block]), start_block
 
         for req_id, rm in send_task.send_request.items():
-            p_main_block_ids, main_start_block = _blocks_for_chunk(rm, self._state.main_group_idx)
+            main_group_idx = layer_meta.tensor_group_idx[0] if layer_meta.device_only else self._state.main_group_idx
+            p_main_block_ids, main_start_block = _blocks_for_chunk(rm, main_group_idx)
             if layer_has_indexer:
                 p_indexer_block_ids, indexer_start_block = _blocks_for_chunk(rm, self._state.indexer_group_idx)
             else:
@@ -296,6 +297,7 @@ class MembPullSendingThread(threading.Thread):
                 "tensor_group_idx": list(meta.tensor_group_idx),
                 "main_tensor_count": meta.main_tensor_count,
                 "has_indexer": meta.has_indexer,
+                "device_only": meta.device_only,
             }
         dealer.send(
             encoder.encode(

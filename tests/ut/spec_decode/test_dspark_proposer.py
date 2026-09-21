@@ -994,3 +994,27 @@ class TestInitializeAttnBackend(_DSparkProposerTestBase):
         assert set(proposer.draft_attn_groups[0].layer_names) == set(draft_layers)
         assert proposer.draft_attn_groups[0].kv_cache_group_id == 0
         assert proposer._layer_group_idx == [0] * 5
+
+
+@pytest.mark.parametrize("producer", [False, True])
+def test_pd_context_write_waits_for_source_reuse_before_projection(producer):
+    from vllm_ascend.spec_decode.dflash_proposer import AscendDflashProposer
+
+    proposer = AscendDSparkProposer.__new__(AscendDSparkProposer)
+    proposer.vllm_config = SimpleNamespace(
+        kv_transfer_config=SimpleNamespace(
+            is_kv_producer=producer,
+            kv_connector_extra_config={"dspark_draft_kv_transfer": True},
+        )
+    )
+    proposer.attn_layer_names = ["draft.layers.78.attn", "draft.layers.79.attn"]
+    order = []
+    connector = SimpleNamespace(wait_for_layer_load=lambda name: order.append(name))
+    with (
+        patch("vllm.distributed.kv_transfer.get_kv_transfer_group", return_value=connector),
+        patch.object(
+            AscendDflashProposer, "build_model_inputs_first_pass", side_effect=lambda *args: order.append("project")
+        ),
+    ):
+        proposer.build_model_inputs_first_pass(8, None)
+    assert order == (proposer.attn_layer_names if producer else []) + ["project"]

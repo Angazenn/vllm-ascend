@@ -40,6 +40,7 @@ from vllm_ascend.models.glm5next.kv_cache import (
 from vllm_ascend.patch.platform.patch_kv_cache_utils import (
     _get_kv_cache_config_deepseek_v4_main,
 )
+from vllm_ascend.spec_decode.dspark_proposer import AscendDSparkProposer
 from vllm_ascend.utils import AscendDeviceType, vllm_version_is
 from vllm_ascend.worker.model_runner_v1 import NPUModelRunner
 from vllm_ascend.worker.v2.kvpp import KVPPRuntime
@@ -483,6 +484,103 @@ def _ratio_kwargs(ratio: int) -> dict[str, int]:
 
 
 class TestNPUModelRunnerKVCache(unittest.TestCase):
+    def test_dspark_target_host_and_draft_device_cache_allocation(self):
+        from vllm_ascend.worker import model_runner_v1
+
+        target_name, draft_name = "model.attn", "draft.attn"
+        target_spec = AscendMLAAttentionSpec(
+            block_size=128, num_kv_heads=1, head_size=576, dtype=torch.bfloat16, store_on_host=True
+        )
+        draft_spec = FullAttentionSpec(block_size=128, num_kv_heads=8, head_size=64, dtype=torch.bfloat16)
+        specs = {target_name: target_spec, draft_name: draft_spec}
+        # Cover release descriptors and packed-main descriptors, in either order.
+        for legacy in (True, False):
+            for names in ([target_name, draft_name], [draft_name, target_name]):
+                with self.subTest(legacy=legacy, names=names):
+                    runner = self._build_runner()
+                    runner.use_sparse = True
+                    runner.sparse_kv_offload_enabled = True
+                    groups = [
+                        KVCacheGroupSpec(
+                            layer_names=list(specs),
+                            kv_cache_spec=UniformTypeKVCacheSpecs(block_size=128, kv_cache_specs=specs),
+                        )
+                    ]
+                    descriptors = (
+                        [SimpleNamespace(size=2 * specs[name].page_size_bytes, names=[name]) for name in names]
+                        if legacy
+                        else [SimpleNamespace(size=2 * sum(s.page_size_bytes for s in specs.values()), names=names)]
+                    )
+                    config = KVCacheConfig(num_blocks=2, kv_cache_tensors=descriptors, kv_cache_groups=groups)
+                    runner._kv_cache_spec_attn_group_iterator = lambda runner=runner: [
+                        SimpleNamespace(kv_cache_spec=spec, backend=runner.attn_backend, layer_names=[name])
+                        for name, spec in specs.items()
+                    ]
+                    host_raw, host_views = object(), object()
+                    with (
+                        patch.object(model_runner_v1, "vllm_version_is", return_value=legacy),
+                        patch.object(
+                            model_runner_v1, "get_kv_cache_tensor_layers", side_effect=lambda desc: desc.names
+                        ),
+                        patch.object(
+                            runner,
+                            "_get_attention_kv_cache_dims",
+                            side_effect=lambda name, spec: (512, 64) if name == target_name else (64, 64),
+                        ),
+                        patch.object(
+                            model_runner_v1, "allocate_kv_cache_tensors_for_sparse_kv_offload", return_value=host_raw
+                        ) as allocate_host,
+                        patch.object(
+                            model_runner_v1, "reshape_kv_cache_tensors_for_sparse_kv_offload", return_value=host_views
+                        ) as reshape_host,
+                    ):
+                        raw = runner._allocate_kv_cache_tensors(config)
+                        caches = runner._reshape_kv_cache_tensors(config, raw)
+                        if legacy:
+                            # Host/device aliasing must fail regardless of layer order.
+                            config.kv_cache_tensors = [SimpleNamespace(size=1, names=names)]
+                            with self.assertRaisesRegex(ValueError, "private allocations"):
+                                runner._allocate_kv_cache_tensors(config)
+                    allocate_host.assert_called_once()
+                    reshape_host.assert_called_once()
+                    self.assertEqual(allocate_host.call_args.args[:2], (2 * 128 * 512 * 2, 2 * 128 * 64 * 2))
+                    self.assertIs(raw[target_name], host_raw)
+                    self.assertIs(caches[target_name], host_views)
+                    self.assertEqual(len(caches[draft_name]), 2)
+                    self.assertEqual(caches[draft_name][0].shape, (2, 128, 8, 64))
+                    self.assertEqual(caches[draft_name][1].shape, (2, 128, 8, 64))
+
+    @patch("vllm_ascend.worker.model_runner_v1.has_ec_transfer", return_value=False)
+    @patch("vllm_ascend.worker.model_runner_v1.get_layers_from_vllm_config")
+    def test_dspark_draft_mla_preserves_own_device_spec(self, mock_layers, _):
+        runner = self._build_runner()
+        runner.use_sparse = True
+        runner.sparse_kv_offload_enabled = True
+        runner.shared_kv_cache_layers = {}
+        runner.block_size = 128
+        runner.kv_cache_dtype = torch.bfloat16
+        runner.model_config.hf_text_config = SimpleNamespace(kv_lora_rank=512, qk_rope_head_dim=64)
+        runner.drafter = MagicMock(spec=AscendDSparkProposer)
+        runner.drafter.attn_layer_names = ["draft.attn"]
+        modules = {}
+        for name in ("target.attn", "draft.attn"):
+            module = MLAAttention.__new__(MLAAttention)
+            torch.nn.Module.__init__(module)
+            module.impl = SimpleNamespace(fa_quant_layer=False, enable_sparse_sfa_c8=False)
+            module.get_kv_cache_spec = MagicMock(
+                return_value=MLAAttentionSpec(block_size=128, num_kv_heads=1, head_size=320, dtype=torch.bfloat16)
+            )
+            modules[name] = module
+        mock_layers.return_value = modules
+        specs = runner.get_kv_cache_spec()
+        self.assertTrue(specs["target.attn"].store_on_host)
+        self.assertEqual(specs["target.attn"].head_size, 576)
+        self.assertFalse(specs["draft.attn"].store_on_host)
+        self.assertEqual(specs["draft.attn"].head_size, 320)
+        # MTP continues to offload its MLA layer along with the target.
+        runner.drafter = None
+        self.assertTrue(runner.get_kv_cache_spec()["draft.attn"].store_on_host)
+
     def _build_runner(self):
         runner = NPUModelRunner.__new__(NPUModelRunner)
         runner.device = torch.device("cpu")

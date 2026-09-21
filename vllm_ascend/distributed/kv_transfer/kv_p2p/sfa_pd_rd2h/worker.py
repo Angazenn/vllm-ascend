@@ -33,6 +33,7 @@ from vllm_ascend.distributed.kv_transfer.kv_p2p.sfa_pd_rd2h.protocol import (
     LayerMetadata,
     NanoTailDest,
     SendTask,
+    get_dspark_draft_layers,
     get_external_request_id,
     infer_sfa_component_group_ids,
 )
@@ -72,6 +73,14 @@ CONNECTOR_THREAD_STARTUP_TIMEOUT_SECONDS = 10.0
 PD_READ_WAIT_LOG_INTERVAL_SECONDS = 10.0
 MIN_TCP_PORT = 1
 MAX_TCP_PORT = 65535
+
+
+def _device_kv_tensors(cache: Any) -> tuple[torch.Tensor, torch.Tensor]:
+    """Normalize the rank-local GQA cache without copying its storage."""
+    tensors = tuple(cache.unbind(0)) if isinstance(cache, torch.Tensor) else tuple(cache)
+    if len(tensors) != 2 or any(not tensor.is_contiguous() for tensor in tensors):
+        raise ValueError("DSpark PD requires two contiguous rank-local K/V caches")
+    return tensors
 
 
 def _layer_idx(layer_name: str) -> int:
@@ -148,6 +157,7 @@ class SFAPDRD2HConsumerWorker:
         self.request_map: dict[str, str] = {}
         # external_req_id -> (main CPU block ids, indexer HBM block ids).
         self._dest_blocks_by_req: dict[str, tuple[list[int], list[int]]] = {}
+        self._device_blocks_by_req: dict[str, dict[int, list[int]]] = {}
         # Internal req_id -> early-bound nano top-k row used by the runner.
         self.nano_slots_by_req: dict[str, int] = {}
         # external_req_id -> circular-tail destination. Shared with the read thread.
@@ -213,6 +223,7 @@ class SFAPDRD2HConsumerWorker:
                 self.request_map[ext_id] = req_id
                 main_ids = list(getattr(req, "main_block_ids", []) or [])
                 indexer_ids = list(getattr(req, "indexer_block_ids", []) or [])
+                self._device_blocks_by_req[ext_id] = dict(getattr(req, "device_block_ids", {}) or {})
                 self._dest_blocks_by_req[ext_id] = (main_ids, indexer_ids)
                 self._cpu_blocks_by_req[req_id] = len(main_ids)
                 pool_slot = getattr(req, "pool_slot", None)
@@ -270,6 +281,7 @@ class SFAPDRD2HConsumerWorker:
             self._cpu_blocks_by_req.pop(req_id, None)
             self.request_map.pop(ext_id, None)
             self._dest_blocks_by_req.pop(ext_id, None)
+            getattr(self, "_device_blocks_by_req", {}).pop(ext_id, None)
             getattr(self, "nano_slots_by_req", {}).pop(req_id, None)
             getattr(self, "_nano_tail_by_req", {}).pop(ext_id, None)
             self._pending_done.discard(ext_id)
@@ -383,6 +395,7 @@ class SFAPDRD2HConsumerWorker:
             topk_row_tokens=self._topk_row_tokens,
             topk_hot_tokens=self._topk_hot_tokens,
             block_size=self._nano_block_size,
+            device_blocks_by_req=self._device_blocks_by_req,
         )
 
     def _register_memfabric_pull(
@@ -429,7 +442,8 @@ class SFAPDRD2HConsumerWorker:
             self._indexer_tensors.append(indexer_tuple[0])
             self._indexer_scale_tensors.append(indexer_tuple[1] if len(indexer_tuple) > 1 else None)
 
-        main_group_idx, indexer_group_idx = infer_sfa_component_group_ids(self.kv_cache_config)
+        draft_layers = get_dspark_draft_layers(self.vllm_config, self.kv_cache_config)
+        main_group_idx, indexer_group_idx = infer_sfa_component_group_ids(self.kv_cache_config, draft_layers)
         for pool_idx, mname in enumerate(main_names):
             indexer_t = self._indexer_tensors[pool_idx]
             indexer_scale_t = self._indexer_scale_tensors[pool_idx]
@@ -463,6 +477,22 @@ class SFAPDRD2HConsumerWorker:
                 main_tensor_count=2 if cpu_pool is not None else 0,
                 has_indexer=indexer_t is not None,
             )
+
+        # Draft context is rank-local GQA K/V, never part of the shared CPU pool.
+        for gid, group in enumerate(self.kv_cache_config.kv_cache_groups):
+            for name in sorted(draft_layers.intersection(group.layer_names)):
+                tensors = _device_kv_tensors(kv_caches[name])
+                self.layer_metadata[name] = LayerMetadata(
+                    tensor_group_idx=[gid, gid],
+                    kv_caches_base_addr=[tensor.data_ptr() for tensor in tensors],
+                    block_len=[tensor.element_size() * math.prod(tensor.shape[1:]) for tensor in tensors],
+                    block_size_scale=[tensor.shape[0] // num_blocks for tensor in tensors],
+                    device_only=True,
+                )
+                if any(tensor.shape[0] % num_blocks for tensor in tensors):
+                    raise ValueError("DSpark device cache must contain an integral number of external blocks")
+        if draft_layers:
+            logger.info("SFAPD D registered %d device-only DSpark context layers", len(draft_layers))
 
         # Create memfabric engine (no registration)
         self._ensure_engine()
@@ -558,7 +588,10 @@ class SFAPDRD2HProducerWorker:
         self.kv_cache_specs = [group_spec.kv_cache_spec for group_spec in self.kv_cache_config.kv_cache_groups]
         self.block_size = [spec.block_size for spec in self.kv_cache_specs]
         self.num_kv_cache_groups = len(self.kv_cache_specs)
-        self.main_group_idx, self.indexer_group_idx = infer_sfa_component_group_ids(self.kv_cache_config)
+        self._draft_layer_names = get_dspark_draft_layers(vllm_config, self.kv_cache_config)
+        self.main_group_idx, self.indexer_group_idx = infer_sfa_component_group_ids(
+            self.kv_cache_config, self._draft_layer_names
+        )
         self.use_mla = self.vllm_config.model_config.use_mla
         self.layer_metadata: dict[str, LayerMetadata] = {}
         self.stage_layer_names: list[str] = []
@@ -617,6 +650,8 @@ class SFAPDRD2HProducerWorker:
                     decode_tp_size=remote_tp_size,
                     prefill_tp_rank=self.tp_rank,
                 )
+                if getattr(self, "_draft_layer_names", None) and self.tp_size != remote_tp_size:
+                    raise ValueError("DSpark context transfer currently requires equal P/D TP sizes")
                 tp_ratio = self.tp_size // remote_tp_size
                 req_meta.tp_ratio = tp_ratio
                 req_meta.group_member_idx = self.tp_rank % tp_ratio
@@ -729,8 +764,10 @@ class SFAPDRD2HProducerWorker:
                 layer_meta.block_size_scale.append(tensor_num_blocks // num_blocks)
 
         for physical_idx, main_name in sorted(main_by_layer.items()):
-            layer_meta = LayerMetadata([], [], [], [])
-            _append_cache_tensors(layer_meta, kv_caches[main_name], layer2group_ids[main_name])
+            device_only = main_name in getattr(self, "_draft_layer_names", set())
+            layer_meta = LayerMetadata([], [], [], [], device_only=device_only)
+            caches = _device_kv_tensors(kv_caches[main_name]) if device_only else kv_caches[main_name]
+            _append_cache_tensors(layer_meta, caches, layer2group_ids[main_name])
             layer_meta.main_tensor_count = len(layer_meta.kv_caches_base_addr)
             if layer_meta.main_tensor_count != 2:
                 raise RuntimeError(
@@ -897,7 +934,9 @@ class SFAPDRD2HProducerWorker:
         )
         for req_id, req_meta in connector_metadata.requests.items():
             local_block_ids = req_meta.local_block_ids
-            has_main = len(local_block_ids) > self.main_group_idx and bool(local_block_ids[self.main_group_idx])
+            metadata = self.layer_metadata[layer_name]
+            main_gid = metadata.tensor_group_idx[0] if metadata.device_only else self.main_group_idx
+            has_main = len(local_block_ids) > main_gid and bool(local_block_ids[main_gid])
             layer_has_indexer = self.layer_metadata[layer_name].has_indexer
             has_indexer = not layer_has_indexer or (
                 len(local_block_ids) > self.indexer_group_idx and bool(local_block_ids[self.indexer_group_idx])
