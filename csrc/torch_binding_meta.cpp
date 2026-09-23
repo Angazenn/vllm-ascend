@@ -96,7 +96,7 @@ std::tuple<at::Tensor &, at::Tensor &, at::Tensor &, at::Tensor &, at::Tensor &>
     return {q_out0, kv_cache_out0, q_out1, kv_cache_out1, inner_out};
 }
 
-void npu_fused_li_manage_mtp_meta(
+void npu_fused_lightning_indexer_manage_meta(
     const at::Tensor &index_weights,
     const at::Tensor &query_dequant_scale,
     const at::Tensor &query,
@@ -120,7 +120,7 @@ void npu_fused_li_manage_mtp_meta(
     return;
 }
 
-void npu_fused_copy_sfa_mtp_meta(
+void npu_fused_scatter_copy_sparse_flash_attention_meta(
     const at::Tensor &query_rope,
     const at::Tensor &query,
     const at::Tensor &actual_seq_lengths_query,
@@ -2234,8 +2234,8 @@ namespace {
 TORCH_LIBRARY_IMPL_EXPAND(CONCAT(_C, _ascend), Meta, ops) {
     ops.impl("get_physical_device_id", &vllm_ascend::meta::get_physical_device_id_meta);
     //Gemma rmsnorm meta implementation
-    ops.impl("npu_fused_li_manage_mtp", &vllm_ascend::meta::npu_fused_li_manage_mtp_meta);
-    ops.impl("npu_fused_copy_sfa_mtp", &vllm_ascend::meta::npu_fused_copy_sfa_mtp_meta);
+    ops.impl("npu_fused_lightning_indexer_manage", &vllm_ascend::meta::npu_fused_lightning_indexer_manage_meta);
+    ops.impl("npu_fused_scatter_copy_sparse_flash_attention", &vllm_ascend::meta::npu_fused_scatter_copy_sparse_flash_attention_meta);
     ops.impl("npu_fused_li_manage_mtp_c8", &vllm_ascend::meta::npu_fused_li_manage_mtp_c8_meta);
     ops.impl("npu_gemma_rms_norm", &vllm_ascend::meta::npu_gemma_rms_norm_meta);
     // recurrent_gated_delta_rule meta implementation
