@@ -124,6 +124,8 @@ MEMCACHE_UNMATCHED_STATE = -3101
 PARTIAL_LEASE_RETRY_COUNT = 10
 PARTIAL_LEASE_RETRY_INTERVAL_S = 0.001
 SAVE_BATCH_FAILURE_POLL_INTERVAL_S = 1.0
+SAME_REQUEST_LAYERWISE_PUBLISH_TIMEOUT_S = 30.0
+SAME_REQUEST_LAYERWISE_PUBLISH_POLL_INTERVAL_S = 0.01
 
 
 class KVPoolWorker:
@@ -1990,13 +1992,28 @@ class KVPoolWorker:
                 # PERF-TUNE(4): dedup identical keys across concurrent requests.
                 ki_cache = getattr(self, "_step_keyinfo_cache", None) or {}
                 self._step_keyinfo_cache = ki_cache
-                uncached = [k for k in keys if k not in ki_cache]
+                wait_for_same_request_publication = (
+                    self.layerwise_offload
+                    and bool(getattr(self, "prefetch_layer_map", {}))
+                    and request.load_spec.is_same_request_continuation
+                )
+                # Do not reuse per-step negative metadata for this narrow
+                # continuation case: the preceding chunk may still be
+                # publishing its keys on another TP rank.
+                uncached = keys if wait_for_same_request_publication else [k for k in keys if k not in ki_cache]
                 if uncached:
                     fetched_infos = self.m_store.batch_get_key_info(uncached, for_load=True)
                     if len(fetched_infos) != len(uncached):
                         raise RuntimeError(
                             "MemCache key info check returned unexpected number of results: "
                             f"expected={len(uncached)}, actual={len(fetched_infos)}"
+                        )
+                    if wait_for_same_request_publication:
+                        fetched_infos = self._wait_for_same_request_layerwise_keys(
+                            request,
+                            group_id,
+                            uncached,
+                            fetched_infos,
                         )
                     for k, ki in zip(uncached, fetched_infos):
                         ki_cache[k] = ki
@@ -2639,6 +2656,115 @@ class KVPoolWorker:
             return self.token_database.load_mask(request.block_hashes, cached_tokens)
         except AssertionError:
             return None
+
+    @staticmethod
+    def _key_info_is_readable(key_info: Any) -> bool:
+        """Match the GVA validity check used by the layerwise load path."""
+        if key_info is None:
+            return False
+        size = int(key_info.size())
+        gvas = key_info.gva_list()
+        return size > 0 and any(int(gva) > 0 for gva in gvas)
+
+    def _wait_for_same_request_layerwise_keys(
+        self,
+        request: ReqMeta,
+        group_id: int,
+        keys: list[str],
+        key_infos: list[Any],
+    ) -> list[Any]:
+        """Wait for prior-chunk keys of a running request to become readable.
+
+        Only keys identified by the scheduler's same-request continuation
+        provenance are eligible for this bounded wait. Missing and size-zero
+        metadata both mean "not readable yet"; the store API does not expose
+        enough state to distinguish an absent key from an in-progress write.
+        """
+        if len(keys) != len(key_infos):
+            raise RuntimeError(
+                "MemCache key-info response length mismatch while waiting for "
+                f"same-request publication: expected={len(keys)}, actual={len(key_infos)}"
+            )
+
+        info_by_key = dict(zip(keys, key_infos, strict=True))
+        # The initial for_load=True lookup may already have attempted an SSD
+        # rewarm for a positive-size, nonresident entry. Do not repeat that
+        # device allocation while polling the same key.
+        load_attempted = {
+            key
+            for key, info in zip(keys, key_infos, strict=True)
+            if info is not None and int(info.size()) > 0 and not self._key_info_is_readable(info)
+        }
+        pending = list(
+            dict.fromkeys(
+                key for key, info in zip(keys, key_infos, strict=True) if not self._key_info_is_readable(info)
+            )
+        )
+        if not pending:
+            return key_infos
+
+        deadline = time.monotonic() + SAME_REQUEST_LAYERWISE_PUBLISH_TIMEOUT_S
+        wait_started = time.monotonic()
+        while pending:
+            send_thread = getattr(self, "kv_send_thread", None)
+            if send_thread is not None:
+                # This reports failures for this rank's writer. There is no
+                # cross-rank writer-error channel, so other ranks surface
+                # persistent publication failures through the bounded timeout.
+                send_thread.raise_if_failed()
+
+            # Poll metadata without triggering repeated SSD rewarm allocations.
+            # If an entry appears with positive size but no resident GVA, make
+            # one for_load lookup so the backend can perform its normal rewarm.
+            refreshed = self.m_store.batch_get_key_info(pending)
+            if len(refreshed) != len(pending):
+                raise RuntimeError(
+                    "MemCache key-info response length mismatch while waiting for "
+                    f"same-request publication: expected={len(pending)}, actual={len(refreshed)}"
+                )
+
+            still_pending = []
+            for key, info in zip(pending, refreshed, strict=True):
+                if (
+                    info is not None
+                    and int(info.size()) > 0
+                    and not self._key_info_is_readable(info)
+                    and key not in load_attempted
+                ):
+                    load_attempted.add(key)
+                    load_info = self.m_store.batch_get_key_info([key], for_load=True)
+                    if len(load_info) != 1:
+                        raise RuntimeError(
+                            "MemCache key-info response length mismatch while rewarming "
+                            f"same-request key: expected=1, actual={len(load_info)}"
+                        )
+                    info = load_info[0]
+                info_by_key[key] = info
+                if not self._key_info_is_readable(info):
+                    still_pending.append(key)
+            pending = still_pending
+
+            if not pending:
+                elapsed_ms = (time.monotonic() - wait_started) * 1000
+                logger.debug(
+                    "Same-request layerwise KV publication wait completed req=%s group=%d keys=%d elapsed_ms=%.3f",
+                    request.req_id,
+                    group_id,
+                    len(keys),
+                    elapsed_ms,
+                )
+                break
+
+            now = time.monotonic()
+            if now >= deadline:
+                raise TimeoutError(
+                    "Timed out waiting for same-request layerwise KV publication "
+                    f"req={request.req_id} group={group_id} pending_keys={len(pending)} "
+                    f"timeout_s={SAME_REQUEST_LAYERWISE_PUBLISH_TIMEOUT_S}"
+                )
+            time.sleep(min(SAME_REQUEST_LAYERWISE_PUBLISH_POLL_INTERVAL_S, deadline - now))
+
+        return [info_by_key[key] for key in keys]
 
     def _drain_deferred_last_save(self) -> None:
         """PERF-TUNE(2): deferred tail of the previous step's last-layer save."""

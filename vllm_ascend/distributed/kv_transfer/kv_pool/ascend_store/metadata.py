@@ -825,6 +825,10 @@ class LoadSpec:
     kvpool_store_skip_tokens: int | None = None
 
     token_len: int = 0
+    # True only when the scheduler asks this running request to reload its
+    # already-computed prefix from the KV pool. This provenance distinguishes
+    # same-request continuation loads from external prefix-cache hits.
+    is_same_request_continuation: bool = False
 
 
 @dataclass(init=False)

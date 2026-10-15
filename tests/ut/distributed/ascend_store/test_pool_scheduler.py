@@ -773,6 +773,7 @@ class TestKVPoolSchedulerBuildMeta(unittest.TestCase):
         self.assertEqual(load_spec.vllm_cached_tokens, 16)
         self.assertEqual(load_spec.kvpool_cached_tokens, 16)
         self.assertTrue(load_spec.can_load)
+        self.assertTrue(load_spec.is_same_request_continuation)
 
     @patch("vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.pool_scheduler.LookupKeyClient")
     def test_running_decode_preserves_partial_block_with_layer_reuse(self, mock_client_cls):

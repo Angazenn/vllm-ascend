@@ -971,6 +971,7 @@ class KVPoolScheduler:
                 vllm_cached_tokens=num_current_tokens,
                 kvpool_cached_tokens=num_current_tokens,
                 can_load=True,
+                is_same_request_continuation=True,
             )
         return self._build_req_meta(
             request_tracker,

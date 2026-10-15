@@ -2084,6 +2084,124 @@ class TestKVPoolWorkerProcessLayerData(unittest.TestCase):
         self.assertNotIn(201, request.load_block_gvas_by_group_np[0])
         self.assertEqual(worker.get_block_ids_with_load_errors(), set())
 
+    def test_same_request_reuse_load_waits_for_late_publication(self):
+        worker = self._make_gva_worker()
+        worker.prefetch_layer_map = {2: 1}
+        missing = None
+        writing = SimpleNamespace(size=lambda: 0, gva_list=lambda: [0])
+        readable = SimpleNamespace(size=lambda: 64, gva_list=lambda: [201])
+        worker.m_store.batch_get_key_info.side_effect = [
+            [missing],
+            [missing],
+            [writing],
+            [readable],
+            [readable],  # Existing post-lease lookup pins the readable GVA.
+        ]
+        # Missing and size-zero key metadata both remain unknown/unreadable
+        # until the publication completes.
+        worker.m_store.batch_add_lease.return_value = [0]
+        request = self._make_gva_request(
+            load_spec=LoadSpec(16, 16, True, is_same_request_continuation=True),
+        )
+
+        with patch("vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.pool_worker.time.sleep") as sleep:
+            worker._prepare_load_gvas([request])
+
+        self.assertEqual(worker.m_store.batch_get_key_info.call_count, 5)
+        self.assertEqual(request.load_block_gvas_by_group_np[0].tolist(), [201])
+        self.assertEqual(worker.get_block_ids_with_load_errors(), set())
+        self.assertEqual(sleep.call_count, 2)
+
+    def test_same_request_reuse_load_uses_initial_readable_metadata(self):
+        worker = self._make_gva_worker()
+        worker.prefetch_layer_map = {2: 1}
+        readable = SimpleNamespace(size=lambda: 64, gva_list=lambda: [201])
+        worker.m_store.batch_get_key_info.side_effect = [[readable], [readable]]
+        worker.m_store.batch_add_lease.return_value = [0]
+        request = self._make_gva_request(
+            load_spec=LoadSpec(16, 16, True, is_same_request_continuation=True),
+        )
+
+        worker._prepare_load_gvas([request])
+
+        # One initial lookup plus the existing under-lease refresh; the guard
+        # adds no polling lookup when the key is already readable.
+        self.assertEqual(worker.m_store.batch_get_key_info.call_count, 2)
+        self.assertEqual(request.load_block_gvas_by_group_np[0].tolist(), [201])
+
+    def test_same_request_reuse_load_times_out_on_persistent_unreadable_key(self):
+        from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store import (
+            pool_worker as pool_worker_module,
+        )
+
+        worker = self._make_gva_worker()
+        worker.prefetch_layer_map = {2: 1}
+        worker.m_store.batch_get_key_info.return_value = [None]
+        request = self._make_gva_request(
+            load_spec=LoadSpec(16, 16, True, is_same_request_continuation=True),
+        )
+
+        with (
+            patch.object(pool_worker_module, "SAME_REQUEST_LAYERWISE_PUBLISH_TIMEOUT_S", 0.5),
+            patch.object(pool_worker_module.time, "monotonic", side_effect=[0.0, 0.0, 1.0]),
+            self.assertRaisesRegex(TimeoutError, "same-request layerwise KV publication"),
+        ):
+            worker._prepare_load_gvas([request])
+
+        worker.m_store.batch_add_lease.assert_not_called()
+
+    def test_same_request_reuse_load_surfaces_store_error_while_waiting(self):
+        worker = self._make_gva_worker()
+        worker.prefetch_layer_map = {2: 1}
+        worker.m_store.batch_get_key_info.side_effect = [[None], RuntimeError("store unavailable")]
+        request = self._make_gva_request(
+            load_spec=LoadSpec(16, 16, True, is_same_request_continuation=True),
+        )
+
+        with self.assertRaisesRegex(RuntimeError, "store unavailable"):
+            worker._prepare_load_gvas([request])
+
+        worker.m_store.batch_add_lease.assert_not_called()
+
+    def test_same_request_reuse_load_surfaces_local_sender_failure(self):
+        worker = self._make_gva_worker()
+        worker.prefetch_layer_map = {2: 1}
+        worker.m_store.batch_get_key_info.return_value = [None]
+        worker.kv_send_thread = MagicMock()
+        worker.kv_send_thread.raise_if_failed.side_effect = RuntimeError("sender failed")
+        request = self._make_gva_request(
+            load_spec=LoadSpec(16, 16, True, is_same_request_continuation=True),
+        )
+
+        with self.assertRaisesRegex(RuntimeError, "sender failed"):
+            worker._prepare_load_gvas([request])
+
+        worker.kv_send_thread.raise_if_failed.assert_called_once()
+        worker.m_store.batch_get_key_info.assert_called_once()
+        worker.m_store.batch_add_lease.assert_not_called()
+
+    def test_external_prefix_miss_does_not_wait_for_same_request_publication(self):
+        worker = self._make_gva_worker()
+        worker.prefetch_layer_map = {2: 1}
+        worker.m_store.batch_get_key_info.return_value = [None]
+        request = self._make_gva_request(load_spec=LoadSpec(0, 16, True))
+
+        worker._prepare_load_gvas([request])
+
+        worker.m_store.batch_get_key_info.assert_called_once()
+
+    def test_same_request_continuation_without_reuse_keeps_one_shot_lookup(self):
+        worker = self._make_gva_worker()
+        worker.prefetch_layer_map = {}
+        worker.m_store.batch_get_key_info.return_value = [None]
+        request = self._make_gva_request(
+            load_spec=LoadSpec(16, 16, True, is_same_request_continuation=True),
+        )
+
+        worker._prepare_load_gvas([request])
+
+        worker.m_store.batch_get_key_info.assert_called_once()
+
     def test_full_pool_hit_uses_verified_extent(self):
         worker = self._make_gva_worker()
         worker.independent_layers = [0]
