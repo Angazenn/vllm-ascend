@@ -61,6 +61,13 @@ paths = [
 ]
 rules = ["generic-api-key"]
 
+# GBSA tiling dispatch compares symbolic identifiers, not credential values.
+[[allowlists]]
+condition = "AND"
+paths = ['''^csrc/attention/generic_block_sparse_attention/op_kernel/generic_block_sparse_attention\.cpp$''']
+regexTarget = "secret"
+regexes = ['''^GBSA_(FP8|FP16|BF16)_[A-Z0-9_]+$''']
+
 # Allow monkey-patch identifier false positives in patch_qwen3_5.py
 # (generic-api-key matches long class/function names like
 #  Qwen3_5MultiTokenPredictor.forward = qwen3_5_mtp_forward)

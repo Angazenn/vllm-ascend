@@ -1,0 +1,5 @@
+pr: 16981
+entries:
+  - category: feature
+    text: Added Qwen3.8 Flash Next support with QSA sparse attention, hybrid KV caching, and MTP speculative decoding on Model Runner V1.
+    model: Qwen3.8-Flash-Next
