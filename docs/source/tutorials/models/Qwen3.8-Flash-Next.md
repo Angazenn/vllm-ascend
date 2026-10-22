@@ -362,3 +362,20 @@ Please refer to the [Feature Matrix](../../user_guide/support_matrix/feature_mat
 ## 10 FAQ
 
 For common environment, installation, and parameter issues, refer to the [Public FAQs](../../faqs.md).
+
+### KV cache page layout
+
+QSA packs a complete K block followed by its V block into the physical page
+shared with a GDN SSM state. The default logical block size is the smallest
+kernel/compression-aligned size whose combined K+V bytes cover the SSM state;
+for the TP8 BF16 cache configuration this is 384 tokens. K and V are zero-copy
+views with a shared physical block stride, while the SSM state covers the whole
+page. Raw indexer, compressed-key, convolution, and PLE caches retain their own
+slabs. GBSA maps each logical block to 128-token pages without making the K/V
+cache contiguous.
+
+The pool reserves one slot per QSA layer, including MTP (13 slots for this
+model). The 36 GDN layers use three independent cache groups of 13, 13, and 10
+layers. Each group reuses slot ordinals starting at zero; separate scheduler
+block tables keep their live physical block IDs disjoint. PLE uses its own
+group over the same pool.

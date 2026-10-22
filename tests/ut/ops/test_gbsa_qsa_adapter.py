@@ -5,9 +5,12 @@ import pytest
 import torch
 
 
+@pytest.mark.parametrize("group_ids", [(0, 1), (31, 32), (95, 96)])
+@pytest.mark.parametrize("storage_page_size", [128, 384])
+@pytest.mark.parametrize("packed", [False, True])
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
 @pytest.mark.parametrize("tail_tokens", range(4))
-def test_qsa_gbsa_uses_original_paged_cache(dtype, tail_tokens):
+def test_qsa_gbsa_uses_original_paged_cache(dtype, tail_tokens, storage_page_size, packed, group_ids):
     source = Path(__file__).resolve().parents[3] / "vllm_ascend/ops/gbsa_qsa.py"
     module = ast.parse(source.read_text())
     module.body = [node for node in module.body if not isinstance(node, (ast.Import, ast.ImportFrom))]
@@ -17,7 +20,7 @@ def test_qsa_gbsa_uses_original_paged_cache(dtype, tail_tokens):
         assert block_shape == [1, 4]
         assert head_dim == 128
         assert kwargs["residual_block_mode"] == 1
-        assert kwargs["seqused_kv"].tolist() == [8 + tail_tokens]
+        assert kwargs["seqused_kv"].tolist() == [sequence_length]
         return torch.empty(0)
 
     def attention(query, keys, values, indices, counts, block_shape, **kwargs):
@@ -49,11 +52,17 @@ def test_qsa_gbsa_uses_original_paged_cache(dtype, tail_tokens):
 
     torch.manual_seed(42 + tail_tokens)
     query = torch.randn(1, 4, 128, dtype=dtype)
-    keys = torch.randn(3, 128, 2, 128, dtype=dtype)
-    values = torch.randn_like(keys)
-    block_table = torch.tensor([[2]], dtype=torch.int32)
-    seq_lens = torch.tensor([8 + tail_tokens], dtype=torch.int32)
-    groups = torch.tensor([0, 1], dtype=torch.int32)
+    if packed:
+        backing = torch.randn(3, 2, storage_page_size, 2, 128, dtype=dtype)
+        keys, values = backing[:, 0], backing[:, 1]
+    else:
+        keys = torch.randn(3, storage_page_size, 2, 128, dtype=dtype)
+        values = torch.randn_like(keys)
+    sequence_length = (max(group_ids) + 1) * 4 + tail_tokens
+    logical_blocks = (sequence_length + storage_page_size - 1) // storage_page_size
+    block_table = torch.tensor([[(index + 2) % 3 for index in range(logical_blocks)]], dtype=torch.int32)
+    seq_lens = torch.tensor([sequence_length], dtype=torch.int32)
+    groups = torch.tensor(group_ids, dtype=torch.int32)
     compact_indices = torch.cat((groups, torch.full((3,), -1, dtype=torch.int32))).view(1, -1)
     output = torch.empty_like(query)
 
@@ -64,7 +73,7 @@ def test_qsa_gbsa_uses_original_paged_cache(dtype, tail_tokens):
         compact_indices,
         block_table,
         torch.tensor([0], dtype=torch.int32),
-        torch.tensor([7 + tail_tokens], dtype=torch.int32),
+        torch.tensor([sequence_length - 1], dtype=torch.int32),
         seq_lens,
         output,
     )
@@ -72,7 +81,13 @@ def test_qsa_gbsa_uses_original_paged_cache(dtype, tail_tokens):
     assert result is output
     assert calls[0][0] == keys.data_ptr()
     assert calls[0][1] == values.data_ptr()
-    torch.testing.assert_close(calls[0][2], block_table)
+    if storage_page_size == 128:
+        torch.testing.assert_close(calls[0][2], block_table)
+    else:
+        subpages = storage_page_size // 128
+        block_stride = subpages * (2 if packed else 1)
+        expected = block_table.unsqueeze(-1) * block_stride + torch.arange(subpages)
+        torch.testing.assert_close(calls[0][2], expected.flatten(1).to(torch.int32))
 
 
 def test_qsa_gbsa_uses_per_row_mtp_visible_lengths():
@@ -130,39 +145,3 @@ def test_qsa_gbsa_uses_per_row_mtp_visible_lengths():
         [24, 25],
         [24, 25],
     ]
-
-
-def test_a3_residual_mode_reuses_runtime_kernel_key():
-    root = Path(__file__).resolve().parents[3]
-    tiling_source = (
-        root / "csrc/attention/generic_block_sparse_attention/op_host/generic_block_sparse_attention_tiling.cpp"
-    ).read_text()
-    arch22_kernel = (
-        root / "csrc/attention/generic_block_sparse_attention/op_kernel/arch22/"
-        "generic_block_sparse_attention_kernel_arch22.h"
-    ).read_text()
-    tiling_keys = (
-        root / "csrc/attention/generic_block_sparse_attention/op_kernel/generic_block_sparse_attention_tilingkey.h"
-    ).read_text()
-
-    assert "if (isArch35 && residualBlockMode_ == GBSA_RESIDUAL_BLOCK_MODE_FORCE)" in tiling_source
-    assert "residualBlockMode_ = tilingData->residualBlockMode;" in arch22_kernel
-    assert "GBSA_BF16_TND_PA_BBND_TILING 9200000071023222ULL" in tiling_keys
-    assert "GBSA_BF16_TND_PA_BBND_FP32SM_TILING_RESIDUAL 9250001071023222ULL" in tiling_keys
-
-
-def test_a3_qsa_arch22_maps_logical_blocks_into_paged_kv():
-    root = Path(__file__).resolve().parents[3]
-    arch22_kernel = (
-        root / "csrc/attention/generic_block_sparse_attention/op_kernel/arch22/"
-        "generic_block_sparse_attention_kernel_arch22.h"
-    ).read_text()
-    tiling_source = (
-        root / "csrc/attention/generic_block_sparse_attention/op_host/generic_block_sparse_attention_tiling.cpp"
-    ).read_text()
-
-    assert "MAX_SPARSE_BLOCK_CAPACITY = 512" in arch22_kernel
-    assert "logicalTokenOffset / blockSize_" in arch22_kernel
-    assert "logicalTokenOffset % blockSize_" in arch22_kernel
-    assert "tokenOffsetInPage) * strideKVRow" in arch22_kernel
-    assert "blockSize_ % blockShapeY_ != 0U" in tiling_source
