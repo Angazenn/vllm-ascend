@@ -845,6 +845,23 @@ _kv_cache_planning.get_kv_cache_config_from_groups = _ascend_get_kv_cache_config
 _kv_cache_planning._max_memory_usage_bytes_from_groups = _ascend_max_memory_usage_bytes_from_groups
 _kv_cache_planning._pool_bytes_per_block = _ascend_pool_bytes_per_block
 
+# vLLM #42309 asks the platform builder for this divisor directly before it
+# calls the patched module-level placement function. Qwen4 has several device
+# backings, so the default one-block probe cannot infer a single backing size.
+# Keep the builder and placement paths on the same Ascend-specific accounting.
+if hasattr(_kv_cache_planning, "DefaultKVCacheConfigBuilder"):
+
+    def _ascend_builder_pool_bytes_per_block(
+        self: Any,
+        vllm_config: VllmConfig,
+        kv_cache_groups: list[KVCacheGroupSpec],
+    ) -> int:
+        return _ascend_pool_bytes_per_block(vllm_config, kv_cache_groups)
+
+    _kv_cache_planning.DefaultKVCacheConfigBuilder._get_pool_bytes_per_block = (
+        _ascend_builder_pool_bytes_per_block
+    )
+
 # Also patch the reference used by engine/core.py which imports the function directly.
 import vllm.v1.engine.core  # noqa: E402
 
