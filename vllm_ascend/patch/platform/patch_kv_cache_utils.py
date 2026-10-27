@@ -4,7 +4,7 @@
 import math
 from collections import defaultdict
 from dataclasses import replace
-from typing import Any
+from typing import Any, cast
 
 import vllm.v1.core.kv_cache_utils
 from vllm.config import VllmConfig
@@ -856,7 +856,10 @@ if hasattr(_kv_cache_planning, "DefaultKVCacheConfigBuilder"):
         vllm_config: VllmConfig,
         kv_cache_groups: list[KVCacheGroupSpec],
     ) -> int:
-        return _ascend_pool_bytes_per_block(vllm_config, kv_cache_groups)
+        pool_bytes_per_block = cast(Any, _ascend_pool_bytes_per_block)
+        if vllm_version_is("0.31.0"):
+            return pool_bytes_per_block(kv_cache_groups)
+        return pool_bytes_per_block(vllm_config, kv_cache_groups)
 
     _kv_cache_planning.DefaultKVCacheConfigBuilder._get_pool_bytes_per_block = _ascend_builder_pool_bytes_per_block
 
