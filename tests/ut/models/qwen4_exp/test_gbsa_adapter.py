@@ -7,20 +7,54 @@ import pytest
 import torch
 
 
-def _load_cache_views():
-    import math
+def _make_kernel_pair_views(
+    backing,
+    *,
+    dtype,
+    num_blocks,
+    manager_block_size,
+    kernel_block_size,
+    num_kv_heads,
+    head_size,
+    head_size_v,
+    storage_offset,
+    block_stride,
+):
+    from types import SimpleNamespace
 
-    source = Path(__file__).resolve().parents[4] / "vllm_ascend/models/qwen4_exp/cache_config.py"
-    module = ast.parse(source.read_text())
-    names = {"make_slab_view", "make_qsa_kernel_page_cache"}
-    module.body = [node for node in module.body if isinstance(node, ast.FunctionDef) and node.name in names]
-    namespace = {
-        "torch": torch,
-        "math": math,
-        "get_dtype_size": lambda dtype: torch.empty((), dtype=dtype).element_size(),
-    }
-    exec(compile(module, str(source), "exec"), namespace)
-    return namespace
+    from vllm.v1.kv_cache_interface import FullAttentionSpec, KVCacheTensor, create_kv_cache_views
+    from vllm.v1.kv_cache_layout import KVCacheLayout
+
+    spec = FullAttentionSpec(
+        block_size=manager_block_size,
+        num_kv_heads=num_kv_heads,
+        head_size=head_size,
+        head_size_v=head_size_v,
+        dtype=dtype,
+        num_head_slots=2,
+        state_content_bytes=num_kv_heads * head_size * backing.view(dtype).element_size(),
+    )
+    descriptor = KVCacheTensor(
+        size=backing.numel(),
+        layers=["attention"],
+        layer_stride=backing.numel(),
+        block_stride=block_stride,
+        offset=storage_offset,
+    )
+    (logical,) = create_kv_cache_views(backing, spec, num_blocks, KVCacheLayout.BLHNC, descriptor, kernel_block_size)
+    # Exercise the production backend binder without importing NPU operators.
+    source = Path(__file__).resolve().parents[4] / "vllm_ascend/models/qwen4_exp/qsa.py"
+    owner = next(
+        node
+        for node in ast.parse(source.read_text()).body
+        if isinstance(node, ast.ClassDef) and node.name == "AscendQwen4ExpQSAAttention"
+    )
+    binder = next(node for node in owner.body if isinstance(node, ast.FunctionDef) and node.name == "bind_kv_cache")
+    namespace = {"torch": torch, "GBSA_PAGE_SIZE": 128}
+    exec(compile(ast.Module(body=[binder], type_ignores=[]), str(source), "exec"), namespace)
+    layer = SimpleNamespace(num_kv_heads=num_kv_heads, head_dim=head_size)
+    namespace["bind_kv_cache"](layer, logical)
+    return layer.kv_cache
 
 
 @pytest.mark.parametrize("group_ids", [(0, 1), (31, 32), (95, 96)])
@@ -86,7 +120,7 @@ def test_qsa_gbsa_uses_kernel_paged_cache(dtype, tail_tokens, storage_page_size,
     page_bytes = 128 * 2 * 128 * dtype_size
     block_stride = subpages
     backing = torch.zeros(3 * block_stride * 2 * page_bytes, dtype=torch.int8)
-    input_keys, input_values = _load_cache_views()["make_qsa_kernel_page_cache"](
+    input_keys, input_values = _make_kernel_pair_views(
         backing,
         dtype=dtype,
         num_blocks=3,
@@ -210,13 +244,12 @@ def test_gbsa_uses_cann_transformer_op_api_without_bundled_sources():
 @pytest.mark.parametrize("manager_block_size", [128, 384, 896])
 @pytest.mark.parametrize("head_size", [64, 128])
 def test_kernel_page_views_preserve_packed_addresses(manager_block_size, head_size):
-    namespace = _load_cache_views()
     kernel_size, heads, num_blocks = 128, 1, 3
     page_bytes = kernel_size * heads * head_size * 2
     manager_bytes = manager_block_size * heads * head_size * 2
     block_stride = 2 * manager_bytes
     backing = torch.zeros(num_blocks * block_stride + 32, dtype=torch.int8)
-    cache = namespace["make_qsa_kernel_page_cache"](
+    cache = _make_kernel_pair_views(
         backing,
         dtype=torch.float16,
         num_blocks=num_blocks,
@@ -284,7 +317,7 @@ def test_whole_page_kernel_pairs_reuse_mrv2_ids(num_kv_heads):
     page_bytes = kernel_size * num_kv_heads * head_size * 2
     manager_bytes = 7 * 2 * page_bytes
     backing = torch.zeros(num_blocks * manager_bytes, dtype=torch.int8)
-    keys, values = _load_cache_views()["make_qsa_kernel_page_cache"](
+    keys, values = _make_kernel_pair_views(
         backing,
         dtype=torch.bfloat16,
         num_blocks=num_blocks,

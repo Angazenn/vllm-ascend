@@ -456,6 +456,7 @@ class AscendQSABackend(upstream_qsa.Qwen4ExpQSAFlashAttentionBackend):
     # vLLM pool, while each individual page remains dense.
     uses_descriptor_cache_view = True
     uses_qsa_page_major_kv_view = True
+    uses_upstream_cache_views = True
 
     @staticmethod
     def get_name() -> str:
@@ -485,7 +486,8 @@ class AscendQSABackend(upstream_qsa.Qwen4ExpQSAFlashAttentionBackend):
 
     @classmethod
     def supported_kv_cache_layouts(cls) -> tuple[KVCacheLayout, ...]:
-        return (KVCacheLayout.BLNHC, KVCacheLayout.BLHNC)
+        # H identifies the whole K/V slots, so each kernel page is K then V.
+        return (KVCacheLayout.BLHNC,)
 
 
 # The upstream owner resolves these names from its module globals during
@@ -501,6 +503,7 @@ upstream_qsa.Qwen4ExpQSAFlashAttentionBackend = AscendQSABackend
 # Their physical block stride is honored by the runner, so no compact copy is
 # required before LightningIndexer or the Triton QSA selector consumes them.
 qsa_cache.QSAStateBackend.uses_descriptor_cache_view = True
+qsa_cache.QSAStateBackend.uses_upstream_cache_views = True
 
 
 # qsa_cache selects its Triton metadata builder at import time. The upstream
@@ -573,8 +576,21 @@ class AscendQwen4ExpQSAAttention(upstream_qsa.Qwen4ExpQSAAttention):
             has_gate=True,
         )
 
-    def bind_kv_cache(self, kv_cache: QSAKVCache) -> None:
-        self.kv_cache = kv_cache
+    def bind_kv_cache(self, kv_cache: torch.Tensor) -> None:
+        # Upstream supplies [kernel pages, K/V slots, tokens, packed heads].
+        # BLHNC makes each slot dense and preserves the planner's K128/V128 pairs.
+        blocks, slots, tokens, channels = kv_cache.shape
+        if (
+            slots != 2
+            or tokens != GBSA_PAGE_SIZE
+            or channels != self.num_kv_heads * self.head_dim
+            or kv_cache.stride(1) != tokens * channels
+            or kv_cache.stride(2) != channels
+        ):
+            raise ValueError("QSA cache must contain two dense 128-token K/V slots")
+        self.kv_cache = tuple(
+            part.view(blocks, tokens, self.num_kv_heads, self.head_dim) for part in kv_cache.unbind(1)
+        )
 
     def _run_qsa(
         self,

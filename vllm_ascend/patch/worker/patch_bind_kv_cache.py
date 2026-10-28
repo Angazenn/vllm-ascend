@@ -7,6 +7,9 @@ from vllm.v1.kv_cache_interface import KVCacheGroupSpec
 from vllm.v1.worker.utils import defaultdict, extract_layer_index
 
 from vllm_ascend.attention.dsa_v41 import DeepseekV41CacheLayer
+from vllm_ascend.core.kv_cache_views import uses_upstream_cache_views
+
+_upstream_bind_kv_cache_to_layers = utils.bind_kv_cache_to_layers
 
 
 # Without this patch, it will raise an exception when initialize kv_cache.
@@ -51,6 +54,11 @@ def bind_kv_cache(
             ordered_layer_names.append(layer_name)
 
     # Bind kv_caches to forward context
+    if all(isinstance(cache, torch.Tensor) for cache in kv_caches.values()) and uses_upstream_cache_views(
+        forward_context[name] for name in kv_caches
+    ):
+        _upstream_bind_kv_cache_to_layers(kv_caches, forward_context, num_attn_module, kv_cache_groups)
+        return
     for layer_name, kv_cache in kv_caches.items():
         forward_context[layer_name].kv_cache = kv_cache
     # vLLM #52506 adds ReplaySSM ring trackers on main.
@@ -70,10 +78,15 @@ def bind_kv_cache_to_layers(
 
     Upstream init_kv_cache switched from bind_kv_cache to
     bind_kv_cache_to_layers on main, which calls each layer's bind_kv_cache
-    with the standardized single-tensor layout (vLLM #51718). Ascend
-    allocates per-layer (k, v) tuples, so assign the raw allocation directly,
-    matching the Ascend bind_kv_cache patch above.
+    with the standardized single-tensor layout (vLLM #51718). Plans opting
+    into that contract use upstream layer binding. Legacy Ascend plans already
+    contain materialized K/V or state tuples and retain direct assignment.
     """
+    if all(isinstance(cache, torch.Tensor) for cache in kv_caches.values()) and uses_upstream_cache_views(
+        forward_context[name] for name in kv_caches
+    ):
+        _upstream_bind_kv_cache_to_layers(kv_caches, forward_context, num_attn_module, kv_cache_groups)
+        return
     for layer_name, kv_cache in kv_caches.items():
         layer = forward_context[layer_name]
         if isinstance(layer, DeepseekV41CacheLayer):

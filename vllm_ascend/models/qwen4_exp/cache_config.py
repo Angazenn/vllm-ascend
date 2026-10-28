@@ -8,7 +8,6 @@ from dataclasses import dataclass
 from typing import Final
 
 import regex as re
-import torch
 from vllm.config import VllmConfig
 from vllm.logger import logger
 from vllm.utils.math_utils import cdiv, round_up
@@ -341,75 +340,6 @@ def build_qwen4_kv_cache_layout(
     return layout
 
 
-def make_slab_view(
-    backing: torch.Tensor,
-    *,
-    dtype: torch.dtype,
-    num_blocks: int,
-    item_shape: tuple[int, ...],
-    storage_offset: int,
-    block_stride: int | None = None,
-) -> torch.Tensor:
-    """Create dense block contents with an explicit physical byte stride."""
-
-    dtype_size = get_dtype_size(dtype)
-    if storage_offset % dtype_size:
-        raise ValueError("Slab cache offset must align to the view dtype")
-    item_bytes = math.prod(item_shape) * dtype_size
-    block_stride = item_bytes if block_stride is None else block_stride
-    if block_stride < item_bytes or block_stride % dtype_size:
-        raise ValueError("Slab block stride must fit one item and align to its dtype")
-    required_bytes = (num_blocks - 1) * block_stride + item_bytes
-    if storage_offset + required_bytes > backing.numel():
-        raise ValueError("Slab cache view exceeds its backing allocation")
-    inner_strides = tuple(math.prod(item_shape[index + 1 :]) for index in range(len(item_shape)))
-    result = (
-        backing[storage_offset : storage_offset + required_bytes]
-        .view(dtype)
-        .as_strided((num_blocks, *item_shape), (block_stride // dtype_size, *inner_strides))
-    )
-    return result
-
-
-def make_qsa_kernel_page_cache(
-    backing: torch.Tensor,
-    *,
-    dtype: torch.dtype,
-    num_blocks: int,
-    manager_block_size: int,
-    kernel_block_size: int,
-    num_kv_heads: int,
-    head_size: int,
-    head_size_v: int,
-    storage_offset: int,
-    block_stride: int,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    """Interleave K/V per kernel page and expose two strided tensor views."""
-    dtype_size = get_dtype_size(dtype)
-    page_bytes = kernel_block_size * num_kv_heads * head_size * dtype_size
-    pair_bytes = 2 * page_bytes
-    if manager_block_size % kernel_block_size or block_stride % pair_bytes or head_size != head_size_v:
-        raise ValueError("QSA kernel-page pools require equal K/V widths and whole-page strides")
-    kernel_pages = manager_block_size // kernel_block_size
-    # vLLM grows manager blocks to fit the full Mamba page. The resulting
-    # K/V pairs must be contiguous so its block IDs and slots need no remap.
-    if block_stride != kernel_pages * pair_bytes:
-        raise ValueError("QSA manager page must match its aligned kernel K/V pairs")
-    physical_page_count = num_blocks * kernel_pages
-    key, value = (
-        make_slab_view(
-            backing,
-            dtype=dtype,
-            num_blocks=physical_page_count,
-            item_shape=(kernel_block_size, num_kv_heads, width),
-            storage_offset=storage_offset + offset,
-            block_stride=pair_bytes,
-        )
-        for width, offset in ((head_size, 0), (head_size_v, page_bytes))
-    )
-    return key, value
-
-
 def _prepare_qsa_composite_groups(
     kv_cache_spec: dict[str, KVCacheSpec],
 ) -> tuple[set[str], set[str], set[str]] | None:
@@ -593,6 +523,20 @@ def _private_page_bytes(owner: CacheOwner) -> int:
     return owner.spec.real_page_size_bytes if owner.role == PLE else owner.spec.page_size_bytes
 
 
+def _private_bank_placements(layout: Qwen4KVCacheLayout) -> tuple[list[tuple[CacheOwner, int]], int]:
+    """Append dense banks with dtype alignment, without changing block strides."""
+    offset = layout.slot_count * layout.slot_backing_size
+    placements = []
+    for owner in layout.owners:
+        if owner.role not in (HIDDEN, PLE):
+            continue
+        dtypes = owner.spec.dtypes if isinstance(owner.spec, MambaSpec) else (owner.spec.dtype,)
+        offset = round_up(offset, math.lcm(*(get_dtype_size(dtype) for dtype in dtypes)))
+        placements.append((owner, offset))
+        offset += _private_page_bytes(owner) * layout.num_blocks
+    return placements, offset
+
+
 def get_qwen4_exp_pool_bytes_per_block(
     kv_cache_groups: list[KVCacheGroupSpec],
 ) -> int | None:
@@ -600,8 +544,7 @@ def get_qwen4_exp_pool_bytes_per_block(
     layout = build_qwen4_kv_cache_layout(kv_cache_groups, num_blocks=1)
     if layout is None:
         return None
-    private_bytes = sum(_private_page_bytes(owner) for owner in layout.owners if owner.role in (HIDDEN, PLE))
-    return layout.slot_count * layout.slot_backing_size + private_bytes
+    return _private_bank_placements(layout)[1]
 
 
 def get_qwen4_exp_max_memory_usage(
@@ -647,12 +590,9 @@ def get_qwen4_exp_kv_cache_config(
 ) -> KVCacheConfig | None:
     """Plan state slabs and block-packed K/V-or-SSM pages per ordinal slot.
 
-    The main descriptor API cannot express that one logical QSA/GDN owner has
-    two disjoint physical regions.  Descriptors therefore publish the anchor
-    region and shared backing geometry; the Ascend runner reconstructs every
-    role from the same capability-derived layout.  Different cache groups
-    deliberately alias the same allocation because a physical block ID is
-    owned by only one group at a time.
+    All descriptors address one allocation. QSA/GDN groups overlay its shared
+    region; PLE and hidden use disjoint dense regions after it. Upstream creates
+    logical page views, and each layer binds its own cache components.
     """
     probe = build_qwen4_kv_cache_layout(
         kv_cache_groups,
@@ -672,9 +612,7 @@ def get_qwen4_exp_kv_cache_config(
             num_blocks=candidate,
         )
         assert candidate_layout is not None
-        required = (
-            candidate_layout.slot_count * candidate_layout.slot_backing_size + private_bytes_per_block * candidate
-        )
+        required = _private_bank_placements(candidate_layout)[1]
         if required <= available_memory:
             break
         candidate -= 1
@@ -717,16 +655,22 @@ def get_qwen4_exp_kv_cache_config(
                     offset=region.offset + owners[0].slot * layout.slot_backing_size,
                 )
             )
-    tensors.extend(
-        KVCacheTensor(
-            size=_private_page_bytes(owner) * num_blocks,
-            layers=[owner.layer_name],
-            layer_stride=_private_page_bytes(owner) * num_blocks,
-            block_stride=_private_page_bytes(owner),
-            offset=0,
+    # Dense banks stay private by address range, while sharing the allocation.
+    # Their block strides and inner shapes are unchanged by a nonzero base.
+    private_placements, total_size = _private_bank_placements(layout)
+    for owner, private_offset in private_placements:
+        page_bytes = _private_page_bytes(owner)
+        tensors.append(
+            KVCacheTensor(
+                size=0,
+                layers=[owner.layer_name],
+                layer_stride=page_bytes * num_blocks,
+                block_stride=page_bytes,
+                offset=private_offset,
+            )
         )
-        for owner in private_owners
-    )
+    for descriptor in tensors:
+        descriptor.size = total_size
 
     return KVCacheConfig(
         num_blocks=num_blocks,
