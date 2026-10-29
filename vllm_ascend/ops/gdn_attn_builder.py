@@ -13,6 +13,12 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+"""[Role] Build Ascend GDN metadata and expose recurrent cache state views.
+[Invariants] State components retain their page offsets and dtypes.
+[Timeouts & Locks] No waits or locks; metadata follows the runner lifecycle.
+[Side-Effect Policy] Cache views alias storage; metadata preparation owns its buffers.
+"""
+
 from dataclasses import dataclass
 
 import torch
@@ -30,8 +36,9 @@ from vllm.v1.attention.backends.utils import (
     mamba_get_block_table_tensor,
     split_decodes_and_prefills,
 )
-from vllm.v1.kv_cache_interface import AttentionSpec
+from vllm.v1.kv_cache_interface import AttentionSpec, MambaSpec
 
+from vllm_ascend.attention.kv_cache_views import mamba_cache_views
 from vllm_ascend.ops.triton.fla.utils import (
     prepare_chunk_indices,
     prepare_chunk_offsets,
@@ -1003,6 +1010,11 @@ class AscendGDNAttentionMetadataBuilder(GDNAttentionMetadataBuilder):
 
 
 class AscendGDNAttentionBackend(GDNAttentionBackend):
+    @staticmethod
+    def get_kernel_cache_views(raw_cache: torch.Tensor, spec: MambaSpec) -> list[torch.Tensor]:
+        """Expose Qwen3.5 conv/SSM states at their existing per-page offsets."""
+        return mamba_cache_views(raw_cache, spec.shapes, spec.dtypes, spec.page_size_bytes)
+
     @staticmethod
     def get_builder_cls() -> type[AscendGDNAttentionMetadataBuilder]:
         return AscendGDNAttentionMetadataBuilder

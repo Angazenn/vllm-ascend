@@ -54,6 +54,7 @@ from vllm_ascend.device.hardware_profile import HardwareCapability, get_hardware
 from vllm_ascend.models.deepseek_v4 import compressor as deepseek_v4_compressor
 from vllm_ascend.models.deepseek_v4 import indexer as deepseek_v4_indexer
 from vllm_ascend.models.deepseek_v4 import model as deepseek_v4_model
+from vllm_ascend.ops.gdn_attn_builder import AscendGDNAttentionBackend
 from vllm_ascend.patch.platform.patch_kv_cache_utils import (
     _get_kv_cache_config_deepseek_v4_main,
 )
@@ -351,7 +352,9 @@ def test_hybrid_allocator_keeps_shared_backing_with_pa_configured(monkeypatch, p
     assert raw_caches[attn_name].data_ptr() == raw_caches[mamba_name].data_ptr()
 
 
-def test_hybrid_attention_layout_preserves_padding(monkeypatch):
+@pytest.mark.parametrize("model_type", ["qwen3_next", "qwen3_5_text", "qwen3_5_moe_text"])
+@pytest.mark.parametrize("layout", ["LBNHC", "LBHNC"])
+def test_hybrid_attention_layout_preserves_padding(monkeypatch, model_type, layout):
     name = "model.layers.0.self_attn.attn"
     spec = FullAttentionSpec(block_size=2, num_kv_heads=1, head_size=4, dtype=torch.float16, page_size_padded=64)
     config = KVCacheConfig(
@@ -361,11 +364,21 @@ def test_hybrid_attention_layout_preserves_padding(monkeypatch):
     )
     group = SimpleNamespace(kv_cache_group_id=0, kv_cache_spec=spec, backend=AscendAttentionBackend, layer_names=[name])
     vllm_config = SimpleNamespace(
-        model_config=SimpleNamespace(hf_config=SimpleNamespace()),
+        model_config=SimpleNamespace(
+            hf_config=SimpleNamespace(), hf_text_config=SimpleNamespace(model_type=model_type)
+        ),
         cache_config=SimpleNamespace(cache_dtype="auto"),
     )
     monkeypatch.setattr(attn_utils, "get_current_vllm_config", lambda: vllm_config)
     monkeypatch.setattr(attn_utils, "enable_sfa", lambda *_args: False)
+    monkeypatch.setattr("vllm.envs.VLLM_KV_CACHE_LAYOUT", layout)
+    view_hook = MagicMock(wraps=AscendAttentionBackend.get_kernel_cache_views)
+    monkeypatch.setattr(AscendAttentionBackend, "get_kernel_cache_views", view_hook)
+    if model_type != "qwen3_next":
+        monkeypatch.setattr(
+            AscendAttentionBackend, "get_kv_cache_shape",
+            MagicMock(side_effect=AssertionError("Qwen3.5 must derive views from the spec")),
+        )
     raw = torch.full((3 * spec.page_size_bytes,), 7, dtype=torch.int8)
     before = raw.clone()
 
@@ -380,6 +393,9 @@ def test_hybrid_attention_layout_preserves_padding(monkeypatch):
         )
 
     key, value = reshape()[name]
+    assert view_hook.call_count == (0 if model_type == "qwen3_next" else 1)
+    expected_shape = (3, 1, 2, 4) if layout == "LBHNC" else (3, 2, 1, 4)
+    assert key.shape == value.shape == expected_shape
     assert not key.is_contiguous() and not value.is_contiguous()
     key[1].fill_(3)
     value[1].fill_(5)
@@ -462,6 +478,36 @@ def test_mrv2_mamba_views_skip_physical_page_padding():
     assert torch.count_nonzero(raw[64:72]) == 0
     assert torch.count_nonzero(raw[72:80]) > 0
     assert torch.count_nonzero(raw[80:]) == 0
+
+
+@pytest.mark.parametrize("model_type", ["qwen3_5_text", "qwen3_5_moe_text"])
+def test_qwen3_5_mamba_backend_views_preserve_v2_hybrid_layout(monkeypatch, model_type):
+    spec = MambaSpec(
+        block_size=4, shapes=((4,), (2,)), dtypes=(torch.float16, torch.float32), page_size_padded=32
+    )
+    name = "model.layers.1.linear_attn"
+    group = SimpleNamespace(
+        kv_cache_group_id=0, kv_cache_spec=spec, backend=AscendGDNAttentionBackend, layer_names=[name]
+    )
+    config = KVCacheConfig(
+        num_blocks=3, kv_cache_tensors=[], kv_cache_groups=[KVCacheGroupSpec([name], spec)]
+    )
+    vllm_config = SimpleNamespace(
+        model_config=SimpleNamespace(hf_config=SimpleNamespace(), hf_text_config=SimpleNamespace(model_type=model_type))
+    )
+    monkeypatch.setattr(attn_utils, "get_current_vllm_config", lambda: vllm_config)
+    hook = MagicMock(wraps=AscendGDNAttentionBackend.get_kernel_cache_views)
+    monkeypatch.setattr(AscendGDNAttentionBackend, "get_kernel_cache_views", hook)
+    backing = torch.zeros(128, dtype=torch.int8)
+    raw = backing[32:]
+    expected = attn_utils._reshape_mamba_kv_cache(raw, spec)
+    actual = attn_utils._reshape_kv_cache_v2([group], {name: raw}, "auto", [4], {}, config)[name]
+    hook.assert_called_once_with(raw, spec)
+    for before, after in zip(expected, actual):
+        assert before.shape == after.shape
+        assert before.stride() == after.stride()
+        assert before.dtype == after.dtype
+        assert before.data_ptr() == after.data_ptr()
 
 
 def test_mrv2_attention_views_interleave_kv_per_physical_page():

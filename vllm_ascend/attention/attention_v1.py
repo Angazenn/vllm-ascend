@@ -15,6 +15,12 @@
 # This file is a part of the vllm-ascend project.
 #
 
+"""[Role] Ascend full-attention backend and kernel dispatch.
+[Invariants] Kernel views preserve the allocator's cache packing and aliasing.
+[Timeouts & Locks] No initialization waits; execution uses the active NPU stream.
+[Side-Effect Policy] View construction is zero-copy; kernels update bound caches.
+"""
+
 from dataclasses import dataclass, field
 from enum import Enum
 from typing import Any
@@ -48,6 +54,7 @@ from vllm_ascend.attention.context_parallel.common_cp import (
     get_pcp_num_replicated_tokens,
     is_pcp_decode_sharding_enabled,
 )
+from vllm_ascend.attention.kv_cache_views import attention_cache_views
 from vllm_ascend.attention.utils import (
     AscendCommonAttentionMetadata,
     _select_seq_lens,
@@ -122,6 +129,28 @@ class AscendAttentionBackend(AttentionBackend):
         if envs_vllm.VLLM_KV_CACHE_LAYOUT in ("LBHNC", "HND"):
             return (2, num_blocks, num_kv_heads, block_size, head_size)
         return (2, num_blocks, block_size, num_kv_heads, head_size)
+
+    @staticmethod
+    def get_kernel_cache_views(
+        raw_cache: torch.Tensor,
+        spec: AttentionSpec,
+        kernel_block_size: int,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Interpret Qwen3.5's existing K/V packing without changing allocation."""
+        if spec.block_size % kernel_block_size:
+            raise ValueError("Attention manager blocks must divide into whole kernel blocks.")
+        num_blocks = raw_cache.nbytes // spec.page_size_bytes
+        kernel_blocks_per_page = spec.block_size // kernel_block_size
+        if spec.page_size_bytes % kernel_blocks_per_page:
+            raise ValueError("Attention physical pages must divide into whole kernel slots.")
+        # These are kernel-facing component axes, independent of upstream's
+        # generic [B, H, N, C] view. Retain Ascend's existing NHD/HND packing.
+        component_axes = (kernel_block_size, spec.num_kv_heads, spec.head_size)
+        if envs_vllm.VLLM_KV_CACHE_LAYOUT in ("LBHNC", "HND"):
+            component_axes = (spec.num_kv_heads, kernel_block_size, spec.head_size)
+        shape = (2, num_blocks * kernel_blocks_per_page, *component_axes)
+        page_stride = spec.page_size_bytes // kernel_blocks_per_page
+        return attention_cache_views(raw_cache, shape, spec.dtype, page_stride)
 
     @staticmethod
     def swap_blocks(

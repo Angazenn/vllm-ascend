@@ -17,6 +17,12 @@
 # This file is a part of the vllm-ascend project.
 #
 
+"""[Role] Adapt V2 attention metadata, cache allocation, and backend views.
+[Invariants] Preserve physical page packing, group aliasing, and bound components.
+[Timeouts & Locks] No added waits; collective operations use existing worker groups.
+[Side-Effect Policy] Allocate worker caches; reshape operations return storage views.
+"""
+
 import math
 from collections.abc import Callable, Iterable, Mapping, Sequence
 from contextlib import contextmanager
@@ -63,11 +69,12 @@ from vllm_ascend.attention.attention_c8_mxfp import (
     mxfp_cache_spec,
     mxfp_cache_views_for_spec,
 )
-from vllm_ascend.attention.attention_v1 import AscendAttentionState
+from vllm_ascend.attention.attention_v1 import AscendAttentionBackend, AscendAttentionState
 from vllm_ascend.attention.context_parallel.dsa_cp import AscendDSACPMetadataBuilder
 from vllm_ascend.attention.dsa_attn_kv_plan import get_dsa_attn_kv_plan
 from vllm_ascend.attention.dsa_v1 import AscendDSAMetadataBuilder
 from vllm_ascend.attention.dsa_v41 import AscendDSAV41MetadataBuilder
+from vllm_ascend.attention.kv_cache_views import uses_qwen3_5_cache_views
 from vllm_ascend.attention.sfa_v1 import AscendSFAMetadataBuilder
 from vllm_ascend.attention.utils import (
     AscendCommonAttentionMetadata,
@@ -1571,6 +1578,7 @@ def _reshape_kv_cache_v2(
         raise ValueError("Reshape KV cache requires KVCacheConfig.")
 
     vllm_config = get_current_vllm_config()
+    qwen3_5_cache_views = uses_qwen3_5_cache_views(vllm_config)
     is_dsv4_model = _is_dsv4_model(vllm_config)
     layer_kv_cache_spec = _get_layer_kv_cache_specs(kv_cache_config)
     kv_caches: dict[str, Any] = {}
@@ -1790,7 +1798,10 @@ def _reshape_kv_cache_v2(
             if isinstance(kv_cache_spec, MambaSpec):
                 if not isinstance(raw_cache, torch.Tensor):
                     raise ValueError(f"Mamba cache for {layer_name} must use one raw tensor.")
-                mamba_cache = _reshape_mamba_kv_cache(raw_cache, kv_cache_spec)
+                if qwen3_5_cache_views:
+                    mamba_cache = group.backend.get_kernel_cache_views(raw_cache, kv_cache_spec)
+                else:
+                    mamba_cache = _reshape_mamba_kv_cache(raw_cache, kv_cache_spec)
                 if mamba_cache[0].shape[0] < kv_cache_config.num_blocks:
                     raise ValueError(f"Mamba cache for {layer_name} has fewer blocks than KVCacheManager.")
                 kv_caches[layer_name] = mamba_cache
@@ -1867,6 +1878,19 @@ def _reshape_kv_cache_v2(
             num_blocks = total_bytes // page_stride_bytes
             num_blocks_per_kv_block = get_storage_block_size(kv_cache_spec) // kernel_block_size
             kernel_num_blocks = num_blocks * num_blocks_per_kv_block
+            if (
+                qwen3_5_cache_views
+                and group.backend is AscendAttentionBackend
+                and type(kv_cache_spec) is FullAttentionSpec
+                and kv_cache_spec.dtype in (torch.float16, torch.bfloat16)
+                and kv_cache_spec.state_content_bytes is None
+                and kv_cache_spec.head_size_v == kv_cache_spec.head_size
+                and isinstance(raw_cache, torch.Tensor)
+            ):
+                kv_caches[layer_name] = group.backend.get_kernel_cache_views(
+                    raw_cache, kv_cache_spec, kernel_block_size
+                )
+                continue
             kv_cache_shape = group.backend.get_kv_cache_shape(
                 kernel_num_blocks,
                 kernel_block_size,
