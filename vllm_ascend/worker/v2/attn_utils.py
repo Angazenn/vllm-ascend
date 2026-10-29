@@ -103,6 +103,7 @@ from vllm_ascend.distributed.kv_transfer.sparse_kv_offload.sparse_kv_offload_man
 )
 from vllm_ascend.models.deepseek_v41.cache_config import is_deepseek_v41_cache
 from vllm_ascend.models.glm5next.cache_views import view_compressed_indexer_cache, view_kpool_tail_cache
+from vllm_ascend.ops.gdn_attn_builder import AscendGDNAttentionBackend
 from vllm_ascend.quantization.methods.kv_cache.turboquant import TURBOQUANT_CACHE_DTYPE
 from vllm_ascend.quantization.methods.kv_cache.turboquant.cache import uses_turboquant_groups
 from vllm_ascend.quantization.utils import enable_fa_quant
@@ -121,10 +122,17 @@ from vllm_ascend.worker.utils import (
     get_single_raw_mla_backing,
     make_page_strided_cache_view,
 )
+from vllm_ascend.worker.v2.kv_cache_plan import (
+    allocate_cache_storage,
+    build_qwen3_5_cache_plan,
+    create_backend_cache_views,
+)
 
 if TYPE_CHECKING:
     from vllm_ascend.worker.v2.pcp_manager import AscendPCPAttentionContext
 
+
+_KV_CACHE_ALIGNMENT_BYTES = 2 * 1024 * 1024
 
 # MRV2's upstream _dummy_run drops runner-specific kwargs such as``skip_gdn_state_update``
 _SKIP_RING_STATE_UPDATE: ContextVar[bool] = ContextVar("_SKIP_RING_STATE_UPDATE", default=False)
@@ -1483,6 +1491,30 @@ def _allocate_kv_cache(
     return kv_cache_raw_tensors
 
 
+def _uses_qwen3_5_cache_plan(vllm_config: VllmConfig, attn_groups: Sequence[AttentionGroup]) -> bool:
+    """Migrate only dense full attention plus GDN; specialized layouts stay on their existing routes."""
+    if not uses_qwen3_5_cache_views(vllm_config) or KVPPConfig.from_vllm_config(vllm_config).size > 1:
+        return False
+    if enable_sfa(vllm_config):
+        return False
+    has_attention = has_mamba = False
+    for group in attn_groups:
+        spec = group.kv_cache_spec
+        if isinstance(spec, MambaSpec) and issubclass(group.backend, AscendGDNAttentionBackend):
+            has_mamba = True
+        elif (
+            type(spec) is FullAttentionSpec
+            and group.backend is AscendAttentionBackend
+            and spec.dtype in (torch.float16, torch.bfloat16)
+            and spec.state_content_bytes is None
+            and spec.head_size_v == spec.head_size
+        ):
+            has_attention = True
+        else:
+            return False
+    return has_attention and has_mamba
+
+
 def allocate_kv_cache_main(
     kv_cache_config: KVCacheConfig,
     device: torch.device,
@@ -1496,6 +1528,8 @@ def allocate_kv_cache_main(
     still consumes separate K/V (and backend-specific state) tensors, so keep
     the Ascend allocation/reshape contract behind the new entry point.
     """
+    # Preserve Ascend's existing NHD/HND selection in its backends. The
+    # upstream argument stays in the adapter signature for API compatibility.
     del layout
     vllm_config = get_current_vllm_config()
     attn_layers = get_layers_from_vllm_config(vllm_config, AttentionLayerBase)
@@ -1504,12 +1538,6 @@ def allocate_kv_cache_main(
         for layer_name, layer in attn_layers.items()
         if (target_layer := getattr(layer, "kv_sharing_target_layer_name", None))
     }
-
-    raw_tensors = _allocate_kv_cache(
-        kv_cache_config,
-        shared_layers=shared_layers,
-        device=device,
-    )
 
     attn_groups: list[AttentionGroup] = []
     for group_id, kv_cache_group in enumerate(kv_cache_config.kv_cache_groups):
@@ -1536,6 +1564,14 @@ def allocate_kv_cache_main(
                 group_map[key].layer_names.append(layer_name)
         attn_groups.extend(group_map[key] for key in group_order)
 
+    if _uses_qwen3_5_cache_plan(vllm_config, attn_groups):
+        plan = build_qwen3_5_cache_plan(kv_cache_config, _get_layer_kv_cache_specs(kv_cache_config), shared_layers)
+        allocations = allocate_cache_storage(
+            plan, lambda size: _allocate_int8_cache_tensor(size, _KV_CACHE_ALIGNMENT_BYTES, device)
+        )
+        return create_backend_cache_views(plan, allocations, attn_groups, kernel_block_sizes)
+
+    raw_tensors = _allocate_kv_cache(kv_cache_config, shared_layers=shared_layers, device=device)
     return _reshape_kv_cache_v2(
         attn_groups=attn_groups,
         kv_cache_raw_tensors=raw_tensors,

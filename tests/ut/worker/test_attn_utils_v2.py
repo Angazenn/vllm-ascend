@@ -376,7 +376,8 @@ def test_hybrid_attention_layout_preserves_padding(monkeypatch, model_type, layo
     monkeypatch.setattr(AscendAttentionBackend, "get_kernel_cache_views", view_hook)
     if model_type != "qwen3_next":
         monkeypatch.setattr(
-            AscendAttentionBackend, "get_kv_cache_shape",
+            AscendAttentionBackend,
+            "get_kv_cache_shape",
             MagicMock(side_effect=AssertionError("Qwen3.5 must derive views from the spec")),
         )
     raw = torch.full((3 * spec.page_size_bytes,), 7, dtype=torch.int8)
@@ -482,16 +483,12 @@ def test_mrv2_mamba_views_skip_physical_page_padding():
 
 @pytest.mark.parametrize("model_type", ["qwen3_5_text", "qwen3_5_moe_text"])
 def test_qwen3_5_mamba_backend_views_preserve_v2_hybrid_layout(monkeypatch, model_type):
-    spec = MambaSpec(
-        block_size=4, shapes=((4,), (2,)), dtypes=(torch.float16, torch.float32), page_size_padded=32
-    )
+    spec = MambaSpec(block_size=4, shapes=((4,), (2,)), dtypes=(torch.float16, torch.float32), page_size_padded=32)
     name = "model.layers.1.linear_attn"
     group = SimpleNamespace(
         kv_cache_group_id=0, kv_cache_spec=spec, backend=AscendGDNAttentionBackend, layer_names=[name]
     )
-    config = KVCacheConfig(
-        num_blocks=3, kv_cache_tensors=[], kv_cache_groups=[KVCacheGroupSpec([name], spec)]
-    )
+    config = KVCacheConfig(num_blocks=3, kv_cache_tensors=[], kv_cache_groups=[KVCacheGroupSpec([name], spec)])
     vllm_config = SimpleNamespace(
         model_config=SimpleNamespace(hf_config=SimpleNamespace(), hf_text_config=SimpleNamespace(model_type=model_type))
     )
@@ -3182,3 +3179,93 @@ def test_combined_mla_cache_nonzero_offset_preserves_guards_and_slot_padding(dty
     assert k_cache.storage_offset() * k_cache.element_size() == raw_offset_bytes
     assert v_cache.storage_offset() * v_cache.element_size() == raw_offset_bytes + k_block_bytes
     assert k_cache.untyped_storage().data_ptr() == v_cache.untyped_storage().data_ptr() == backing.data_ptr()
+
+
+@pytest.mark.parametrize("model_type", ["qwen3_5_text", "qwen3_5_moe_text"])
+@pytest.mark.parametrize("layout", ["LBNHC", "LBHNC"])
+@pytest.mark.parametrize("reuse_layer", [False, True])
+def test_qwen3_5_plan_allocation_and_backend_views(monkeypatch, model_type, layout, reuse_layer):
+    """The live MRV2 entry uses one planned pool and preserves hybrid byte placement."""
+    attn_names = ["model.layers.0.self_attn.attn", "model.layers.2.self_attn.attn"]
+    state_name = "model.layers.1.linear_attn"
+    alias_name = "model.layers.4.self_attn.attn"
+    blocks, page_bytes, offset = 3, 128, 32
+    full_spec = FullAttentionSpec(
+        block_size=4, num_kv_heads=1, head_size=4, dtype=torch.float16, page_size_padded=page_bytes
+    )
+    state_spec = MambaSpec(
+        block_size=4, shapes=((4,), (2,)), dtypes=(torch.float16, torch.float32), page_size_padded=page_bytes
+    )
+    layer_bytes = blocks * page_bytes
+    pool_size = offset + 2 * layer_bytes
+    config = KVCacheConfig(
+        num_blocks=blocks,
+        kv_cache_tensors=[
+            KVCacheTensor(
+                size=pool_size,
+                layers=attn_names,
+                layer_stride=0 if reuse_layer else layer_bytes,
+                block_stride=page_bytes,
+                offset=offset,
+            ),
+            KVCacheTensor(
+                size=pool_size,
+                layers=[state_name],
+                layer_stride=layer_bytes,
+                block_stride=page_bytes,
+                offset=offset,
+            ),
+        ],
+        kv_cache_groups=[KVCacheGroupSpec(attn_names, full_spec), KVCacheGroupSpec([state_name], state_spec)],
+    )
+    layers = {name: SimpleNamespace(get_attn_backend=lambda: AscendAttentionBackend) for name in attn_names}
+    layers[state_name] = SimpleNamespace(get_attn_backend=lambda: AscendGDNAttentionBackend)
+    layers[alias_name] = SimpleNamespace(kv_sharing_target_layer_name=attn_names[0])
+    vllm_config = SimpleNamespace(
+        model_config=SimpleNamespace(hf_text_config=SimpleNamespace(model_type=model_type)),
+        additional_config={},
+        kv_transfer_config=None,
+    )
+    monkeypatch.setattr(attn_utils, "get_current_vllm_config", lambda: vllm_config)
+    monkeypatch.setattr(attn_utils, "get_layers_from_vllm_config", lambda *_args: layers)
+    monkeypatch.setattr(attn_utils, "enable_sfa", lambda *_args: False)
+    monkeypatch.setattr("vllm.envs.VLLM_KV_CACHE_LAYOUT", layout)
+    for name in ("_allocate_kv_cache", "_reshape_kv_cache_v2"):
+        monkeypatch.setattr(attn_utils, name, MagicMock(side_effect=AssertionError("Legacy cache path used")))
+    monkeypatch.setattr(
+        AscendAttentionBackend,
+        "get_kv_cache_shape",
+        MagicMock(side_effect=AssertionError("Backend views must derive from the spec")),
+    )
+    allocations = []
+
+    def allocate(size, alignment, device):
+        raw = torch.zeros(size, dtype=torch.int8, device=device)
+        allocations.append(raw)
+        return raw
+
+    monkeypatch.setattr(attn_utils, "_allocate_int8_cache_tensor", allocate)
+    caches = attn_utils.allocate_kv_cache_main(config, torch.device("cpu"), None, [2, 4])
+    assert len(allocations) == 1
+    backing = allocations[0]
+    assert backing.nbytes == pool_size
+    assert caches[alias_name] is caches[attn_names[0]]
+    key, value = caches[attn_names[0]]
+    second_key, _ = caches[attn_names[1]]
+    conv, ssm = caches[state_name]
+    assert key.shape[0] == blocks * 2
+    assert conv.shape[0] == ssm.shape[0] == blocks
+    assert key.stride(0) == value.stride(0) == page_bytes // 4
+    assert ssm.stride(0) == page_bytes // 4
+    assert second_key.data_ptr() - key.data_ptr() == (0 if reuse_layer else layer_bytes)
+    assert key.untyped_storage().data_ptr() == ssm.untyped_storage().data_ptr()
+    key[3].fill_(3)
+    value[3].fill_(5)
+    ssm[2].fill_(7)
+    expected = torch.zeros_like(backing)
+    start = offset + page_bytes + page_bytes // 2
+    expected[start : start + 16].view(torch.float16).fill_(3)
+    expected[start + 16 : start + 32].view(torch.float16).fill_(5)
+    start = offset + 2 * page_bytes + 8
+    expected[start : start + 8].view(torch.float32).fill_(7)
+    torch.testing.assert_close(backing, expected)

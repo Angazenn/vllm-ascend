@@ -38,7 +38,7 @@ from vllm.v1.attention.backends.utils import (
 )
 from vllm.v1.kv_cache_interface import AttentionSpec, MambaSpec
 
-from vllm_ascend.attention.kv_cache_views import mamba_cache_views
+from vllm_ascend.attention.kv_cache_views import CacheViewPlacement, mamba_cache_views
 from vllm_ascend.ops.triton.fla.utils import (
     prepare_chunk_indices,
     prepare_chunk_offsets,
@@ -1011,9 +1011,16 @@ class AscendGDNAttentionMetadataBuilder(GDNAttentionMetadataBuilder):
 
 class AscendGDNAttentionBackend(GDNAttentionBackend):
     @staticmethod
-    def get_kernel_cache_views(raw_cache: torch.Tensor, spec: MambaSpec) -> list[torch.Tensor]:
+    def get_kernel_cache_views(
+        raw_cache: torch.Tensor,
+        spec: MambaSpec,
+        kernel_block_size: int | None = None,
+        *,
+        placement: CacheViewPlacement | None = None,
+    ) -> list[torch.Tensor]:
         """Expose Qwen3.5 conv/SSM states at their existing per-page offsets."""
-        return mamba_cache_views(raw_cache, spec.shapes, spec.dtypes, spec.page_size_bytes)
+        # Mamba checkpoints use manager pages; kernel token blocks do not split states.
+        return mamba_cache_views(raw_cache, spec.shapes, spec.dtypes, spec.page_size_bytes, placement=placement)
 
     @staticmethod
     def get_builder_cls() -> type[AscendGDNAttentionMetadataBuilder]:
