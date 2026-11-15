@@ -6,9 +6,7 @@ from vllm.utils.torch_utils import get_dtype_size
 from vllm.v1.core.kv_cache_utils import KVCacheBlockCopy
 from vllm.v1.kv_cache_interface import (
     AttentionSpec,
-    EncoderOnlyAttentionSpec,
     KVCacheConfig,
-    UniformTypeKVCacheSpecs,
 )
 from vllm.v1.worker.utils import (
     AttentionGroup,
@@ -16,6 +14,10 @@ from vllm.v1.worker.utils import (
     select_common_block_size,
 )
 
+from vllm_ascend.core.kv_cache_compat import (
+    EncoderOnlyAttentionSpec,
+    UniformTypeKVCacheSpecs,
+)
 from vllm_ascend.utils import vllm_version_is
 
 
@@ -159,6 +161,11 @@ def prepare_ascend_kernel_block_sizes(
         List of kernel block sizes for each cache group.
     """
     kernel_block_sizes = prepare_kernel_block_sizes(kv_cache_config, attn_groups)
+
+    if any(hasattr(group, "kv_cache_specs") for group in kv_cache_config.kv_cache_groups):
+        # Native DeepSeek placements have nonzero layer strides. The workaround
+        # below is for legacy allocation descriptors with zero-stride aliases.
+        return kernel_block_sizes
 
     # Upstream drops only encoder-only groups, so this index tracks its output.
     index = 0

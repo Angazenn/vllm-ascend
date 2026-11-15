@@ -10,9 +10,14 @@ from vllm.model_executor.layers.attention_layer_base import AttentionLayerBase
 from vllm.model_executor.models.extract_hidden_states import CacheOnlyAttentionLayer
 from vllm.model_executor.models.utils import extract_layer_index
 from vllm.utils.torch_utils import get_dtype_size
-from vllm.v1.kv_cache_interface import FullAttentionSpec, KVCacheSpec
+from vllm.v1.kv_cache_interface import (
+    KVCacheSpec,
+)
 
 from vllm_ascend.ascend_config import KVPPConfig
+from vllm_ascend.core.kv_cache_compat import (
+    FullAttentionSpec,
+)
 from vllm_ascend.core.kv_cache_interface import AscendMLAAttentionSpec, AscendSFAIndexerCacheSpec
 from vllm_ascend.quantization.utils import enable_fa_quant
 from vllm_ascend.utils import calc_split_factor, enable_sfa, kv_cache_spec_uses_packed_sfa_main_cache

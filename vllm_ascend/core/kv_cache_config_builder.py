@@ -21,18 +21,23 @@ from vllm.v1.core.kv_cache_planning import (
     unify_hybrid_kv_cache_specs,
 )
 from vllm.v1.kv_cache_interface import (
-    KVCacheGroupSpec,
+    KVCacheConfig,
     KVCacheSpec,
     MLAAttentionSpec,
+)
+
+from vllm_ascend.core.kv_cache_compat import (
+    KVCacheGroupSpec,
     SlidingWindowMLASpec,
     UniformTypeKVCacheSpecs,
 )
-
 from vllm_ascend.models.deepseek_v41.cache_config import (
     get_deepseek_v41_pool_bytes_per_block,
     group_cache_specs,
+    group_layer_configs,
     is_deepseek_v41_cache,
     make_cache_groups,
+    place_deepseek_v41_cache,
 )
 from vllm_ascend.models.glm5next.cache_config import (
     _get_glm5_next_cache_layout,
@@ -62,6 +67,10 @@ class AscendKVCacheConfigBuilder(DefaultKVCacheConfigBuilder):
         Precedence: Kimi-K3.1, GLM-Next, then DSV4.1 / mixed-page-size shared slots, then
         the Kimi-K3 DSpark mixed grouping, then vLLM's generic grouping.
         """
+        if hasattr(next(iter(kv_cache_spec.values()), None), "manager_config"):
+            if is_deepseek_v41_cache({name: config.spec for name, config in kv_cache_spec.items()}):
+                return group_layer_configs(kv_cache_spec)
+            return super().get_kv_cache_groups(vllm_config, kv_cache_spec)
         if vllm_config.model_config.hf_config.model_type == "kimi_k31":
             return paired_sfa_cache_groups(vllm_config, kv_cache_spec)
         if vllm_config.scheduler_config.disable_hybrid_kv_cache_manager:
@@ -87,6 +96,12 @@ class AscendKVCacheConfigBuilder(DefaultKVCacheConfigBuilder):
 
         return super().get_kv_cache_groups(vllm_config, kv_cache_spec)
 
+    def get_kv_cache_config_from_groups(self, vllm_config, kv_cache_groups, num_blocks) -> KVCacheConfig:
+        if kv_cache_groups and hasattr(kv_cache_groups[0], "kv_cache_specs"):
+            if is_deepseek_v41_cache(kv_cache_groups):
+                return place_deepseek_v41_cache(vllm_config, kv_cache_groups, num_blocks)
+        return super().get_kv_cache_config_from_groups(vllm_config, kv_cache_groups, num_blocks)
+
     def _get_pool_bytes_per_block(
         self,
         vllm_config: VllmConfig,
@@ -102,6 +117,8 @@ class AscendKVCacheConfigBuilder(DefaultKVCacheConfigBuilder):
             return paired_sfa_pool_bytes(kv_cache_groups)
         if is_deepseek_v41_cache(kv_cache_groups):
             return get_deepseek_v41_pool_bytes_per_block(kv_cache_groups)
+        if kv_cache_groups and hasattr(kv_cache_groups[0], "kv_cache_specs"):
+            return super()._get_pool_bytes_per_block(vllm_config, kv_cache_groups)
         if _get_glm5_next_cache_layout(kv_cache_groups) is not None:
             return get_glm5_next_pool_bytes_per_block(kv_cache_groups)
         qwen_bytes = get_qwen4_exp_pool_bytes_per_block(kv_cache_groups)

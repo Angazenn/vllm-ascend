@@ -12,8 +12,15 @@ from vllm.distributed.kv_transfer.kv_connector.v1.base import KVConnectorMetadat
 from vllm.logger import logger
 from vllm.utils.math_utils import cdiv
 from vllm.v1.core.kv_cache_utils import BlockHash, BlockHashList
-from vllm.v1.kv_cache_interface import FullAttentionSpec, KVCacheConfig, MambaSpec, UniformTypeKVCacheSpecs
+from vllm.v1.kv_cache_interface import (
+    KVCacheConfig,
+    MambaSpec,
+)
 
+from vllm_ascend.core.kv_cache_compat import (
+    FullAttentionSpec,
+    UniformTypeKVCacheSpecs,
+)
 from vllm_ascend.core.kv_cache_interface import is_prefix_cacheable
 
 if TYPE_CHECKING:

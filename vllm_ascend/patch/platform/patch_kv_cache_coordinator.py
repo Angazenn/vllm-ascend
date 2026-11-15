@@ -26,13 +26,15 @@ from vllm.v1.core.single_type_kv_cache_manager import (
     get_manager_for_kv_cache_spec,
 )
 from vllm.v1.kv_cache_interface import (
-    FullAttentionSpec,
     KVCacheConfig,
     KVCacheSpec,
     MambaSpec,
-    UniformTypeKVCacheSpecs,
 )
 
+from vllm_ascend.core.kv_cache_compat import (
+    FullAttentionSpec,
+    UniformTypeKVCacheSpecs,
+)
 from vllm_ascend.core.kv_cache_interface import is_prefix_cacheable
 
 _orig_get_kv_cache_coordinator = vllm.v1.core.kv_cache_coordinator.get_kv_cache_coordinator

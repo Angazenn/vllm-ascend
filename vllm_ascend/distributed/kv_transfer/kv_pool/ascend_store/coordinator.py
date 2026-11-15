@@ -14,12 +14,14 @@ from vllm.v1.core.block_pool import BlockPool
 from vllm.v1.core.kv_cache_utils import BlockHash, BlockHashList, KVCacheBlock
 from vllm.v1.core.single_type_kv_cache_manager import SingleTypeKVCacheManager
 from vllm.v1.kv_cache_interface import (
-    FullAttentionSpec,
-    KVCacheGroupSpec,
     KVCacheSpec,
-    UniformTypeKVCacheSpecs,
 )
 
+from vllm_ascend.core.kv_cache_compat import (
+    FullAttentionSpec,
+    KVCacheGroupSpec,
+    UniformTypeKVCacheSpecs,
+)
 from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.metadata import (
     block_hash_to_bytes,
     get_block_hashes,

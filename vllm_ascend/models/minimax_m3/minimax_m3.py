@@ -92,11 +92,13 @@ from vllm.sequence import IntermediateTensors
 from vllm.triton_utils import HAS_TRITON
 from vllm.utils.torch_utils import kv_cache_dtype_str_to_dtype
 from vllm.v1.kv_cache_interface import (
-    FullAttentionSpec,
     KVCacheSpec,
     get_kv_quant_mode,
 )
 
+from vllm_ascend.core.kv_cache_compat import (
+    FullAttentionSpec,
+)
 from vllm_ascend.device.device_op import DeviceOperator
 from vllm_ascend.models.common.ops.sequence_parallel import (
     sp_all_gather,

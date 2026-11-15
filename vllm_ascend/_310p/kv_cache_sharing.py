@@ -1,7 +1,14 @@
 # SPDX-License-Identifier: Apache-2.0
 # Copyright (c) 2026 Huawei Technologies Co., Ltd. All Rights Reserved.
 
-from vllm.v1.kv_cache_interface import AttentionSpec, MambaSpec, UniformTypeKVCacheSpecs
+from vllm.v1.kv_cache_interface import (
+    AttentionSpec,
+    MambaSpec,
+)
+
+from vllm_ascend.core.kv_cache_compat import (
+    UniformTypeKVCacheSpecs,
+)
 
 
 def get_310p_shared_cache_slots(kv_cache_groups, layout) -> dict[str, int]:

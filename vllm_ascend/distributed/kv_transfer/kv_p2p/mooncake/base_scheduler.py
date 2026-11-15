@@ -19,7 +19,6 @@ from vllm.utils.network_utils import get_ip, make_zmq_path
 from vllm.v1.core.sched.output import SchedulerOutput
 from vllm.v1.kv_cache_interface import (
     MambaSpec,
-    UniformTypeKVCacheSpecs,
 )
 from vllm.v1.outputs import KVConnectorOutput
 from zmq.constants import SocketOption, SocketType
@@ -28,6 +27,9 @@ from zmq.error import Again
 from vllm_ascend.ascend_config import (
     get_ascend_config,
     init_ascend_config,
+)
+from vllm_ascend.core.kv_cache_compat import (
+    UniformTypeKVCacheSpecs,
 )
 from vllm_ascend.core.kv_cache_interface import is_circular_kv_cache_spec
 from vllm_ascend.distributed.kv_transfer.kv_p2p.mooncake.metadata import (

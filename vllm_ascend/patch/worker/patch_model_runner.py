@@ -235,4 +235,6 @@ upstream.copy_kv_cache_blocks_inplace = copy_kv_cache_blocks_inplace
 
 upstream.dispatch_cg_and_sync_dp = dispatch_cg_and_sync_dp
 
-upstream.GPUModelRunner.initialize_kv_cache = initialize_kv_cache
+# The new runner reads manager policy directly from its native groups.
+if not hasattr(upstream.GPUModelRunner, "get_kv_cache_layer_configs"):
+    upstream.GPUModelRunner.initialize_kv_cache = initialize_kv_cache

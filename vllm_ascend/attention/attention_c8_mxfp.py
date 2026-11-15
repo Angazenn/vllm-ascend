@@ -54,7 +54,9 @@ from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.attention_fence im
 from vllm_ascend.utils import uses_mooncake_connector
 
 if TYPE_CHECKING:
-    from vllm.v1.kv_cache_interface import FullAttentionSpec
+    from vllm_ascend.core.kv_cache_compat import (
+        FullAttentionSpec,
+    )
 
 
 # KV cache MXFP8 scale layouts, PA_NZ flavor (QFA layout_kv="PA_NZ"; golden

@@ -24,16 +24,18 @@ from vllm.logger import logger
 from vllm.utils.network_utils import get_ip
 from vllm.v1.attention.backends.registry import MambaAttentionBackendEnum
 from vllm.v1.kv_cache_interface import (
-    FullAttentionSpec,
     KVCacheSpec,
     MambaSpec,
     MLAAttentionSpec,
+)
+
+from vllm_ascend.ascend_config import get_ascend_config, init_ascend_config
+from vllm_ascend.core.kv_cache_compat import (
+    FullAttentionSpec,
     SlidingWindowMLASpec,
     SlidingWindowSpec,
     UniformTypeKVCacheSpecs,
 )
-
-from vllm_ascend.ascend_config import get_ascend_config, init_ascend_config
 from vllm_ascend.core.kv_cache_interface import AscendSFAIndexerCacheSpec, is_circular_kv_cache_spec
 from vllm_ascend.core.kv_cache_placement import map_kvpp_layers_to_owners
 from vllm_ascend.distributed.kv_transfer.kv_p2p.mooncake.metadata import (

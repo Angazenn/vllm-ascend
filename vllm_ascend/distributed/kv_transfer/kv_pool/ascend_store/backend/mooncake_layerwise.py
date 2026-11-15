@@ -11,9 +11,11 @@ from copy import copy
 from typing import TYPE_CHECKING, Any
 
 from vllm.logger import logger
-from vllm.v1.kv_cache_interface import UniformTypeKVCacheSpecs
 
 from vllm_ascend.ascend_config import KVPPConfig
+from vllm_ascend.core.kv_cache_compat import (
+    UniformTypeKVCacheSpecs,
+)
 from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.metadata import (
     ReqMeta,
     block_hash_to_str,

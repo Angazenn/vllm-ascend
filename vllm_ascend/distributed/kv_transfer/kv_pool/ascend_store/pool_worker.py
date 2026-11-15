@@ -23,11 +23,13 @@ from vllm.v1.core.kv_cache_utils import BlockHash, maybe_convert_block_hash
 from vllm.v1.kv_cache_interface import (
     KVCacheConfig,
     MambaSpec,
-    UniformTypeKVCacheSpecs,
 )
 from vllm.v1.worker.mamba_utils import get_mamba_groups
 
 from vllm_ascend.ascend_config import KVPPConfig
+from vllm_ascend.core.kv_cache_compat import (
+    UniformTypeKVCacheSpecs,
+)
 from vllm_ascend.core.kv_cache_placement import map_kvpp_layers_to_owners
 from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.backend import (
     backend_map,

@@ -26,7 +26,6 @@ from vllm.v1.kv_cache_interface import (
     KVCacheConfig,
     KVCacheSpec,
     MambaSpec,
-    UniformTypeKVCacheSpecs,
 )
 from vllm.v1.utils import CpuGpuBuffer
 from vllm.v1.worker.cp_utils import check_attention_cp_compatibility
@@ -53,6 +52,9 @@ from vllm_ascend._310p.worker.v2.spec_utils import (
 )
 from vllm_ascend._310p.worker.v2.states import Ascend310PRequestState
 from vllm_ascend._310p.worker.v2.structured_outputs import apply_grammar_bitmask
+from vllm_ascend.core.kv_cache_compat import (
+    UniformTypeKVCacheSpecs,
+)
 from vllm_ascend.core.kv_cache_interface import get_storage_block_size
 from vllm_ascend.ops.rotary_embedding import update_cos_sin
 from vllm_ascend.utils import ACL_FORMAT_FRACTAL_NZ, get_kv_cache_tensor_layers, shared_experts_calculation_stream

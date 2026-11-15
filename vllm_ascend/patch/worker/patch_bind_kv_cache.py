@@ -3,10 +3,12 @@ from collections.abc import Sequence
 import torch
 import vllm.v1.worker.utils as utils
 from vllm.model_executor.layers.attention import Attention
-from vllm.v1.kv_cache_interface import KVCacheGroupSpec
 from vllm.v1.worker.utils import defaultdict, extract_layer_index
 
 from vllm_ascend.attention.dsa_v41 import DeepseekV41CacheLayer
+from vllm_ascend.core.kv_cache_compat import (
+    KVCacheGroupSpec,
+)
 
 
 # Without this patch, it will raise an exception when initialize kv_cache.

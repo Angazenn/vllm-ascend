@@ -11,18 +11,20 @@ from vllm.config import VllmConfig
 from vllm.utils.math_utils import cdiv, round_up
 from vllm.v1.core.kv_cache_planning import _approximate_gcd, may_override_num_blocks
 from vllm.v1.kv_cache_interface import (
-    FullAttentionSpec,
     KVCacheConfig,
-    KVCacheGroupSpec,
     KVCacheSpec,
     KVCacheSpecKind,
     KVCacheTensor,
     MLAAttentionSpec,
-    SlidingWindowMLASpec,
-    UniformTypeKVCacheSpecs,
     get_kv_cache_spec_kind,
 )
 
+from vllm_ascend.core.kv_cache_compat import (
+    FullAttentionSpec,
+    KVCacheGroupSpec,
+    SlidingWindowMLASpec,
+    UniformTypeKVCacheSpecs,
+)
 from vllm_ascend.models.deepseek_v41.cache_config import (
     get_deepseek_v41_kv_cache_config,
     get_deepseek_v41_pool_bytes_per_block,

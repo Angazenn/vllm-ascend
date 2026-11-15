@@ -27,7 +27,6 @@ from vllm.v1.kv_cache_interface import (
     AttentionSpec,
     KVCacheConfig,
     MambaSpec,
-    UniformTypeKVCacheSpecs,
 )
 from vllm.v1.kv_offload.base import (
     CanonicalKVCacheRef,
@@ -36,6 +35,9 @@ from vllm.v1.kv_offload.base import (
     CanonicalPageMapping,
 )
 
+from vllm_ascend.core.kv_cache_compat import (
+    UniformTypeKVCacheSpecs,
+)
 from vllm_ascend.utils import get_kv_cache_tensor_layers
 
 

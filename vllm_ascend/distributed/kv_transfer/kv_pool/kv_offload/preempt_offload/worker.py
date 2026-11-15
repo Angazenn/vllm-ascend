@@ -9,8 +9,13 @@ import torch
 from vllm.config import VllmConfig
 from vllm.logger import logger
 from vllm.v1.attention.backends.registry import MambaAttentionBackendEnum
-from vllm.v1.kv_cache_interface import MambaSpec, UniformTypeKVCacheSpecs
+from vllm.v1.kv_cache_interface import (
+    MambaSpec,
+)
 
+from vllm_ascend.core.kv_cache_compat import (
+    UniformTypeKVCacheSpecs,
+)
 from vllm_ascend.distributed.kv_transfer.kv_pool.kv_offload.preempt_offload.metadata import (
     MambaConvLoadMeta,
     PreemptOffloadMetadata,

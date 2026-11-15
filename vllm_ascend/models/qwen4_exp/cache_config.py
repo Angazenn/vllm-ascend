@@ -19,18 +19,20 @@ try:
 except ImportError:
     from vllm.v1.core.kv_cache_planning import may_override_num_blocks
 from vllm.v1.kv_cache_interface import (
-    CircularBufferSpec,
-    FullAttentionSpec,
     HiddenStateCacheSpec,
     KVCacheConfig,
-    KVCacheGroupSpec,
     KVCacheSpec,
     KVCacheTensor,
     MambaSpec,
     MLAAttentionSpec,
-    UniformTypeKVCacheSpecs,
 )
 
+from vllm_ascend.core.kv_cache_compat import (
+    CircularBufferSpec,
+    FullAttentionSpec,
+    KVCacheGroupSpec,
+    UniformTypeKVCacheSpecs,
+)
 from vllm_ascend.core.kv_cache_interface import (
     get_kv_cache_compression_ratio,
 )

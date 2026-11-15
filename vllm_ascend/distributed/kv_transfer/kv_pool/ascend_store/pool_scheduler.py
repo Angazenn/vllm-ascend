@@ -11,13 +11,15 @@ from vllm.v1.core.sched.output import NewRequestData, SchedulerOutput
 from vllm.v1.kv_cache_interface import (
     KVCacheConfig,
     MambaSpec,
-    RSWASpec,
-    SlidingWindowSpec,
-    UniformTypeKVCacheSpecs,
 )
 from vllm.v1.outputs import KVConnectorOutput
 from vllm.v1.request import Request
 
+from vllm_ascend.core.kv_cache_compat import (
+    RSWASpec,
+    SlidingWindowSpec,
+    UniformTypeKVCacheSpecs,
+)
 from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.backend import (
     resolve_backend,
 )

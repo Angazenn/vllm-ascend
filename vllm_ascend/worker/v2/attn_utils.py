@@ -46,14 +46,11 @@ from vllm.v1.attention.backends.gdn_attn import GDNAttentionMetadataBuilder
 from vllm.v1.attention.backends.utils import get_dcp_local_seq_lens
 from vllm.v1.kv_cache_interface import (
     AttentionSpec,
-    FullAttentionSpec,
     KVCacheConfig,
     KVCacheSpec,
     KVQuantMode,
     MambaSpec,
     MLAAttentionSpec,
-    SlidingWindowSpec,
-    UniformTypeKVCacheSpecs,
 )
 from vllm.v1.worker.gpu.model_states.interface import ModelSpecificAttnMetadata
 from vllm.v1.worker.utils import AttentionGroup
@@ -75,6 +72,11 @@ from vllm_ascend.attention.utils import (
     get_tq_fused_slot_bytes,
     requires_contiguous_pa_kv_cache,
     supports_strided_mla_cache,
+)
+from vllm_ascend.core.kv_cache_compat import (
+    FullAttentionSpec,
+    SlidingWindowSpec,
+    UniformTypeKVCacheSpecs,
 )
 from vllm_ascend.core.kv_cache_interface import (
     AscendIndexerKPoolTailSpec,
@@ -720,6 +722,9 @@ def build_attn_state(
 def _get_layer_kv_cache_specs(kv_cache_config: KVCacheConfig) -> dict[str, KVCacheSpec]:
     layer_kv_cache_spec: dict[str, KVCacheSpec] = {}
     for group_kv_cache_spec in kv_cache_config.kv_cache_groups:
+        if (layer_specs := getattr(group_kv_cache_spec, "kv_cache_specs", None)) is not None:
+            layer_kv_cache_spec.update(layer_specs)
+            continue
         group_spec = group_kv_cache_spec.kv_cache_spec
         for layer_name in group_kv_cache_spec.layer_names:
             if isinstance(group_spec, UniformTypeKVCacheSpecs):
@@ -1480,6 +1485,7 @@ def _get_cache_attention_groups(
 ) -> list[AttentionGroup]:
     """Resolve each cache owner's backend and spec without changing placement."""
     attn_groups: list[AttentionGroup] = []
+    specs = _get_layer_kv_cache_specs(kv_cache_config)
     for group_id, kv_cache_group in enumerate(kv_cache_config.kv_cache_groups):
         group_map: dict[tuple[str, KVCacheSpec, int], AttentionGroup] = {}
         group_order: list[tuple[str, KVCacheSpec, int]] = []
@@ -1487,9 +1493,7 @@ def _get_cache_attention_groups(
             if layer_name in shared_layers:
                 continue
             layer = attn_layers[layer_name]
-            layer_spec = kv_cache_group.kv_cache_spec
-            if isinstance(layer_spec, UniformTypeKVCacheSpecs):
-                layer_spec = layer_spec.kv_cache_specs[layer_name]
+            layer_spec = specs[layer_name]
             backend = layer.get_attn_backend()
             key = (backend.full_cls_name(), layer_spec, getattr(layer, "num_heads", 0))
             if key not in group_map:
@@ -1646,6 +1650,8 @@ def allocate_kv_cache_main(
     device: torch.device,
     layout: Any,
     kernel_block_sizes: list[int],
+    *,
+    allocate: Callable[[int], torch.Tensor] | None = None,
 ) -> dict[str, Any]:
     """Allocate Ascend KV cache through vLLM main's #51718 entry point.
 
@@ -1654,6 +1660,8 @@ def allocate_kv_cache_main(
     still consumes separate K/V (and backend-specific state) tensors, so keep
     the Ascend allocation/reshape contract behind the new entry point.
     """
+    if allocate is not None:
+        raise NotImplementedError("Custom upstream KV backing allocation is not supported on Ascend.")
     vllm_config = get_current_vllm_config()
     model_type = getattr(getattr(vllm_config.model_config, "hf_text_config", None), "model_type", None)
     if model_type in ("deepseek_v4", "deepseek_v41", "deepseek_v41_text"):

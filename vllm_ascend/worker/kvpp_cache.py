@@ -1,8 +1,14 @@
 # SPDX-License-Identifier: Apache-2.0
 import torch
 from vllm.config import VllmConfig
-from vllm.v1.kv_cache_interface import KVCacheConfig, KVCacheSpec, UniformTypeKVCacheSpecs
+from vllm.v1.kv_cache_interface import (
+    KVCacheConfig,
+    KVCacheSpec,
+)
 
+from vllm_ascend.core.kv_cache_compat import (
+    UniformTypeKVCacheSpecs,
+)
 from vllm_ascend.core.kv_cache_placement import (
     KVPP_SCRATCH_BUFFER_COUNT,
     build_kvpp_layer_layout,

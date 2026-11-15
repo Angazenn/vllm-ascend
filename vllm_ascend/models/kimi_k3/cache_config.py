@@ -5,13 +5,15 @@
 from vllm.logger import logger
 from vllm.utils.math_utils import cdiv
 from vllm.v1.kv_cache_interface import (
-    FullAttentionSpec,
-    KVCacheGroupSpec,
     KVCacheSpec,
     MambaSpec,
-    UniformTypeKVCacheSpecs,
 )
 
+from vllm_ascend.core.kv_cache_compat import (
+    FullAttentionSpec,
+    KVCacheGroupSpec,
+    UniformTypeKVCacheSpecs,
+)
 from vllm_ascend.utils import vllm_version_is
 
 # vLLM main moved this helper to kv_cache_planning after v0.32.0.

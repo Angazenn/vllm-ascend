@@ -19,9 +19,15 @@ from vllm.v1.core.kv_cache_coordinator import (
 )
 from vllm.v1.core.kv_cache_utils import resolve_dcp_kv_block_size, resolve_kv_cache_block_sizes
 from vllm.v1.core.sched.output import SchedulerOutput
-from vllm.v1.kv_cache_interface import MambaSpec, SlidingWindowSpec, UniformTypeKVCacheSpecs
+from vllm.v1.kv_cache_interface import (
+    MambaSpec,
+)
 from vllm.v1.outputs import KVConnectorOutput
 
+from vllm_ascend.core.kv_cache_compat import (
+    SlidingWindowSpec,
+    UniformTypeKVCacheSpecs,
+)
 from vllm_ascend.core.kv_cache_interface import is_circular_kv_cache_spec
 from vllm_ascend.distributed.kv_transfer.kv_pool.kv_offload.preempt_offload.metadata import (
     MambaConvLoadMeta,

@@ -16,15 +16,17 @@ from vllm.distributed.kv_transfer.kv_connector.v1.base import KVConnectorTransfe
 from vllm.logger import logger
 from vllm.utils.network_utils import make_zmq_path
 from vllm.v1.kv_cache_interface import (
-    FullAttentionSpec,
     KVCacheConfig,
     KVCacheSpec,
     MambaSpec,
     MLAAttentionSpec,
+)
+
+from vllm_ascend.core.kv_cache_compat import (
+    FullAttentionSpec,
     SlidingWindowMLASpec,
     SlidingWindowSpec,
 )
-
 from vllm_ascend.core.kv_cache_interface import (
     AscendSFAIndexerCacheSpec,
     is_circular_kv_cache_spec,

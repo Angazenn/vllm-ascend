@@ -19,13 +19,20 @@ import os
 import vllm_ascend.patch.platform.patch_distributed  # noqa
 import vllm_ascend.patch.platform.patch_glm53_reasoning  # noqa
 import vllm_ascend.patch.platform.patch_kimi_k31_config  # noqa
-import vllm_ascend.patch.platform.patch_kv_cache_utils  # noqa
-import vllm_ascend.patch.platform.patch_mamba_block_aligned_split  # noqa
 import vllm_ascend.patch.platform.patch_mla_prefill_backend  # noqa
 import vllm_ascend.patch.platform.patch_parallel_config  # noqa
 import vllm_ascend.patch.platform.patch_pp_mtp  # noqa
 import vllm_ascend.patch.platform.patch_use_v2_model_runner  # noqa
+from vllm_ascend.core.kv_cache_compat import USES_MANAGER_CONFIGS
 from vllm_ascend.device.hardware_profile import HardwareCapability, get_current_hardware_profile
+
+# These patches operate on the old spec-based planning and scheduler APIs.
+if not USES_MANAGER_CONFIGS:
+    import vllm_ascend.patch.platform.patch_kv_cache_utils  # noqa
+    import vllm_ascend.patch.platform.patch_mamba_block_aligned_split  # noqa
+    import vllm_ascend.patch.platform.patch_mamba_manager  # noqa
+    import vllm_ascend.patch.platform.patch_swa_bounded_replay  # noqa
+    import vllm_ascend.patch.platform.patch_kv_cache_coordinator  # noqa
 
 if get_current_hardware_profile().supports(HardwareCapability.STANDARD_MAMBA_PATCH):
     import vllm_ascend.patch.platform.patch_mamba_config  # noqa
@@ -35,16 +42,13 @@ import vllm_ascend.patch.platform.patch_minimax_m2_config  # noqa
 
 import vllm_ascend.patch.platform.patch_structured_output  # noqa
 import vllm_ascend.patch.platform.patch_torch_accelerator  # noqa
-import vllm_ascend.patch.platform.patch_mamba_manager  # noqa
 
 if os.getenv("DYNAMIC_EPLB", "false").lower() in ("true", "1") or os.getenv("EXPERT_MAP_RECORD", "false") == "true":
     import vllm_ascend.patch.platform.patch_multiproc_executor  # noqa
 
-import vllm_ascend.patch.platform.patch_swa_bounded_replay  # noqa
 import vllm_ascend.patch.platform.patch_balance_schedule  # noqa
 import vllm_ascend.patch.platform.patch_engine_core  # noqa
 
-import vllm_ascend.patch.platform.patch_kv_cache_coordinator  # noqa
 import vllm_ascend.patch.platform.patch_speculative_config  # noqa
 import vllm_ascend.patch.platform.patch_replayssm_config  # noqa
 

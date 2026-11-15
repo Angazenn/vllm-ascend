@@ -3,7 +3,10 @@
 
 from collections.abc import Sequence
 
-from vllm.v1.kv_cache_interface import KVCacheGroupSpec, UniformTypeKVCacheSpecs
+from vllm_ascend.core.kv_cache_compat import (
+    KVCacheGroupSpec,
+    UniformTypeKVCacheSpecs,
+)
 
 
 def draft_only_group_ids(groups: Sequence[KVCacheGroupSpec]) -> tuple[int, ...]:

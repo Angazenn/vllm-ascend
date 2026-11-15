@@ -44,17 +44,19 @@ from vllm.utils.torch_utils import get_dtype_size
 from vllm.v1.core.sched.output import SchedulerOutput
 from vllm.v1.kv_cache_interface import (
     AttentionSpec,
-    FullAttentionSpec,
     KVCacheConfig,
     KVCacheSpec,
     MambaSpec,
     MLAAttentionSpec,
-    SlidingWindowSpec,
-    UniformTypeKVCacheSpecs,
 )
 from vllm.v1.worker.utils import extract_layer_index
 
 from vllm_ascend.ascend_config import get_ascend_config
+from vllm_ascend.core.kv_cache_compat import (
+    FullAttentionSpec,
+    SlidingWindowSpec,
+    UniformTypeKVCacheSpecs,
+)
 from vllm_ascend.distributed.kv_transfer.kv_p2p.mooncake_connector import GET_META_MSG
 from vllm_ascend.distributed.kv_transfer.utils.mooncake_transfer_engine import global_te
 from vllm_ascend.distributed.kv_transfer.utils.utils import (

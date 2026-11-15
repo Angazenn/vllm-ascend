@@ -63,11 +63,8 @@ from vllm.v1.core.sched.output import GrammarOutput, SchedulerOutput
 from vllm.v1.kv_cache_interface import (
     AttentionSpec,
     KVCacheConfig,
-    KVCacheGroupSpec,
     KVCacheSpec,
     MambaSpec,
-    SlidingWindowSpec,
-    UniformTypeKVCacheSpecs,
 )
 from vllm.v1.outputs import EMPTY_MODEL_RUNNER_OUTPUT, AsyncModelRunnerOutput, DraftTokenIds, ModelRunnerOutput
 from vllm.v1.utils import report_usage_stats
@@ -82,6 +79,11 @@ from vllm.v1.worker.workspace import init_workspace_manager
 import vllm_ascend.envs as envs_ascend
 from vllm_ascend.ascend_config import KVPPConfig, get_ascend_config, init_ascend_config
 from vllm_ascend.batch_invariant import init_batch_invariance
+from vllm_ascend.core.kv_cache_compat import (
+    KVCacheGroupSpec,
+    SlidingWindowSpec,
+    UniformTypeKVCacheSpecs,
+)
 from vllm_ascend.core.kv_cache_placement import (
     KVPPPhysicalCachePlan,
     create_kvpp_cache_allocation_plan,
@@ -1264,6 +1266,10 @@ class NPUWorker(WorkerBase):
                     physical_page_bytes += indexer.spec.page_size_bytes
                     break
         return num_layers, num_buffer_assignments, logical_page_bytes / physical_page_bytes
+
+    def get_kv_cache_layer_configs(self):
+        """Return native declarations to the engine core on vLLM #61452."""
+        return self.model_runner.get_kv_cache_layer_configs()
 
     def get_kv_cache_spec(self) -> dict[str, KVCacheSpec]:
         kv_cache_spec = self.model_runner.get_kv_cache_spec()

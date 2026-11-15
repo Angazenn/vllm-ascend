@@ -120,6 +120,7 @@ from vllm_ascend.worker.device_metadata import TargetDeviceMetadata
 from vllm_ascend.worker.utils import disable_compilation
 from vllm_ascend.worker.v2.aclgraph_utils import ModelAclGraphManager
 from vllm_ascend.worker.v2.attn_utils import (
+    _get_layer_kv_cache_specs,
     build_attn_state,
     skip_ring_state_update,
 )
@@ -493,7 +494,7 @@ class NPUModelRunner(GPUModelRunner):
             self.model_state._offload_draft_attn_groups = (
                 [] if resident_draft_names else getattr(self.speculator, "attn_groups", [])
             )
-        if any(is_circular_kv_cache_spec(group.kv_cache_spec) for group in self.kv_cache_config.kv_cache_groups):
+        if any(is_circular_kv_cache_spec(spec) for spec in _get_layer_kv_cache_specs(self.kv_cache_config).values()):
             from vllm_ascend.models.deepseek_v41.compressor import DeepseekV41Compressor
 
             for module in self.model.modules():

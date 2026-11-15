@@ -4,25 +4,27 @@
 import inspect
 from collections.abc import Iterable
 from dataclasses import dataclass, replace
-from typing import Any
+from typing import Any, Self
 
 import torch
-from typing_extensions import Self
 from vllm.config import CacheConfig, VllmConfig
 from vllm.utils.math_utils import cdiv
 from vllm.utils.torch_utils import get_dtype_size
 from vllm.v1.core.single_type_kv_cache_manager import FullAttentionManager, SlidingWindowManager
 from vllm.v1.kv_cache_interface import (
-    CircularBufferSpec,
-    FullAttentionSpec,
     KVCacheSpec,
     MambaSpec,
     MLAAttentionSpec,
+)
+
+from vllm_ascend.core.kv_cache_compat import (
+    CircularBufferSpec,
+    FullAttentionSpec,
+    KVCacheSpecRegistry,
     SlidingWindowMLASpec,
     SlidingWindowSpec,
     UniformTypeKVCacheSpecs,
 )
-from vllm.v1.kv_cache_spec_registry import KVCacheSpecRegistry
 
 
 def get_kv_cache_compression_ratio(kv_cache_spec: KVCacheSpec) -> int:

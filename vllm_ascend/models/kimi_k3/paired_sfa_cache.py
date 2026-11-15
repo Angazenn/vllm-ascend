@@ -15,12 +15,14 @@ from vllm.config import VllmConfig
 from vllm.model_executor.models.utils import extract_layer_index
 from vllm.v1.kv_cache_interface import (
     KVCacheConfig,
-    KVCacheGroupSpec,
     KVCacheTensor,
     MambaSpec,
-    UniformTypeKVCacheSpecs,
 )
 
+from vllm_ascend.core.kv_cache_compat import (
+    KVCacheGroupSpec,
+    UniformTypeKVCacheSpecs,
+)
 from vllm_ascend.core.kv_cache_interface import AscendMLAAttentionSpec, AscendSFAIndexerCacheSpec
 from vllm_ascend.models.kimi_k3.cache_config import make_kimi_cache_groups
 from vllm_ascend.utils import vllm_version_is

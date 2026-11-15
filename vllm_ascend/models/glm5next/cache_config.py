@@ -22,14 +22,16 @@ from vllm.v1.core.kv_cache_planning import (
 )
 from vllm.v1.kv_cache_interface import (
     KVCacheConfig,
-    KVCacheGroupSpec,
     KVCacheSpec,
     KVCacheTensor,
     MambaSpec,
     MLAAttentionSpec,
-    UniformTypeKVCacheSpecs,
 )
 
+from vllm_ascend.core.kv_cache_compat import (
+    KVCacheGroupSpec,
+    UniformTypeKVCacheSpecs,
+)
 from vllm_ascend.core.kv_cache_interface import (
     AscendIndexerKPoolTailSpec,
     AscendMLAAttentionSpec,
