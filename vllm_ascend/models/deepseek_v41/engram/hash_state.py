@@ -19,11 +19,11 @@ launch is split into request search and hashing for the Ascend compiler.
 import torch
 
 # Upstream #56741 normalized the V4.1 model package name.
+from vllm.models.deepseek_v41.common import engram as upstream_engram
 from vllm.models.deepseek_v41.common.engram import (
     DEAD_ID,
     EngramLayout,
     NgramHashState,
-    _write_hash_cache_kernel,
 )
 from vllm.triton_utils import triton
 
@@ -76,6 +76,9 @@ class AscendNgramHashState(NgramHashState):
     Keep that compiler workaround in this subclass, without changing vLLM.
     """
 
+    # Still set by the old upstream constructor when it owns a slot history.
+    use_slot_cache = False
+
     def forward(
         self,
         input_ids: torch.Tensor,
@@ -116,7 +119,9 @@ class AscendNgramHashState(NgramHashState):
             assert cache is not None and slot_mapping is not None
             assert block_table is not None
             # Finish writes before other thread blocks read fallback history.
-            _write_hash_cache_kernel[(triton.cdiv(num_tokens, 256),)](
+            upstream_engram._write_hash_cache_kernel[  # type: ignore[attr-defined]
+                (triton.cdiv(num_tokens, 256),)
+            ](
                 input_ids,
                 self.token_map,
                 dead_mask,
@@ -157,7 +162,7 @@ class AscendNgramHashState(NgramHashState):
             query_stride=query_start_loc.stride(0),
             num_table_rows=block_table.shape[0] if block_table is not None else 0,
             max_blocks=block_table.shape[1] if block_table is not None else 0,
-            cache_block_size=self.block_size,
+            cache_block_size=self.swa_cache_module.block_size,
             MAX_NGRAM=max_ngram,
             num_heads=num_heads,
             BLOCK_T=32,
