@@ -90,7 +90,7 @@ class SFAPDRD2HProducerScheduler:
         self.vllm_config = vllm_config
         self.kv_cache_config = kv_cache_config
         self.engine_id = engine_id
-        self.block_size = [group_spec.kv_cache_spec.block_size for group_spec in kv_cache_config.kv_cache_groups]
+        self.block_size = [group_spec.block_size for group_spec in kv_cache_config.kv_cache_groups]
         self._reqs_need_send_layerwise: dict[str, _SendReqInfo] = {}
 
     @staticmethod
@@ -249,7 +249,7 @@ class SFAPDRD2HScheduler:
 
         if kv_cache_config is None:
             raise ValueError("SFAPDRD2HScheduler requires KVCacheConfig")
-        self.block_size = [group_spec.kv_cache_spec.block_size for group_spec in kv_cache_config.kv_cache_groups]
+        self.block_size = [group_spec.block_size for group_spec in kv_cache_config.kv_cache_groups]
         self.main_group_idx, self.indexer_group_idx = infer_sfa_component_group_ids(kv_cache_config)
         self._dspark_context_groups = self._find_dspark_context_groups()
         self._dspark_context_requests: dict[str, tuple[DSparkContextDescriptor, dict[int, tuple[int, ...]]]] = {}
@@ -312,17 +312,10 @@ class SFAPDRD2HScheduler:
         speculative_config = getattr(self.vllm_config, "speculative_config", None)
         if speculative_config is None or speculative_config.method != "dspark":
             return ()
-        group_ids = getattr(self.kv_cache_config, "dspark_context_group_ids", None)
-        if group_ids is None:
-            group_ids = resident_mla_context_group_ids(self.kv_cache_config.kv_cache_groups)
+        group_ids = resident_mla_context_group_ids(self.kv_cache_config.kv_cache_groups)
         if not group_ids:
             raise RuntimeError("DSpark sparse offload requires loader-created resident MLA cache groups")
-        if len(set(group_ids)) != len(group_ids) or any(
-            type(group_id) is not int or not 0 <= group_id < len(self.kv_cache_config.kv_cache_groups)
-            for group_id in group_ids
-        ):
-            raise RuntimeError("DSpark resident MLA group ownership is invalid")
-        return tuple(group_ids)
+        return group_ids
 
     # ------------------------------------------------------------------
     # D side (kv_consumer)

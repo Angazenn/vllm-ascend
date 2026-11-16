@@ -38,7 +38,8 @@ from vllm.config import CacheConfig, VllmConfig
 from vllm.model_executor.layers.linear import ReplicatedLinear
 from vllm.model_executor.layers.quantization import QuantizationConfig
 from vllm.models.deepseek_v4.attention import DeepseekV4IndexerCache
-from vllm.v1.kv_cache_interface import KVCacheSpec
+from vllm.v1.core.single_type_kv_cache_manager import FullAttentionManager
+from vllm.v1.kv_cache_interface import KVCacheLayerConfig
 
 from vllm_ascend.device.hardware_profile import HardwareCapability, get_current_hardware_profile
 from vllm_ascend.models.deepseek_v4.compressor import AscendCompressorMetadata, Compressor
@@ -137,15 +138,12 @@ class AscendDeepseekV4IndexerCache(DeepseekV4IndexerCache):
     ):
         super().__init__(head_dim, dtype, prefix, cache_config, compress_ratio)
 
-    def get_kv_cache_spec(self, vllm_config: VllmConfig) -> KVCacheSpec:
+    def get_kv_cache_config(self, vllm_config: VllmConfig) -> KVCacheLayerConfig:
         from vllm_ascend.core.kv_cache_interface import AscendMLAAttentionSpec
         from vllm_ascend.models.layer.attention.layer import DSV4_BLOCK_SIZES
 
         storage_block_size = DSV4_BLOCK_SIZES[vllm_config.cache_config.block_size][0][0]
-        # vLLM #51718 replaced MLAAttentionSpec.compress_ratio with
-        # AttentionSpec.tokens_per_state on main.
-        ratio_kwargs = {"tokens_per_state": self.compress_ratio}
-        return AscendMLAAttentionSpec(
+        spec = AscendMLAAttentionSpec(
             block_size=storage_block_size * self.compress_ratio,
             num_kv_heads=1,
             head_size=self.head_dim,
@@ -156,8 +154,9 @@ class AscendDeepseekV4IndexerCache(DeepseekV4IndexerCache):
             scale_dtype=torch.float
             if get_current_hardware_profile().supports(HardwareCapability.DSV4_COMPRESSED_CACHE)
             else torch.float16,
-            **ratio_kwargs,
+            tokens_per_state=self.compress_ratio,
         )
+        return FullAttentionManager.layer_config(spec)
 
     def forward(self): ...
 

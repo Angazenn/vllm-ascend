@@ -1413,21 +1413,17 @@ def test_adjust_kernel_block_sizes_respects_physical_blocks(block_sizes, head_si
             self.block_size = block_size
             self.head_size = head_size
 
-    class FakeUniformTypeKVCacheSpecs:
-        def __init__(self, specs):
-            self.kv_cache_specs = dict(enumerate(specs))
-
     specs = [FakeAttentionSpec(b, h) for b, h in zip(block_sizes, head_sizes)]
-    group_spec = specs[0] if len(specs) == 1 else FakeUniformTypeKVCacheSpecs(specs)
     runner = object.__new__(NPUModelRunner310V2)
     runner.kernel_block_sizes = [128]
     runner.attn_groups = [
         [SimpleNamespace(backend=SimpleNamespace(get_supported_kernel_block_sizes=lambda: [128, 64]))]
     ]
-    config = SimpleNamespace(kv_cache_groups=[SimpleNamespace(kv_cache_spec=group_spec)])
+    config = SimpleNamespace(
+        kv_cache_groups=[SimpleNamespace(kv_cache_specs={str(i): spec for i, spec in enumerate(specs)})]
+    )
     with (
         patch.object(model_runner_module, "AttentionSpec", FakeAttentionSpec),
-        patch.object(model_runner_module, "UniformTypeKVCacheSpecs", FakeUniformTypeKVCacheSpecs),
     ):
         runner._adjust_kernel_block_sizes(config)
     assert runner.kernel_block_sizes == [expected_kernel_size]
@@ -1444,7 +1440,7 @@ def test_adjust_kernel_block_sizes_rejects_incompatible_physical_blocks():
     runner.attn_groups = [
         [SimpleNamespace(backend=SimpleNamespace(get_supported_kernel_block_sizes=lambda: [128, 64]))]
     ]
-    config = SimpleNamespace(kv_cache_groups=[SimpleNamespace(kv_cache_spec=FakeAttentionSpec())])
+    config = SimpleNamespace(kv_cache_groups=[SimpleNamespace(kv_cache_specs={"layer": FakeAttentionSpec()})])
     with (
         patch.object(model_runner_module, "AttentionSpec", FakeAttentionSpec),
         pytest.raises(NotImplementedError, match="divides every attention cache block size"),

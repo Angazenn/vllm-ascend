@@ -5,7 +5,8 @@ from unittest.mock import Mock
 import pytest
 import torch
 from vllm.utils.torch_utils import get_dtype_size
-from vllm.v1.kv_cache_interface import KVCacheConfig, KVCacheGroupSpec, KVCacheTensor, UniformTypeKVCacheSpecs
+from vllm.v1.core.single_type_kv_cache_manager import FullAttentionManager, SlidingWindowManager
+from vllm.v1.kv_cache_interface import KVCacheConfig, KVCacheGroup, KVCacheTensor
 
 from vllm_ascend.attention import dsa_v1
 from vllm_ascend.attention.dsa_v1 import AscendDSAC4Backend, AscendDSAImpl
@@ -92,7 +93,7 @@ def test_dsv4_cache_view_validates_backing_size_in_bytes():
     config = KVCacheConfig(
         num_blocks=1,
         kv_cache_tensors=[],
-        kv_cache_groups=[KVCacheGroupSpec(layer_names=["attn"], kv_cache_spec=spec)],
+        kv_cache_groups=[KVCacheGroup.from_layers({"attn": FullAttentionManager.layer_config(spec)})],
     )
     raw = torch.empty(
         spec.page_size_bytes // torch.empty((), dtype=torch.bfloat16).element_size(),
@@ -124,7 +125,7 @@ def test_non_turboquant_v2_rejects_noncontiguous_pages_before_allocation(monkeyp
     config = KVCacheConfig(
         num_blocks=2,
         kv_cache_tensors=[descriptor],
-        kv_cache_groups=[KVCacheGroupSpec(layer_names=["attn"], kv_cache_spec=spec)],
+        kv_cache_groups=[KVCacheGroup.from_layers({"attn": FullAttentionManager.layer_config(spec)})],
     )
     runtime = SimpleNamespace(
         additional_config={},
@@ -162,8 +163,8 @@ def test_tq_v2_uses_one_backing_and_preserves_strided_pages(monkeypatch):
         model_version="deepseek_v4",
     )
     groups = [
-        KVCacheGroupSpec(layer_names=list(specs), kv_cache_spec=UniformTypeKVCacheSpecs.from_specs(specs)),
-        KVCacheGroupSpec(layer_names=["swa"], kv_cache_spec=UniformTypeKVCacheSpecs.from_specs({"swa": swa})),
+        KVCacheGroup.from_layers({name: FullAttentionManager.layer_config(spec) for name, spec in specs.items()}),
+        KVCacheGroup.from_layers({"swa": SlidingWindowManager.layer_config(swa, sliding_window=128)}),
     ]
     runtime = SimpleNamespace(
         additional_config={},
@@ -171,7 +172,8 @@ def test_tq_v2_uses_one_backing_and_preserves_strided_pages(monkeypatch):
         kv_transfer_config=None,
         model_config=SimpleNamespace(hf_config=SimpleNamespace(compress_ratios=[4])),
     )
-    num_blocks, descriptors = cache.cache_config(runtime, groups, cache.pool_bytes_per_block(groups) * 3)
+    num_blocks = 3
+    descriptors = cache.cache_tensors(groups, num_blocks)
     config = KVCacheConfig(num_blocks=num_blocks, kv_cache_tensors=descriptors, kv_cache_groups=groups)
     monkeypatch.setattr(attn_utils, "get_current_vllm_config", lambda: runtime)
     allocations = []
@@ -225,8 +227,8 @@ def test_unified_dsv4_matches_existing_allocation_and_views(monkeypatch, turboqu
             KVCacheTensor(size=pool_size, layers=[alias_name], offset=0, layer_stride=0, block_stride=stride),
         ],
         kv_cache_groups=[
-            KVCacheGroupSpec(names, UniformTypeKVCacheSpecs.from_specs(dict.fromkeys(names, spec))),
-            KVCacheGroupSpec([alias_name], UniformTypeKVCacheSpecs.from_specs({alias_name: spec})),
+            KVCacheGroup.from_layers(dict.fromkeys(names, FullAttentionManager.layer_config(spec))),
+            KVCacheGroup.from_layers({alias_name: FullAttentionManager.layer_config(spec)}),
         ],
     )
     runtime = SimpleNamespace(

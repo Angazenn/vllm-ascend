@@ -78,7 +78,7 @@ from vllm_ascend.utils import (
 
 from .cache_config import (
     make_mla_cache_spec,
-    make_swa_cache_spec,
+    make_swa_cache_layout,
 )
 from .compressor import DeepseekV41Compressor
 from .decoder_replay_layers import make_decoder_replay
@@ -568,13 +568,11 @@ class AscendDeepseekV41SWACache(DeepseekV41CacheLayer):
 
     def __init__(self, head_dim, window_size, dtype, prefix, cache_config, bounded_replay=False):
         block_size = cache_config.block_size
-        spec = make_swa_cache_spec(
+        spec = make_swa_cache_layout(
             block_size=block_size,
-            window_size=window_size,
             head_size=head_dim,
             dtype=dtype,
             cache_dtype=cache_config.cache_dtype,
-            bounded_replay=bounded_replay,
         )
         super().__init__(get_current_vllm_config(), prefix, spec)
         self.head_dim = head_dim
@@ -582,6 +580,16 @@ class AscendDeepseekV41SWACache(DeepseekV41CacheLayer):
         self.dtype = dtype
         self.block_size = block_size
         self.cache_config = cache_config
+        self.bounded_replay = bounded_replay
+
+    def get_kv_cache_config(self, vllm_config):
+        from vllm.v1.core.single_type_kv_cache_manager import SlidingWindowManager
+
+        return SlidingWindowManager.layer_config(
+            self.spec,
+            sliding_window=self.window_size,
+            bounded_replay=self.bounded_replay,
+        )
 
 
 class DeepseekV41SWAAttention(nn.Module):

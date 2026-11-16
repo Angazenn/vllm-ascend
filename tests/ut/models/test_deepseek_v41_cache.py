@@ -18,21 +18,21 @@ import torch
 import torch_npu
 from vllm.config import set_current_vllm_config
 from vllm.transformers_utils.configs.deepseek_v41 import DeepseekV41Config
-
-# vLLM #61183 moved the KV-cache planning helpers to `kv_cache_planning` on
-# main; the v0.33.0 lane still ships them in `kv_cache_utils`.
 from vllm.v1.core import kv_cache_planning, kv_cache_utils
-from vllm.v1.kv_cache_interface import CircularBufferSpec
+from vllm.v1.kv_cache_interface import MLAAttentionSpec
 
 from tests.deepseek_v41_utils import (
     allocate_cache_views,
     build_v41_cache_specs,
     compressor_ratio2_reference,
     gather_cache_rows,
+    group_v41_test_specs,
     make_cache_config,
+    plan_v41_test_cache,
     scatter_cache,
     select_candidate_blocks,
     select_index_topk,
+    v41_pool_bytes_per_block,
 )
 from vllm_ascend.attention import dsa_v41
 from vllm_ascend.attention.dsa_v41 import (
@@ -43,45 +43,27 @@ from vllm_ascend.attention.dsa_v41 import (
     pad_sparse_indices,
     scatter_cache_sk,
 )
+from vllm_ascend.core.kv_cache_config_builder import AscendKVCacheConfigBuilder
 from vllm_ascend.core.kv_cache_interface import (
+    AscendCircularBufferSpec,
     AscendMLAAttentionSpec,
-    AscendSlidingWindowMLASpec,
-    declared_kwarg,
     get_storage_block_size,
 )
 from vllm_ascend.models.deepseek_v41.cache_config import (
-    get_deepseek_v41_kv_cache_config,
-    get_deepseek_v41_pool_bytes_per_block,
     get_layer_tuples,
-    group_cache_specs,
     is_deepseek_v41_cache,
-    make_cache_groups,
     make_folded_index_cache_spec,
     make_index_cache_spec,
     make_mla_cache_spec,
-    make_swa_cache_spec,
+    make_swa_cache_layout,
 )
 from vllm_ascend.models.deepseek_v41.compressor import DeepseekV41Compressor
 from vllm_ascend.models.deepseek_v41.model import AscendDeepseekV41SWACache, build_layer_plan
 from vllm_ascend.worker.device_metadata import DeviceMetadataStage, DeviceMetadataTask
 
 
-def _pool_bytes_per_block(runtime, groups):
-    """vLLM #57169 added a leading ``vllm_config`` argument on main."""
-    return kv_cache_planning._pool_bytes_per_block(runtime, groups)
-
-
 def _max_memory_usage_bytes_from_groups(runtime, groups):
-    """Call the admission helper with the signature the live vLLM expects.
-
-    vLLM #42309 added a leading ``KVCacheConfigBuilder`` argument on main. The
-    live module attribute is Ascend's override, which delegates V4.1 groups to
-    the upstream formula; that formula sizes the pool through the builder hook,
-    so feed it the Ascend V4.1 per-block cost.
-    """
-    builder = MagicMock()
-    builder._get_pool_bytes_per_block.return_value = get_deepseek_v41_pool_bytes_per_block(groups)
-    return kv_cache_planning._max_memory_usage_bytes_from_groups(builder, runtime, groups)
+    return kv_cache_planning._max_memory_usage_bytes_from_groups(AscendKVCacheConfigBuilder(), runtime, groups)
 
 
 @pytest.fixture(autouse=True)
@@ -164,19 +146,18 @@ def collect_specs(runtime, prefix="model"):
 
 @pytest.mark.parametrize("packed", [False, True])
 def test_compressor_registers_state_cache_and_preserves_norm_weights(config, runtime, monkeypatch, packed):
-    from vllm_ascend.core.kv_cache_interface import AscendCircularBufferSpec
-
     monkeypatch.setattr("vllm_ascend.models.deepseek_v41.compressor.uses_a5_packed_cache", lambda: packed)
     runtime.scheduler_config.max_num_batched_tokens = 8
     compressor = DeepseekV41Compressor(config, 2, runtime, prefix="compressor")
     state = compressor.state_cache
-    assert type(state) is DeepseekV41CacheLayer
+    assert isinstance(state, DeepseekV41CacheLayer)
     assert runtime.compilation_config.static_forward_context["compressor.state_cache"] is state
-    spec = state.get_kv_cache_spec(runtime)
+    spec = state.get_kv_cache_config(runtime).spec
     assert spec.dtype == torch.float32
     assert spec.block_size == 32
     assert spec.head_size == 2 * config.head_dim
-    assert type(spec) is (AscendCircularBufferSpec if packed else CircularBufferSpec)
+    assert type(spec) is AscendCircularBufferSpec
+    assert state.get_kv_cache_config(runtime).manager_cls.zeroes_new_blocks is packed
     assert compressor.norm.weight.dtype == torch.bfloat16
     assert set(compressor.state_dict()) == {"wkv.weight", "wgate.weight", "norm.weight"}
 
@@ -185,7 +166,7 @@ def test_owner_counts_nested_config_and_source_resolution(config, runtime):
     topology = build_layer_plan(DeepseekV41Config(text_config=vars(config)))
     specs = collect_specs(runtime)
     assert len(specs) == 51
-    assert is_deepseek_v41_cache(specs)
+    assert is_deepseek_v41_cache(specs.values())
     assert topology.kv_consumers(2) == tuple(range(2, 8))
     assert topology.kv_consumers(20) == tuple(range(20, 40))
     assert topology.layer(26).kv_source_layer == 20
@@ -195,30 +176,25 @@ def test_owner_counts_nested_config_and_source_resolution(config, runtime):
     assert "model.layers.20.self_attn.compressor.state_cache" not in specs
     assert type(specs["model.layers.2.self_attn.long_kv_cache"]) is AscendMLAAttentionSpec
     assert type(specs["model.layers.2.self_attn.indexer.k_cache"]) is AscendMLAAttentionSpec
-    assert type(specs["model.layers.2.self_attn.swa_cache"]) is AscendSlidingWindowMLASpec
-    assert type(specs["model.layers.2.self_attn.compressor.state_cache"]) is CircularBufferSpec
+    assert type(specs["model.layers.2.self_attn.swa_cache"]) is MLAAttentionSpec
+    assert type(specs["model.layers.2.self_attn.compressor.state_cache"]) is AscendCircularBufferSpec
 
 
-@pytest.mark.parametrize("packed_groups", [False, True])
-def test_swa_only_reduced_backbone_uses_independent_slots(config, runtime, packed_groups):
+def test_swa_only_reduced_backbone_uses_independent_slots(config, runtime):
     config.num_hidden_layers = 2
     config.compress_ratios = [0, 0]
     config.kv_source_layer_ids = []
     config.index_source_layer_ids = []
     specs = collect_specs(runtime)
     assert len(specs) == 2
-    assert all(isinstance(spec, AscendSlidingWindowMLASpec) for spec in specs.values())
-    assert is_deepseek_v41_cache(specs)
+    assert all(type(spec) is MLAAttentionSpec for spec in specs.values())
+    assert is_deepseek_v41_cache(specs.values())
 
-    groups = (
-        make_cache_groups(group_cache_specs(specs))
-        if packed_groups
-        else kv_cache_planning.get_kv_cache_groups(runtime, specs)
-    )
-    assert is_deepseek_v41_cache(groups)
+    groups = group_v41_test_specs(specs)
+    assert is_deepseek_v41_cache(spec for group in groups for spec in group.distinct_specs)
     page_bytes = sum(spec.page_size_bytes for spec in specs.values())
-    assert _pool_bytes_per_block(runtime, groups) == page_bytes
-    cache_config = kv_cache_planning.get_kv_cache_config_from_groups(runtime, groups, 10 * page_bytes + 1)
+    assert v41_pool_bytes_per_block(runtime, groups) == page_bytes
+    cache_config = plan_v41_test_cache(runtime, groups, 10 * page_bytes + 1)
     assert cache_config.num_blocks == 10
     assert len(cache_config.kv_cache_tensors) == 2
     assert {tuple(tensor.layers) for tensor in cache_config.kv_cache_tensors} == {(name,) for name in specs}
@@ -233,24 +209,24 @@ def test_swa_only_reduced_backbone_uses_independent_slots(config, runtime, packe
 
 def test_twelve_groups_share_four_layer_slots(config, runtime):
     original = collect_specs(runtime)
-    uniform = group_cache_specs(original)
+    uniform = group_v41_test_specs(original)
     assert [len(g.kv_cache_specs) for g in uniform] == [8, 3] + [4] * 10
     assert [g.block_size for g in uniform] == [64, 32] + [64] * 10
-    groups = make_cache_groups(uniform)
-    assert is_deepseek_v41_cache(groups)
+    groups = uniform
+    assert is_deepseek_v41_cache(spec for group in groups for spec in group.distinct_specs)
     for row, group in enumerate(groups[2:]):
         assert group.layer_names == [
             f"model.layers.{layer}.self_attn.swa_cache" for layer in range(row * 4, row * 4 + 4)
         ]
     specs = {n: s for g in uniform for n, s in g.kv_cache_specs.items()}
     assert all(s.page_size_padded is None for s in original.values())
-    assert group_cache_specs(specs) == uniform  # Replanning cannot accumulate padding.
-    assert group_cache_specs(dict(reversed(list(original.items())))) == uniform
+    assert group_v41_test_specs(specs) == uniform  # Replanning cannot accumulate padding.
+    assert group_v41_test_specs(dict(reversed(list(original.items())))) == uniform
     page_sizes, layer_tuples = get_layer_tuples(specs)
-    cache_config = get_deepseek_v41_kv_cache_config(
+    cache_config = plan_v41_test_cache(
         runtime,
         groups,
-        get_deepseek_v41_pool_bytes_per_block(groups) * 10 + 1,
+        v41_pool_bytes_per_block(runtime, groups) * 10 + 1,
     )
     blocks = cache_config.num_blocks
     placements = {d.layers[0]: d for d in cache_config.kv_cache_tensors}
@@ -258,7 +234,7 @@ def test_twelve_groups_share_four_layer_slots(config, runtime):
     raw, caches = allocate_cache_views(cache_config)
     assert len(raw) == 1
     backing = raw[0]
-    assert backing.numel() == blocks * get_deepseek_v41_pool_bytes_per_block(groups)
+    assert backing.numel() == blocks * v41_pool_bytes_per_block(runtime, groups)
     assert set(caches) == set(original)
     slot_offset = 0
     for page_size, layer_tuple in zip(page_sizes, layer_tuples):
@@ -292,8 +268,8 @@ def test_candidate_source_folded_index_cache_is_in_same_physical_slot(runtime):
     source_slot = next(i for i, slot in enumerate(tuples) if long_name in slot)
     assert tuples[source_slot][:3] == (long_name, index_name, name)
     assert page_sizes[source_slot] >= sum(specs[layer].unpadded_page_size_bytes for layer in tuples[source_slot][:3])
-    groups = make_cache_groups(group_cache_specs(specs))
-    planned = get_deepseek_v41_kv_cache_config(runtime, groups, get_deepseek_v41_pool_bytes_per_block(groups) * 2)
+    groups = group_v41_test_specs(specs)
+    planned = plan_v41_test_cache(runtime, groups, v41_pool_bytes_per_block(runtime, groups) * 2)
     placements = {d.layers[0]: d for d in planned.kv_cache_tensors}
     slot_offset = planned.num_blocks * sum(page_sizes[:source_slot])
     assert placements[long_name].offset == slot_offset
@@ -316,10 +292,9 @@ def test_mrv2_unified_pool_preserves_slot_layout(runtime, monkeypatch, block_siz
     if packed:
         monkeypatch.setattr("vllm_ascend.models.deepseek_v41.cache_config.uses_a5_packed_cache", lambda: True)
         for name, spec in specs.items():
-            if isinstance(spec, AscendSlidingWindowMLASpec):
-                specs[name] = make_swa_cache_spec(
+            if type(spec) is MLAAttentionSpec:
+                specs[name] = make_swa_cache_layout(
                     block_size=spec.block_size,
-                    window_size=128,
                     head_size=512,
                     dtype=torch.bfloat16,
                     cache_dtype="auto",
@@ -334,8 +309,8 @@ def test_mrv2_unified_pool_preserves_slot_layout(runtime, monkeypatch, block_siz
     index = folded.removesuffix("_folded")
     long_kv = folded.removesuffix(".indexer.k_cache_folded") + ".long_kv_cache"
     specs[folded] = make_folded_index_cache_spec(block_size=runtime.cache_config.block_size)
-    groups = make_cache_groups(group_cache_specs(specs))
-    planned = get_deepseek_v41_kv_cache_config(runtime, groups, get_deepseek_v41_pool_bytes_per_block(groups) * 2)
+    groups = group_v41_test_specs(specs)
+    planned = plan_v41_test_cache(runtime, groups, v41_pool_bytes_per_block(runtime, groups) * 2)
     layer_specs = attn_utils._get_layer_kv_cache_specs(planned)
     layers = {name: DeepseekV41CacheLayer(runtime, name, spec) for name, spec in layer_specs.items()}
     runtime.model_config.hf_text_config.model_type = "deepseek_v41_text"
@@ -357,12 +332,10 @@ def test_mrv2_unified_pool_preserves_slot_layout(runtime, monkeypatch, block_siz
         "get_kv_cache_shape",
         Mock(side_effect=AssertionError("legacy backend shapes")),
     )
-    caches = attn_utils.allocate_kv_cache_main(
-        planned, torch.device("cpu"), None, [g.kv_cache_spec.block_size for g in groups]
-    )
+    caches = attn_utils.allocate_kv_cache_main(planned, torch.device("cpu"), None, [g.block_size for g in groups])
     assert len(allocations) == 1
     backing = allocations[0]
-    assert backing.numel() == planned.num_blocks * get_deepseek_v41_pool_bytes_per_block(groups)
+    assert backing.numel() == planned.num_blocks * v41_pool_bytes_per_block(runtime, groups)
     if kv_transfer:
         assert backing.data_ptr() % (2 * 1024 * 1024) == 0
     placements = {d.layers[0]: d for d in planned.kv_cache_tensors}
@@ -397,11 +370,11 @@ def test_mrv2_unified_pool_preserves_slot_layout(runtime, monkeypatch, block_siz
 def test_production_layout_matches_design(config, runtime):
     runtime.cache_config.block_size = 128
     specs = build_v41_cache_specs(SimpleNamespace(**(vars(config) | {"head_dim": 512, "index_head_dim": 128})), runtime)
-    groups = make_cache_groups(group_cache_specs(specs))
+    groups = group_v41_test_specs(specs)
     assert len(groups) == 12
-    assert [g.kv_cache_spec.page_size_bytes for g in groups] == [540928, 393216] + [540928] * 10
-    assert get_deepseek_v41_pool_bytes_per_block(groups) == 540928
-    padded = {name: spec for group in groups for name, spec in group.kv_cache_spec.kv_cache_specs.items()}
+    assert [g.page_size_bytes for g in groups] == [540928, 393216] + [540928] * 10
+    assert v41_pool_bytes_per_block(runtime, groups) == 540928
+    padded = {name: spec for group in groups for name, spec in group.kv_cache_specs.items()}
     page_sizes, layer_tuples = get_layer_tuples(padded)
     assert page_sizes == [131072] * 3 + [147712]
     assert [len(layer_tuple) for layer_tuple in layer_tuples] == [13, 13, 13, 12]
@@ -409,8 +382,8 @@ def test_production_layout_matches_design(config, runtime):
         tuple_specs = [padded[name] for name in layer_tuple]
         assert sum(isinstance(spec, AscendMLAAttentionSpec) and not spec.scale_dim for spec in tuple_specs) == 1
         assert sum(isinstance(spec, AscendMLAAttentionSpec) and spec.scale_dim for spec in tuple_specs) == 1
-        assert sum(isinstance(spec, CircularBufferSpec) for spec in tuple_specs) == int(i < 3)
-        assert sum(isinstance(spec, AscendSlidingWindowMLASpec) for spec in tuple_specs) == 10
+        assert sum(isinstance(spec, AscendCircularBufferSpec) for spec in tuple_specs) == int(i < 3)
+        assert sum(type(spec) is MLAAttentionSpec for spec in tuple_specs) == 10
         assert padded[layer_tuple[0]].unpadded_page_size_bytes == (65536 if i < 3 else 131072)
         assert padded[layer_tuple[1]].page_size_bytes == (65536 if i < 3 else 16640)
     swa_padding = [
@@ -419,19 +392,19 @@ def test_production_layout_matches_design(config, runtime):
         if n.endswith(".swa_cache") and ".mtp." not in f".{n}"
     ]
     assert swa_padding.count(0) == 30 and swa_padding.count(16640) == 10
-    cache_config = get_deepseek_v41_kv_cache_config(runtime, groups, 540928 * 3)
+    cache_config = plan_v41_test_cache(runtime, groups, 540928 * 3)
     assert cache_config.num_blocks == 3
     _, caches = allocate_cache_views(cache_config)
     assert sum(caches[n].is_contiguous() for n in padded if n.endswith(".swa_cache") and ".mtp." not in f".{n}") == 30
 
 
 def test_shared_slots_isolate_groups_and_recycled_ids(config, runtime):
-    groups = make_cache_groups(group_cache_specs(collect_specs(runtime)))
+    groups = group_v41_test_specs(collect_specs(runtime))
     count = len(groups) + 1
-    cfg = get_deepseek_v41_kv_cache_config(
+    cfg = plan_v41_test_cache(
         runtime,
         groups,
-        get_deepseek_v41_pool_bytes_per_block(groups) * count,
+        v41_pool_bytes_per_block(runtime, groups) * count,
     )
     _, caches = allocate_cache_views(cfg)
     expected = []
@@ -478,34 +451,31 @@ def test_v2_view_with_nonzero_component_storage_offset():
 def test_request_accounting_counts_merged_full_context_once(runtime):
     runtime.model_config.max_model_len = 1024
     runtime.max_in_flight_tokens = 128
-    groups = make_cache_groups(group_cache_specs(collect_specs(runtime)))
-    bounded = sum(
-        max(s.max_memory_usage_bytes(runtime) // s.page_size_bytes for s in g.kv_cache_spec.kv_cache_specs.values())
-        for g in groups[1:]
-    )
-    page = get_deepseek_v41_pool_bytes_per_block(groups)
+    groups = group_v41_test_specs(collect_specs(runtime))
+    bounded = sum(group.max_allocated_blocks_per_request(runtime) for group in groups[1:])
+    page = v41_pool_bytes_per_block(runtime, groups)
     required = _max_memory_usage_bytes_from_groups(runtime, groups)
     assert required // page == 1024 // 64 + bounded
 
 
 def test_safe_override_capacity(runtime):
-    groups = make_cache_groups(group_cache_specs(collect_specs(runtime)))
-    page = get_deepseek_v41_pool_bytes_per_block(groups)
+    groups = group_v41_test_specs(collect_specs(runtime))
+    page = v41_pool_bytes_per_block(runtime, groups)
     runtime.cache_config.num_gpu_blocks_override = 3
-    config = get_deepseek_v41_kv_cache_config(runtime, groups, 5 * page + 1)
+    config = plan_v41_test_cache(runtime, groups, 5 * page + 1)
     assert config.num_blocks == 3 and {t.size for t in config.kv_cache_tensors} == {3 * page}
 
 
 def test_upstream_entrypoint_and_admission_use_slot_reservation(runtime):
     runtime.model_config.max_model_len = 1024
     runtime.max_in_flight_tokens = 128
-    groups = make_cache_groups(group_cache_specs(collect_specs(runtime)))
-    page = get_deepseek_v41_pool_bytes_per_block(groups)
-    config = kv_cache_planning.get_kv_cache_config_from_groups(runtime, groups, 100 * page)
+    groups = group_v41_test_specs(collect_specs(runtime))
+    page = v41_pool_bytes_per_block(runtime, groups)
+    config = plan_v41_test_cache(runtime, groups, 100 * page)
     assert config.num_blocks == 100
     assert {t.size for t in config.kv_cache_tensors} == {100 * page}
     demand = _max_memory_usage_bytes_from_groups(runtime, groups) // page
-    assert _pool_bytes_per_block(runtime, groups) == page
+    assert v41_pool_bytes_per_block(runtime, groups) == page
     assert _max_memory_usage_bytes_from_groups(runtime, groups) == demand * page
     assert kv_cache_utils.get_max_concurrency_for_kv_cache_config(runtime, config) == 100 / demand
     scheduler_config = kv_cache_utils.generate_scheduler_kv_cache_config([config])
@@ -522,7 +492,6 @@ def test_model_registration_and_binding(runtime):
     assert all(module.kv_cache[0].numel() == 0 for module in context.values())
     state = context["language_model.model.layers.2.self_attn.compressor.state_cache"]
     assert state is context["language_model.model.layers.2.self_attn.compressor.state_cache"]
-    assert not state.spec.prefix_cacheable
     assert get_storage_block_size(state.spec) == 32
     owned_names = [name for name, module in modules.named_modules() if hasattr(module, "kv_cache")]
     assert len(owned_names) == 51
@@ -537,17 +506,16 @@ def test_dspark_is_one_additional_group_in_existing_slots(runtime):
     assert len(groups) == 13 and sum(len(g.layer_names) for g in groups) == 54
     assert groups[:12] == target.kv_cache_groups
     assert groups[12].layer_names == [f"mtp.{i}.self_attn.swa_cache" for i in range(3)]
-    assert all(isinstance(s, AscendSlidingWindowMLASpec) for s in groups[12].kv_cache_spec.kv_cache_specs.values())
+    assert all(type(s) is MLAAttentionSpec for s in groups[12].kv_cache_specs.values())
     assert len(draft.kv_cache_tensors) == len(target.kv_cache_tensors) + 3
     assert {t.size for t in draft.kv_cache_tensors} == {t.size for t in target.kv_cache_tensors}
-    assert get_deepseek_v41_pool_bytes_per_block(groups) == 540928
+    assert v41_pool_bytes_per_block(runtime, groups) == 540928
     added = (
         _max_memory_usage_bytes_from_groups(runtime, groups)
         - _max_memory_usage_bytes_from_groups(runtime, target.kv_cache_groups)
-    ) // get_deepseek_v41_pool_bytes_per_block(groups)
-    spec = next(iter(groups[12].kv_cache_spec.kv_cache_specs.values()))
-    assert added == (spec.max_memory_usage_bytes(runtime) + spec.page_size_bytes - 1) // spec.page_size_bytes
-    padded = {n: s for g in groups for n, s in g.kv_cache_spec.kv_cache_specs.items()}
+    ) // v41_pool_bytes_per_block(runtime, groups)
+    assert added == groups[12].max_allocated_blocks_per_request(runtime)
+    padded = {n: s for g in groups for n, s in g.kv_cache_specs.items()}
     assert get_layer_tuples(padded) == get_layer_tuples(dict(reversed(list(padded.items()))))
     backings, views = allocate_cache_views(draft)
     assert sum(b.numel() for b in backings) == 17 * 540928
@@ -986,7 +954,7 @@ def test_batch_metadata_reuses_work_and_keeps_group_slots_separate(runtime, monk
     builders = []
     for group in groups:
         layers_by_spec: dict[Any, list[str]] = {}
-        for name, spec in group.kv_cache_spec.kv_cache_specs.items():
+        for name, spec in group.kv_cache_specs.items():
             layers_by_spec.setdefault(spec, []).append(name)
         builders.append(
             [
@@ -1130,7 +1098,7 @@ def test_batch_metadata_reuses_work_and_keeps_group_slots_separate(runtime, monk
 @pytest.mark.parametrize("end", [127, 128, 129, 255, 256, 257])
 def test_merged_metadata_preserves_nonconsecutive_block_ids(runtime, end):
     runtime.cache_config.block_size = 128
-    group = group_cache_specs(collect_specs(runtime))[0]
+    group = group_v41_test_specs(collect_specs(runtime))[0]
     table = torch.tensor([[7, 19, 3]], dtype=torch.int32)
     positions = torch.arange(end - 3, end)
     original_slots = table[0, positions // 128] * 128 + positions % 128
@@ -1172,7 +1140,7 @@ def test_merged_metadata_preserves_nonconsecutive_block_ids(runtime, end):
 
 @pytest.mark.parametrize("end", [15, 16, 17, 31, 32, 33, 127, 128, 129, 255, 256, 257])
 def test_state_boundary_mapping_with_padded_pages(runtime, end):
-    group = group_cache_specs(collect_specs(runtime))[1]
+    group = group_v41_test_specs(collect_specs(runtime))[1]
     positions = torch.arange(end - 2, end)
     common = SimpleNamespace(
         slot_mapping=torch.full((2,), -1),
@@ -1312,15 +1280,14 @@ def test_ring_source_reuses_prepared_store_coordinates(monkeypatch, num_tokens, 
 
 
 def test_state_uses_one_ring_page_and_block_table_entry(config, runtime):
-    from vllm.v1.kv_cache_interface import CircularBufferSpec
-
-    spec = collect_specs(runtime)["model.layers.2.self_attn.compressor.state_cache"]
-    assert isinstance(spec, CircularBufferSpec)
-    assert spec.tokens_per_state == 1 and not spec.prefix_cacheable
+    group = group_v41_test_specs(collect_specs(runtime))[1]
+    spec = group.kv_cache_specs["model.layers.2.self_attn.compressor.state_cache"]
+    assert isinstance(spec, AscendCircularBufferSpec)
+    assert spec.tokens_per_state == 1 and not group.prefix_cacheable
     assert get_storage_block_size(spec) == 32
-    assert spec.page_size_bytes == 32 * 16 * 4
-    assert spec.max_num_blocks_per_req(runtime, 1024) == 1
-    assert spec.max_memory_usage_bytes(runtime) == spec.page_size_bytes
+    assert spec.unpadded_page_size_bytes == 32 * 16 * 4
+    assert group.max_num_blocks_per_req(runtime, 1024) == 1
+    assert group.max_memory_usage_bytes(runtime) == group.page_size_bytes
 
 
 @pytest.mark.parametrize("pcp", [False, True])
@@ -1385,18 +1352,6 @@ def test_state_page_reuse_does_not_require_request_reset(config):
     torch.testing.assert_close(actual, expected)
 
 
-def test_state_registers_circular_manager():
-    from vllm.v1.core.single_type_kv_cache_manager import CircularBufferManager
-    from vllm.v1.kv_cache_spec_registry import KVCacheSpecRegistry
-
-    assert (
-        KVCacheSpecRegistry.get_manager_class(
-            CircularBufferSpec(block_size=32, num_kv_heads=1, head_size=16, head_size_v=0, dtype=torch.float32)
-        )
-        is CircularBufferManager
-    )
-
-
 @torch.inference_mode()
 def test_interleaved_request_state_isolation(config):
     compressor = DeepseekV41Compressor(config, 2)
@@ -1439,12 +1394,11 @@ def _cp_common():
 
 def test_dspark_v41_indices_keep_capture_addresses(runtime):
     runtime.speculative_config = SimpleNamespace(num_speculative_tokens=3)
-    spec = AscendSlidingWindowMLASpec(
+    spec = MLAAttentionSpec(
         block_size=128,
         num_kv_heads=1,
         head_size=8,
         dtype=torch.bfloat16,
-        sliding_window=128,
         cache_dtype_str="bfloat16",
         model_version="deepseek_v41",
     )
@@ -1504,16 +1458,13 @@ def _replay_common(replay_starts, *, query_lens, seq_lens):
 
 
 def _swa_builder(runtime, window=REPLAY_WINDOW):
-    # The builder reads the window off the model config, which is the same value
-    # the operator's own band uses, so the two cannot drift; the spec is only
-    # there for the cache geometry. Set both to the geometry under test.
+    # The builder and the attention operator read the same model window.
     runtime.model_config.hf_text_config.sliding_window = window
-    spec = AscendSlidingWindowMLASpec(
+    spec = MLAAttentionSpec(
         block_size=128,
         num_kv_heads=1,
         head_size=8,
         dtype=torch.bfloat16,
-        sliding_window=window,
         cache_dtype_str="bfloat16",
         model_version="deepseek_v41",
     )
@@ -1643,12 +1594,9 @@ def test_only_the_sliding_window_group_carries_the_length(runtime):
     assert metadata.ori_mask_mode == 4
 
 
-def test_the_swa_cache_carries_the_replay_flag_into_its_spec(monkeypatch):
-    """Where the switch becomes a spec field, and the field becomes the two
-    properties the scheduler and the worker read. On a lane pinned before
-    #56227 there is no field to carry, and then there is no flag either."""
-    if not declared_kwarg(AscendSlidingWindowMLASpec, "bounded_replay", True):
-        pytest.skip("bounded_replay is absent from this baseline's SlidingWindowMLASpec.")
+def test_the_swa_cache_carries_replay_policy_into_its_manager(monkeypatch):
+    from vllm.v1.core.single_type_kv_cache_manager import SlidingWindowManager
+
     monkeypatch.setattr("vllm_ascend.models.deepseek_v41.cache_config.uses_a5_packed_cache", lambda: False)
 
     cache = AscendDeepseekV41SWACache(
@@ -1660,10 +1608,11 @@ def test_the_swa_cache_carries_the_replay_flag_into_its_spec(monkeypatch):
         bounded_replay=True,
     )
 
-    spec = cache.get_kv_cache_spec(None)
-    assert spec.bounded_replay
-    assert not spec.prefix_cacheable
-    assert spec.prefix_replay_tokens == REPLAY_WINDOW
+    config = cache.get_kv_cache_config(None)
+    assert type(config.spec) is MLAAttentionSpec
+    assert config.manager_config == SlidingWindowManager.config(sliding_window=REPLAY_WINDOW, bounded_replay=True)
+    assert not SlidingWindowManager.prefix_cacheable(config.manager_config)
+    assert SlidingWindowManager.prefix_replay_tokens(config.manager_config) == REPLAY_WINDOW
 
 
 @pytest.mark.parametrize("block_size", [16, 256])
@@ -1678,4 +1627,4 @@ def test_swa_cache_uses_configured_block_size(block_size, monkeypatch):
     )
 
     assert cache.block_size == block_size
-    assert cache.get_kv_cache_spec(None).block_size == block_size
+    assert cache.get_kv_cache_config(None).spec.block_size == block_size

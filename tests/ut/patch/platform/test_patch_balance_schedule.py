@@ -61,12 +61,13 @@ import vllm.v1.core.sched.scheduler as _upstream_sched_mod
 import vllm.v1.engine.core as _upstream_engine_mod
 from vllm.model_executor.models import ModelRegistry
 from vllm.v1.core.sched.request_queue import SchedulingPolicy, create_request_queue
+from vllm.v1.core.single_type_kv_cache_manager import FullAttentionManager
 from vllm.v1.engine.core import DPEngineCoreProc as _UpstreamDPEngineCoreProc
 from vllm.v1.engine.core import EngineCoreProc as _UpstreamEngineCoreProc
 from vllm.v1.kv_cache_interface import (
-    FullAttentionSpec,
+    AttentionSpec,
     KVCacheConfig,
-    KVCacheGroupSpec,
+    KVCacheGroup,
 )
 from vllm.v1.request import RequestStatus
 from vllm.v1.structured_output import StructuredOutputManager
@@ -292,14 +293,18 @@ def test_mamba_waiting_path_schedules_without_argument_mismatch():
         num_blocks=64,
         kv_cache_tensors=[],
         kv_cache_groups=[
-            KVCacheGroupSpec(
-                ["layer"],
-                FullAttentionSpec(
-                    block_size=block_size,
-                    num_kv_heads=1,
-                    head_size=1,
-                    dtype=torch.float16,
-                ),
+            KVCacheGroup.from_layers(
+                dict.fromkeys(
+                    ["layer"],
+                    FullAttentionManager.layer_config(
+                        AttentionSpec(
+                            block_size=block_size,
+                            num_kv_heads=1,
+                            head_size=1,
+                            dtype=torch.float16,
+                        )
+                    ),
+                )
             )
         ],
     )
@@ -689,7 +694,7 @@ def _make_balance_scheduler(*, dp_size=2, max_num_seqs=16, policy="fcfs", num_bl
 
     import torch
     from vllm.config import CacheConfig, ModelConfig, SchedulerConfig, VllmConfig
-    from vllm.v1.kv_cache_interface import FullAttentionSpec, KVCacheConfig, KVCacheGroupSpec
+    from vllm.v1.kv_cache_interface import AttentionSpec, KVCacheConfig, KVCacheGroup
     from vllm.v1.structured_output import StructuredOutputManager
 
     from vllm_ascend.patch.platform import patch_balance_schedule as pbs
@@ -754,9 +759,13 @@ def _make_balance_scheduler(*, dp_size=2, max_num_seqs=16, policy="fcfs", num_bl
             num_blocks=num_blocks,
             kv_cache_tensors=[],
             kv_cache_groups=[
-                KVCacheGroupSpec(
-                    ["layer"],
-                    FullAttentionSpec(block_size=_BLOCK_SIZE, num_kv_heads=1, head_size=1, dtype=torch.float32),
+                KVCacheGroup.from_layers(
+                    dict.fromkeys(
+                        ["layer"],
+                        FullAttentionManager.layer_config(
+                            AttentionSpec(block_size=_BLOCK_SIZE, num_kv_heads=1, head_size=1, dtype=torch.float32)
+                        ),
+                    )
                 )
             ],
         )

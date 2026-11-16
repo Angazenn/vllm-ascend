@@ -4,10 +4,9 @@ from unittest.mock import MagicMock
 import pytest
 import torch
 from vllm.v1.kv_cache_interface import (
-    FullAttentionSpec,
+    AttentionSpec,
     KVCacheTensor,
     MambaSpec,
-    UniformTypeKVCacheSpecs,
     compute_layout_strides,
 )
 from vllm.v1.kv_cache_layout import KVCacheLayout
@@ -32,8 +31,8 @@ def _make_full_attention_spec(
     *,
     num_kv_heads: int = 1,
     head_size: int = 8,
-) -> FullAttentionSpec:
-    return FullAttentionSpec(
+) -> AttentionSpec:
+    return AttentionSpec(
         block_size=2,
         num_kv_heads=num_kv_heads,
         head_size=head_size,
@@ -74,15 +73,7 @@ def test_no_reuse_skips_topology_validation():
     kv_cache_config = SimpleNamespace(
         num_blocks=1,
         kv_cache_tensors=original_tensors.copy(),
-        kv_cache_groups=[
-            SimpleNamespace(
-                layer_names=layer_names,
-                kv_cache_spec=UniformTypeKVCacheSpecs(
-                    block_size=2,
-                    kv_cache_specs=dict.fromkeys(layer_names, spec),
-                ),
-            )
-        ],
+        kv_cache_groups=[SimpleNamespace(kv_cache_specs=dict.fromkeys(layer_names, spec))],
     )
 
     apply_layerwise_kv_cache_plan(kv_cache_config, _make_vllm_config(2, 2))
@@ -97,15 +88,7 @@ def test_base_layers_are_merged_into_shared_slots():
     kv_cache_config = SimpleNamespace(
         num_blocks=1,
         kv_cache_tensors=original_tensors,
-        kv_cache_groups=[
-            SimpleNamespace(
-                layer_names=layer_names,
-                kv_cache_spec=UniformTypeKVCacheSpecs(
-                    block_size=2,
-                    kv_cache_specs=dict.fromkeys(layer_names, spec),
-                ),
-            )
-        ],
+        kv_cache_groups=[SimpleNamespace(kv_cache_specs=dict.fromkeys(layer_names, spec))],
     )
 
     apply_layerwise_kv_cache_plan(kv_cache_config, _make_vllm_config(6, 2))
@@ -233,15 +216,7 @@ def test_incompatible_cache_specs_use_separate_slots():
     kv_cache_config = SimpleNamespace(
         num_blocks=1,
         kv_cache_tensors=[_make_kv_cache_tensor(32, [layer_name]) for layer_name in layer_names],
-        kv_cache_groups=[
-            SimpleNamespace(
-                layer_names=layer_names,
-                kv_cache_spec=UniformTypeKVCacheSpecs(
-                    block_size=2,
-                    kv_cache_specs=layer_specs,
-                ),
-            )
-        ],
+        kv_cache_groups=[SimpleNamespace(kv_cache_specs=layer_specs)],
     )
 
     apply_layerwise_kv_cache_plan(kv_cache_config, _make_vllm_config(4, 1))
@@ -263,15 +238,7 @@ def test_partial_layout_skips_tensor_merge():
     kv_cache_config = SimpleNamespace(
         num_blocks=1,
         kv_cache_tensors=original_tensors.copy(),
-        kv_cache_groups=[
-            SimpleNamespace(
-                layer_names=layer_names,
-                kv_cache_spec=UniformTypeKVCacheSpecs(
-                    block_size=2,
-                    kv_cache_specs=dict.fromkeys(layer_names, spec),
-                ),
-            )
-        ],
+        kv_cache_groups=[SimpleNamespace(kv_cache_specs=dict.fromkeys(layer_names, spec))],
     )
     vllm_config = _make_vllm_config(4, 1)
     vllm_config.kv_transfer_config.kv_connector_extra_config["layerwise_independent_layers"] = []
@@ -441,20 +408,8 @@ def test_multi_group_sfa_descriptors_are_merged_by_main_component():
             *(_make_kv_cache_tensor(indexer_spec.page_size_bytes, [name]) for name in indexer_names),
         ],
         kv_cache_groups=[
-            SimpleNamespace(
-                layer_names=main_names,
-                kv_cache_spec=UniformTypeKVCacheSpecs(
-                    block_size=2,
-                    kv_cache_specs=dict.fromkeys(main_names, main_spec),
-                ),
-            ),
-            SimpleNamespace(
-                layer_names=indexer_names,
-                kv_cache_spec=UniformTypeKVCacheSpecs(
-                    block_size=2,
-                    kv_cache_specs=dict.fromkeys(indexer_names, indexer_spec),
-                ),
-            ),
+            SimpleNamespace(kv_cache_specs=dict.fromkeys(main_names, main_spec)),
+            SimpleNamespace(kv_cache_specs=dict.fromkeys(indexer_names, indexer_spec)),
         ],
     )
 
@@ -516,20 +471,8 @@ def test_component_sharing_merges_main_across_a_and_b_layers():
             *(_make_kv_cache_tensor(indexer_spec.page_size_bytes, [name]) for name in indexer_by_layer.values()),
         ],
         kv_cache_groups=[
-            SimpleNamespace(
-                layer_names=list(main_by_layer.values()),
-                kv_cache_spec=UniformTypeKVCacheSpecs(
-                    block_size=2,
-                    kv_cache_specs=dict.fromkeys(main_by_layer.values(), main_spec),
-                ),
-            ),
-            SimpleNamespace(
-                layer_names=list(indexer_by_layer.values()),
-                kv_cache_spec=UniformTypeKVCacheSpecs(
-                    block_size=2,
-                    kv_cache_specs=dict.fromkeys(indexer_by_layer.values(), indexer_spec),
-                ),
-            ),
+            SimpleNamespace(kv_cache_specs=dict.fromkeys(main_by_layer.values(), main_spec)),
+            SimpleNamespace(kv_cache_specs=dict.fromkeys(indexer_by_layer.values(), indexer_spec)),
         ],
     )
 
@@ -584,15 +527,7 @@ def test_packed_cache_tensor_descriptors_are_rejected():
             (KVCacheTensor(size=16, layers=[layer_name], layer_stride=16, block_stride=64, offset=8))
             for layer_name in layer_names
         ],
-        kv_cache_groups=[
-            SimpleNamespace(
-                layer_names=layer_names,
-                kv_cache_spec=UniformTypeKVCacheSpecs(
-                    block_size=2,
-                    kv_cache_specs=dict.fromkeys(layer_names, spec),
-                ),
-            )
-        ],
+        kv_cache_groups=[SimpleNamespace(kv_cache_specs=dict.fromkeys(layer_names, spec))],
     )
 
     with pytest.raises(NotImplementedError, match="contiguous per-layer pages"):
@@ -619,7 +554,7 @@ def test_standardized_multi_layer_descriptor_becomes_private_reuse_slots(offset)
                 offset=offset,
             )
         ],
-        kv_cache_groups=[SimpleNamespace(layer_names=names, kv_cache_spec=spec)],
+        kv_cache_groups=[SimpleNamespace(kv_cache_specs=dict.fromkeys(names, spec))],
     )
 
     apply_layerwise_kv_cache_plan(config, _make_vllm_config(4, 1))
@@ -647,7 +582,7 @@ def test_out_of_bounds_contiguous_descriptor_is_rejected():
                 block_stride=spec.page_size_bytes,
             )
         ],
-        kv_cache_groups=[SimpleNamespace(layer_names=names, kv_cache_spec=spec)],
+        kv_cache_groups=[SimpleNamespace(kv_cache_specs=dict.fromkeys(names, spec))],
     )
     with pytest.raises(ValueError, match="exceeds its backing allocation"):
         apply_layerwise_kv_cache_plan(config, _make_vllm_config(3, 1))
@@ -682,12 +617,7 @@ def test_mixed_indexers_share_max_capacity_without_changing_reuse_order(c8_first
             )
             for name, spec in specs.items()
         ],
-        kv_cache_groups=[
-            SimpleNamespace(
-                layer_names=list(specs),
-                kv_cache_spec=UniformTypeKVCacheSpecs(block_size=2, kv_cache_specs=specs),
-            )
-        ],
+        kv_cache_groups=[SimpleNamespace(kv_cache_specs=specs)],
     )
     layout = build_layerwise_reuse_layout(specs, 5, {"layerwise_num_shared_buffers": 1})
     assert layout.prefetch_layer_map == {2: 1, 3: 2, 4: 3}
@@ -737,12 +667,7 @@ def _make_generic_indexer_descriptors(replication=1, quantized=True):
         SimpleNamespace(
             num_blocks=num_blocks,
             kv_cache_tensors=tensors,
-            kv_cache_groups=[
-                SimpleNamespace(
-                    layer_names=list(specs),
-                    kv_cache_spec=UniformTypeKVCacheSpecs(block_size=2, kv_cache_specs=specs),
-                )
-            ],
+            kv_cache_groups=[SimpleNamespace(kv_cache_specs=specs)],
         ),
         indexer,
         indexer_names,

@@ -157,7 +157,8 @@ def test_v2_loader_selects_flash_attn_and_restores_target_context(monkeypatch, c
 def test_v2_flash_attn_uses_exact_lengths_after_rejection_and_reordering(monkeypatch, causal):
     import sys
 
-    from vllm.v1.kv_cache_interface import FullAttentionSpec, KVCacheConfig, KVCacheGroupSpec
+    from vllm.v1.core.single_type_kv_cache_manager import FullAttentionManager
+    from vllm.v1.kv_cache_interface import AttentionSpec, KVCacheConfig, KVCacheGroup
     from vllm.v1.worker.gpu.cudagraph_utils import BatchExecutionDescriptor
 
     from vllm_ascend.attention.fa_v1 import AscendFlashAttentionImpl, AscendFlashAttentionMetadataBuilder
@@ -168,7 +169,7 @@ def test_v2_flash_attn_uses_exact_lengths_after_rejection_and_reordering(monkeyp
     builder.model_config = SimpleNamespace(runner_type="generate")
     builder.attn_mask_builder = SimpleNamespace(get_splitfuse_attn_mask=lambda: None)
     group = SimpleNamespace(layer_names=layer_names, get_metadata_builder=lambda _: builder)
-    kv_spec = FullAttentionSpec(block_size=128, num_kv_heads=1, head_size=128, dtype=torch.bfloat16)
+    kv_spec = AttentionSpec(block_size=128, num_kv_heads=1, head_size=128, dtype=torch.bfloat16)
     speculator = AscendDFlash2Speculator.__new__(AscendDFlash2Speculator)
     speculator.arange_np = torch.arange(5, dtype=torch.int32).numpy()
     # vLLM main exposes max_model_len as a read-only view of vllm_config.
@@ -185,7 +186,9 @@ def test_v2_flash_attn_uses_exact_lengths_after_rejection_and_reordering(monkeyp
     speculator.kv_cache_config = KVCacheConfig(
         num_blocks=8,
         kv_cache_tensors=[],
-        kv_cache_groups=[KVCacheGroupSpec(layer_names=layer_names, kv_cache_spec=kv_spec)],
+        kv_cache_groups=[
+            KVCacheGroup.from_layers(dict.fromkeys(layer_names, FullAttentionManager.layer_config(kv_spec)))
+        ],
     )
     speculator.block_tables = SimpleNamespace(
         input_block_tables=[torch.zeros(4, 8, dtype=torch.int32)],

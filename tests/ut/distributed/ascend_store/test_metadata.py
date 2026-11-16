@@ -24,7 +24,8 @@ import tests.ut.distributed.ascend_store._mock_deps  # noqa: F401, E402
 
 # isort: split
 import torch
-from vllm.v1.kv_cache_interface import FullAttentionSpec, KVCacheGroupSpec, MambaSpec, UniformTypeKVCacheSpecs
+from vllm.v1.core.single_type_kv_cache_manager import FullAttentionManager, MambaManager
+from vllm.v1.kv_cache_interface import AttentionSpec, KVCacheGroup, MambaSpec
 
 from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.layerwise.metadata import (
     LayerMultiBlockReqMeta,
@@ -56,23 +57,31 @@ class TestCacheLayoutHelpers(unittest.TestCase):
             shapes=((4,),),
             dtypes=(torch.float32,),
             block_size=16,
-            mamba_cache_mode="align",
         )
         specs = [
-            FullAttentionSpec(block_size=16, num_kv_heads=1, head_size=1, dtype=torch.float32),
+            AttentionSpec(block_size=16, num_kv_heads=1, head_size=1, dtype=torch.float32),
             mamba_spec,
             replace(mamba_spec, tp_replicated=True),
-            UniformTypeKVCacheSpecs.from_specs({"layer.3": mamba_spec}),
+            mamba_spec,
         ]
         config = SimpleNamespace(
-            kv_cache_groups=[KVCacheGroupSpec([f"layer.{group_id}"], spec) for group_id, spec in enumerate(specs)]
+            kv_cache_groups=[
+                KVCacheGroup.from_layers(
+                    {
+                        f"layer.{group_id}": MambaManager.layer_config(spec, mamba_cache_mode="align")
+                        if isinstance(spec, MambaSpec)
+                        else FullAttentionManager.layer_config(spec)
+                    }
+                )
+                for group_id, spec in enumerate(specs)
+            ]
         )
         self.assertEqual(get_sharded_mamba_group_ids(config), {1, 3})
 
     def test_uses_hybrid_kv_cache(self):
         groups = [
-            SimpleNamespace(kv_cache_spec=SimpleNamespace(block_size=16)),
-            SimpleNamespace(kv_cache_spec=SimpleNamespace(block_size=32)),
+            KVCacheGroup({}, FullAttentionManager.config(), 16),
+            KVCacheGroup({}, MambaManager.config(), 32),
         ]
         scheduler_config = SimpleNamespace(disable_hybrid_kv_cache_manager=False)
         self.assertTrue(uses_hybrid_kv_cache(scheduler_config, groups))
@@ -80,16 +89,16 @@ class TestCacheLayoutHelpers(unittest.TestCase):
 
     def test_uses_hybrid_kv_cache_disabled(self):
         groups = [
-            SimpleNamespace(kv_cache_spec=SimpleNamespace(block_size=16)),
-            SimpleNamespace(kv_cache_spec=SimpleNamespace(block_size=32)),
+            KVCacheGroup({}, FullAttentionManager.config(), 16),
+            KVCacheGroup({}, MambaManager.config(), 32),
         ]
         scheduler_config = SimpleNamespace(disable_hybrid_kv_cache_manager=True)
         self.assertFalse(uses_hybrid_kv_cache(scheduler_config, groups))
 
     def test_infer_group_block_sizes(self):
         groups = [
-            SimpleNamespace(kv_cache_spec=SimpleNamespace(block_size=16)),
-            SimpleNamespace(kv_cache_spec=SimpleNamespace(block_size=32)),
+            KVCacheGroup({}, FullAttentionManager.config(), 16),
+            KVCacheGroup({}, MambaManager.config(), 32),
         ]
         self.assertEqual(infer_group_block_sizes(8, groups), [16, 32])
         self.assertEqual(infer_group_block_sizes(8, None), [8])

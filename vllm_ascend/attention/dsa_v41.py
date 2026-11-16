@@ -26,18 +26,21 @@ from vllm.v1.attention.backend import (
     AttentionMetadata,
     AttentionMetadataBuilder,
 )
-from vllm.v1.kv_cache_interface import AttentionSpec, CircularBufferSpec
+from vllm.v1.kv_cache_interface import (
+    AttentionSpec,
+)
 
 from vllm_ascend.ascend_config import get_ascend_config
 from vllm_ascend.attention.dsa_v1 import AscendDSABackend, build_dspark_swa_indices, dsv4_dsa_overlap_stream
 from vllm_ascend.attention.utils import KVCacheRuntimeShapes
 from vllm_ascend.core.kv_cache_interface import (
     AscendMLAAttentionSpec,
-    AscendSlidingWindowMLASpec,
     get_kv_cache_compression_ratio,
     get_storage_block_size,
+    is_circular_kv_cache_spec,
 )
 from vllm_ascend.device.device_op import DeviceOperator
+from vllm_ascend.models.deepseek_v41.cache_config import is_v41_swa_layout
 from vllm_ascend.ops.rope_dsv4 import (
     get_cos_and_sin_dsa,
     get_full_cos_and_sin_dsa_for_layer,
@@ -847,9 +850,9 @@ class AscendDSAV41MetadataBuilder(AttentionMetadataBuilder[AscendDSAV41Metadata]
         # Allocate both decode and prefill owners before graph capture.
         self._build_query_metadata = build_query_metadata
         self._build_compressor_metadata = build_compressor_metadata
-        if isinstance(kv_cache_spec, CircularBufferSpec):
+        if is_circular_kv_cache_spec(kv_cache_spec):
             self._cache_kind = "compressor_state"
-        elif isinstance(kv_cache_spec, AscendSlidingWindowMLASpec):
+        elif is_v41_swa_layout(kv_cache_spec):
             self._cache_kind = "swa"
         elif isinstance(kv_cache_spec, AscendMLAAttentionSpec):
             # make_folded_index_cache_spec packs eight index rows into one:
@@ -867,13 +870,6 @@ class AscendDSAV41MetadataBuilder(AttentionMetadataBuilder[AscendDSAV41Metadata]
         text_config = vllm_config.model_config.hf_text_config
         window_size = int(_config_value(text_config, "sliding_window", 0))
         self._window_size = window_size
-        if self._cache_kind == "swa":
-            # Replay padding and query masking must use the same fixed window.
-            spec_window = int(kv_cache_spec.sliding_window)
-            assert spec_window == window_size, (
-                "SWA bounded replay pads the spec's sliding_window "
-                f"({spec_window}) while the mask floors on the text config's ({window_size})."
-            )
         query_metadata_size = V41_METADATA_BUFFER_SIZE if build_query_metadata else 0
         compressor_tokens = max_tokens if build_compressor_metadata else 0
         compressor_reqs = max_reqs if build_compressor_metadata else 0
@@ -1822,16 +1818,18 @@ class DeepseekV41CacheLayer(nn.Module, AttentionLayerBase):
             kv_cache = kv_cache[0] if len(kv_cache) == 1 else tuple(kv_cache)
         self.kv_cache = [kv_cache]
 
-    def get_kv_cache_spec(self, vllm_config):
-        return self.spec
+    def get_kv_cache_config(self, vllm_config):
+        from vllm.v1.core.single_type_kv_cache_manager import FullAttentionManager
+
+        return FullAttentionManager.layer_config(self.spec)
 
     def get_attn_backend(self):
         spec = self.spec
 
-        if isinstance(spec, CircularBufferSpec):
+        if is_circular_kv_cache_spec(spec):
             return DeepseekV41StateBackend
 
-        if isinstance(spec, AscendSlidingWindowMLASpec):
+        if is_v41_swa_layout(spec):
             return DeepseekV41SWABackend
 
         if isinstance(spec, AscendMLAAttentionSpec):

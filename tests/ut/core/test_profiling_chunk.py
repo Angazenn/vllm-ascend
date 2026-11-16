@@ -25,7 +25,8 @@ from vllm.v1.core.kv_cache_utils import get_request_block_hasher, init_none_hash
 from vllm.v1.core.sched.async_scheduler import AsyncScheduler
 from vllm.v1.core.sched.interface import PauseState
 from vllm.v1.core.sched.request_queue import SchedulingPolicy
-from vllm.v1.kv_cache_interface import FullAttentionSpec, KVCacheConfig, KVCacheGroupSpec
+from vllm.v1.core.single_type_kv_cache_manager import FullAttentionManager
+from vllm.v1.kv_cache_interface import AttentionSpec, KVCacheConfig, KVCacheGroup
 from vllm.v1.outputs import ModelRunnerOutput
 from vllm.v1.request import Request, RequestStatus
 from vllm.v1.structured_output import StructuredOutputManager
@@ -360,9 +361,13 @@ class TestProfilingChunkScheduler(TestBase):
             num_blocks=10000,
             kv_cache_tensors=[],
             kv_cache_groups=[
-                KVCacheGroupSpec(
-                    ["layer"],
-                    FullAttentionSpec(block_size=BLOCK_SIZE, num_kv_heads=1, head_size=1, dtype=torch.float32),
+                KVCacheGroup.from_layers(
+                    dict.fromkeys(
+                        ["layer"],
+                        FullAttentionManager.layer_config(
+                            AttentionSpec(block_size=BLOCK_SIZE, num_kv_heads=1, head_size=1, dtype=torch.float32)
+                        ),
+                    )
                 )
             ],
         )
@@ -808,9 +813,13 @@ class TestProfilingChunkAsyncScheduler(TestBase):
             num_blocks=10000,
             kv_cache_tensors=[],
             kv_cache_groups=[
-                KVCacheGroupSpec(
-                    ["layer"],
-                    FullAttentionSpec(block_size=BLOCK_SIZE, num_kv_heads=1, head_size=1, dtype=torch.float32),
+                KVCacheGroup.from_layers(
+                    dict.fromkeys(
+                        ["layer"],
+                        FullAttentionManager.layer_config(
+                            AttentionSpec(block_size=BLOCK_SIZE, num_kv_heads=1, head_size=1, dtype=torch.float32)
+                        ),
+                    )
                 )
             ],
         )

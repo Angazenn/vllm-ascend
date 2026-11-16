@@ -19,10 +19,12 @@ from vllm.v1.core.kv_cache_coordinator import (
 )
 from vllm.v1.core.kv_cache_utils import resolve_dcp_kv_block_size, resolve_kv_cache_block_sizes
 from vllm.v1.core.sched.output import SchedulerOutput
-from vllm.v1.kv_cache_interface import MambaSpec, SlidingWindowSpec, UniformTypeKVCacheSpecs
+from vllm.v1.core.single_type_kv_cache_manager import CircularBufferManager, MambaManager, SlidingWindowManager
+from vllm.v1.kv_cache_interface import (
+    MambaSpec,
+)
 from vllm.v1.outputs import KVConnectorOutput
 
-from vllm_ascend.core.kv_cache_interface import is_circular_kv_cache_spec
 from vllm_ascend.distributed.kv_transfer.kv_pool.kv_offload.preempt_offload.metadata import (
     MambaConvLoadMeta,
     PreemptOffloadMetadata,
@@ -134,27 +136,11 @@ class PreemptOffloadScheduler:
 
     @staticmethod
     def _get_group_is_sliding_window(kv_cache_config: "KVCacheConfig") -> list[bool]:
-        group_is_sliding_window: list[bool] = []
-        for group in kv_cache_config.kv_cache_groups:
-            if isinstance(group.kv_cache_spec, UniformTypeKVCacheSpecs):
-                group_is_sliding_window.append(
-                    any(isinstance(spec, SlidingWindowSpec) for spec in group.kv_cache_spec.kv_cache_specs.values())
-                )
-            else:
-                group_is_sliding_window.append(isinstance(group.kv_cache_spec, SlidingWindowSpec))
-        return group_is_sliding_window
+        return [issubclass(group.manager_cls, SlidingWindowManager) for group in kv_cache_config.kv_cache_groups]
 
     @staticmethod
     def _get_group_is_mamba(kv_cache_config: "KVCacheConfig") -> list[bool]:
-        group_is_mamba: list[bool] = []
-        for group in kv_cache_config.kv_cache_groups:
-            if isinstance(group.kv_cache_spec, UniformTypeKVCacheSpecs):
-                group_is_mamba.append(
-                    any(isinstance(spec, MambaSpec) for spec in group.kv_cache_spec.kv_cache_specs.values())
-                )
-            else:
-                group_is_mamba.append(isinstance(group.kv_cache_spec, MambaSpec))
-        return group_is_mamba
+        return [issubclass(group.manager_cls, MambaManager) for group in kv_cache_config.kv_cache_groups]
 
     @staticmethod
     def _get_group_has_mamba_conv(kv_cache_config: "KVCacheConfig") -> list[bool]:
@@ -166,11 +152,7 @@ class PreemptOffloadScheduler:
         }
         group_has_mamba_conv: list[bool] = []
         for group in kv_cache_config.kv_cache_groups:
-            specs = (
-                group.kv_cache_spec.kv_cache_specs.values()
-                if isinstance(group.kv_cache_spec, UniformTypeKVCacheSpecs)
-                else (group.kv_cache_spec,)
-            )
+            specs = group.distinct_specs
             group_has_mamba_conv.append(
                 any(isinstance(spec, MambaSpec) and spec.mamba_type in conv_backends for spec in specs)
             )
@@ -319,8 +301,8 @@ class PreemptOffloadScheduler:
                         gpu_blocks.append(gpu_block)
                         effective_hashes.append(None)
             else:
-                group_block_size = resolve_dcp_kv_block_size(kv_cache_groups[g].kv_cache_spec, self.dcp_world_size)
-                is_circular = is_circular_kv_cache_spec(kv_cache_groups[g].kv_cache_spec)
+                group_block_size = resolve_dcp_kv_block_size(kv_cache_groups[g], self.dcp_world_size)
+                is_circular = issubclass(kv_cache_groups[g].manager_cls, CircularBufferManager)
                 # A ring owns one private block, independent of token position.
                 if is_circular and (len(group_gpu_ids) != 1 or group_gpu_ids[0] <= 0):
                     raise RuntimeError(f"Invalid circular cache blocks for {req_id}: {group_gpu_ids}")
@@ -493,7 +475,7 @@ class PreemptOffloadScheduler:
                 # separate accepted-token shift. If postprocess_mamba already
                 # crossed a cache boundary, only the residual in-block shift
                 # remains to be applied during resume.
-                mamba_block_size = self.cpu_kv_cache_config.kv_cache_groups[g].kv_cache_spec.block_size
+                mamba_block_size = self.cpu_kv_cache_config.kv_cache_groups[g].block_size
                 num_tokens_running_state = request.num_tokens - 1 - accept_token_idx
                 accepted_state_position = request.num_tokens - 1
                 aligned_accepted_state_position = (accepted_state_position // mamba_block_size) * mamba_block_size
@@ -515,7 +497,7 @@ class PreemptOffloadScheduler:
                         source_offset=conv_source_offset,
                     )
                 )
-            elif is_circular_kv_cache_spec(self.cpu_kv_cache_config.kv_cache_groups[g].kv_cache_spec):
+            elif issubclass(self.cpu_kv_cache_config.kv_cache_groups[g].manager_cls, CircularBufferManager):
                 # Reuse the ordinary block transfer, but always restore slot 0.
                 group_gpu_ids = block_ids_by_group[g]
                 if len(group_cpu_ids) != 1 or len(group_gpu_ids) != 1 or group_cpu_ids[0] <= 0 or group_gpu_ids[0] <= 0:
@@ -527,7 +509,7 @@ class PreemptOffloadScheduler:
                 gpu_block_ids.append(group_gpu_ids[0])
             else:
                 group_block_size = resolve_dcp_kv_block_size(
-                    self.cpu_kv_cache_config.kv_cache_groups[g].kv_cache_spec, self.dcp_world_size
+                    self.cpu_kv_cache_config.kv_cache_groups[g], self.dcp_world_size
                 )
                 start_block = load_start_tokens // group_block_size
                 end_block = min(

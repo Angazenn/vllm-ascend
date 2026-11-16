@@ -13,7 +13,8 @@ import tests.ut.distributed.ascend_store._mock_deps  # noqa: F401
 
 # isort: split
 import torch
-from vllm.v1.kv_cache_interface import FullAttentionSpec, KVCacheGroupSpec, MambaSpec
+from vllm.v1.core.single_type_kv_cache_manager import FullAttentionManager, MambaManager
+from vllm.v1.kv_cache_interface import AttentionSpec, KVCacheGroup, MambaSpec
 
 from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.backend import mooncake_layerwise
 from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.backend.memcache_backend import MemcacheBackend
@@ -61,11 +62,9 @@ class TestBoundLayerwiseKeys(unittest.TestCase):
         config = self.make_config()
         config.parallel_config.tensor_parallel_size = 1
         cache = self.make_cache_config(2)
-        cache.kv_cache_groups[1].kv_cache_spec = MambaSpec(
-            block_size=32,
-            shapes=((4,),),
-            dtypes=(torch.float32,),
-            mamba_cache_mode="align",
+        state = MambaSpec(block_size=32, shapes=((4,),), dtypes=(torch.float32,))
+        cache.kv_cache_groups[1] = KVCacheGroup.from_layers(
+            {"model.layers.1.kv": MambaManager.layer_config(state, mamba_cache_mode="align")}
         )
         for backend_class in (MooncakeBackend, MemcacheBackend):
             with self.subTest(backend=backend_class.__name__):
@@ -156,9 +155,12 @@ class TestBoundLayerwiseKeys(unittest.TestCase):
     def make_cache_config(num_groups):
         return SimpleNamespace(
             kv_cache_groups=[
-                KVCacheGroupSpec(
-                    [f"model.layers.{group}.kv"],
-                    FullAttentionSpec(block_size=16 * (group + 1), num_kv_heads=1, head_size=1, dtype="uint8"),
+                KVCacheGroup.from_layers(
+                    {
+                        f"model.layers.{group}.kv": FullAttentionManager.layer_config(
+                            AttentionSpec(block_size=16 * (group + 1), num_kv_heads=1, head_size=1, dtype=torch.uint8)
+                        )
+                    }
                 )
                 for group in range(num_groups)
             ]

@@ -9,6 +9,8 @@ import pytest
 import torch
 from vllm.config import CUDAGraphMode
 from vllm.v1.attention.backend import AttentionCGSupport
+from vllm.v1.core.single_type_kv_cache_manager import FullAttentionManager
+from vllm.v1.kv_cache_interface import AttentionSpec, KVCacheGroup
 from vllm.v1.worker.gpu import attn_utils
 from vllm.v1.worker.gpu.dp_utils import DPSyncState
 from vllm.v1.worker.gpu.model_runner import GPUModelRunner
@@ -273,17 +275,17 @@ def test_adaptive_verification_manager_initialization(cpu_manager_resources, mon
     speculator = AscendMTPSpeculator.__new__(AscendMTPSpeculator)
     speculator.draft_attn_layer_names = {"draft"}
     speculator.enable_adaptive_verification = enabled
-    cache_spec = SimpleNamespace(
-        block_size=128,
-        uses_slot_mapping=True,
-        dcp_sharded=False,
-        block_table_token_alignment=1,
-        max_num_blocks_per_req=lambda *args: 1,
+    cache_spec = AttentionSpec(block_size=128, num_kv_heads=1, head_size=16, dtype=torch.float16)
+    cache_group = KVCacheGroup.from_layers(
+        dict.fromkeys(("target", "draft"), FullAttentionManager.layer_config(cache_spec))
     )
+    vllm_config = kwargs["vllm_config"]
+    vllm_config.parallel_config = SimpleNamespace(decode_context_parallel_size=1)
     runner = SimpleNamespace(
         parallel_config=SimpleNamespace(cp_kv_cache_interleave_size=1),
         is_encoder_decoder=False,
         max_model_len=128,
+        batch_sharder=None,
         speculator=speculator,
         vllm_config=kwargs["vllm_config"],
         device=torch.device("cpu"),
@@ -314,11 +316,9 @@ def test_adaptive_verification_manager_initialization(cpu_manager_resources, mon
 
     # Stop after the real manager call, before device cache allocation or graph setup.
     monkeypatch.setattr(upstream, "BlockTables", Mock(side_effect=BeforeCacheAllocation))
-    cache_config = SimpleNamespace(
-        kv_cache_groups=[SimpleNamespace(kv_cache_spec=cache_spec, layer_names=["target", "draft"])]
-    )
+    cache_config = SimpleNamespace(kv_cache_groups=[cache_group])
     with pytest.raises(BeforeCacheAllocation):
-        patch_model_runner.initialize_kv_cache(runner, cache_config)
+        GPUModelRunner.initialize_kv_cache(runner, cache_config)
     manager_call.assert_called_once()
     assert manager_call.call_args.kwargs["enable_adaptive_verification"] is enabled
     assert manager_call.call_args.kwargs["target_layer_names"] == {"target"}

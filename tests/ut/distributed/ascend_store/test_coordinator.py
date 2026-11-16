@@ -15,21 +15,19 @@
 # This file is a part of the vllm-ascend project.
 #
 
-import inspect
 import unittest
-from dataclasses import dataclass, replace
 from unittest.mock import patch
 from weakref import ref
 
 # isort: off
 import tests.ut.distributed.ascend_store._mock_deps  # noqa: F401, E402
 import torch
-from vllm.v1.kv_cache_interface import FullAttentionSpec, KVCacheGroupSpec, MambaSpec, SlidingWindowSpec
+from vllm.v1.core.single_type_kv_cache_manager import FullAttentionManager, MambaManager, SlidingWindowManager
+from vllm.v1.kv_cache_interface import AttentionSpec, KVCacheGroup, MambaSpec
 from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.metadata import get_block_hashes
 from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.coordinator import (
     AscendStoreCoordinator,
     ExternalCachedBlockPool,
-    _reachable_block_mask,
 )
 # isort: on
 
@@ -38,89 +36,18 @@ def _hashes(num_blocks: int) -> list[bytes]:
     return [bytes([idx % 251]) * 32 for idx in range(num_blocks)]
 
 
-def _full_spec(block_size: int) -> FullAttentionSpec:
-    return FullAttentionSpec(
-        block_size=block_size,
-        num_kv_heads=1,
-        head_size=1,
-        dtype=torch.float32,
-    )
+def _full_config(block_size: int):
+    spec = AttentionSpec(block_size=block_size, num_kv_heads=1, head_size=1, dtype=torch.float32)
+    return FullAttentionManager.layer_config(spec)
 
 
-def _sliding_spec(block_size: int, sliding_window: int) -> SlidingWindowSpec:
-    return SlidingWindowSpec(
-        block_size=block_size,
-        num_kv_heads=1,
-        head_size=1,
-        dtype=torch.float32,
-        sliding_window=sliding_window,
-    )
+def _sliding_config(block_size: int, sliding_window: int):
+    spec = AttentionSpec(block_size=block_size, num_kv_heads=1, head_size=1, dtype=torch.float32)
+    return SlidingWindowManager.layer_config(spec, sliding_window=sliding_window)
 
 
-@dataclass(frozen=True)
-class _FakeCompressedSpec:
-    block_size: int
-    compress_ratio: int
-
-    def copy_with_new_block_size(self, block_size):
-        return replace(self, block_size=block_size)
-
-
-class _FakeCompressedManager:
-    @classmethod
-    def find_longest_cache_hit(
-        cls,
-        block_hashes,
-        max_length,
-        kv_cache_group_ids,
-        block_pool,
-        kv_cache_spec,
-        drop_eagle_block=False,
-        alignment_tokens=16,
-        **kwargs,
-    ):
-        computed: tuple[list[object], ...] = tuple([] for _ in kv_cache_group_ids)
-        logical_block_size = kv_cache_spec.block_size
-        if logical_block_size != block_pool.hash_block_size:
-            scale_factor = logical_block_size // block_pool.hash_block_size
-            block_hashes = [
-                block_hashes[index + scale_factor - 1]
-                for index in range(0, len(block_hashes) // scale_factor * scale_factor, scale_factor)
-            ]
-        max_blocks = max_length // logical_block_size
-        for block_hash in list(block_hashes)[:max_blocks]:
-            cached = block_pool.get_cached_block(block_hash, kv_cache_group_ids)
-            if not cached:
-                break
-            for blocks, block in zip(computed, cached):
-                blocks.append(block)
-        return computed, len(computed[0]) * logical_block_size
-
-
-class _FakePrefixManager:
-    """FA manager: contiguous prefix walk over externally cached blocks."""
-
-    @classmethod
-    def find_longest_cache_hit(
-        cls,
-        block_hashes,
-        max_length,
-        kv_cache_group_ids,
-        block_pool,
-        kv_cache_spec,
-        drop_eagle_block=False,
-        alignment_tokens=16,
-        **kwargs,
-    ):
-        computed: tuple[list[object], ...] = tuple([] for _ in kv_cache_group_ids)
-        max_blocks = max_length // kv_cache_spec.block_size
-        for block_hash in list(block_hashes)[:max_blocks]:
-            cached = block_pool.get_cached_block(block_hash, kv_cache_group_ids)
-            if not cached:
-                break
-            for blocks, block in zip(computed, cached):
-                blocks.append(block)
-        return computed, len(computed[0]) * kv_cache_spec.block_size
+def _group(layer_names, layer_config, **kwargs):
+    return KVCacheGroup.from_layers(dict.fromkeys(layer_names, layer_config), **kwargs)
 
 
 class TestAscendStoreCoordinator(unittest.TestCase):
@@ -128,7 +55,7 @@ class TestAscendStoreCoordinator(unittest.TestCase):
         block_hashes = _hashes(128)
         grouped_hash = get_block_hashes(block_hashes, group_block_size=128 * 128, hash_block_size=128)[0]
         coord = AscendStoreCoordinator(
-            [KVCacheGroupSpec(["layer.0"], _full_spec(128 * 128))],
+            [_group(["layer.0"], _full_config(128 * 128))],
             scheduler_block_size=128 * 128,
             hash_block_size=128,
             group_block_sizes=[128 * 128],
@@ -143,46 +70,13 @@ class TestAscendStoreCoordinator(unittest.TestCase):
 
         self.assertEqual(hit_length, 128 * 128)
 
-    def test_compressed_spec_does_not_apply_ratio_twice(self):
-        block_hashes = _hashes(128)
-        grouped_hash = get_block_hashes(block_hashes, group_block_size=128 * 128, hash_block_size=128)[0]
-
-        with patch(
-            "vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.coordinator._get_manager_class",
-            return_value=_FakeCompressedManager,
-        ):
-            coord = AscendStoreCoordinator(
-                [
-                    KVCacheGroupSpec(
-                        ["layer.0"],
-                        _FakeCompressedSpec(
-                            block_size=128 * 128,
-                            compress_ratio=128,
-                        ),
-                    )
-                ],
-                scheduler_block_size=128 * 128,
-                hash_block_size=128,
-                group_block_sizes=[128 * 128],
-                group_cache_families=["c128"],
-            )
-
-            _, hit_length = coord.find_longest_cache_hit(
-                block_hashes,
-                128 * 128,
-                ExternalCachedBlockPool(128, {(0, bytes(grouped_hash))}),
-            )
-
-        self.assertEqual(coord.group_effective_specs[0].compress_ratio, 128)
-        self.assertEqual(hit_length, 128 * 128)
-
     def test_missing_required_group_returns_zero(self):
         block_hashes = _hashes(128)
         c1_exists = {(0, block_hash) for block_hash in block_hashes}
         coord = AscendStoreCoordinator(
             [
-                KVCacheGroupSpec(["layer.0"], _full_spec(128)),
-                KVCacheGroupSpec(["layer.1"], _full_spec(128 * 128)),
+                _group(["layer.0"], _full_config(128)),
+                _group(["layer.1"], _full_config(128 * 128)),
             ],
             scheduler_block_size=128 * 128,
             hash_block_size=128,
@@ -206,15 +100,16 @@ class TestAscendStoreCoordinator(unittest.TestCase):
 
     def test_store_mask_uses_manager_reachability(self):
         coord = AscendStoreCoordinator(
-            [KVCacheGroupSpec(["layer.0"], _sliding_spec(block_size=128, sliding_window=256))],
+            [_group(["layer.0"], _sliding_config(block_size=128, sliding_window=256))],
             scheduler_block_size=512,
             hash_block_size=128,
             group_block_sizes=[128],
             group_cache_families=["c1"],
         )
 
-        with patch(
-            "vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.coordinator._reachable_block_mask",
+        with patch.object(
+            SlidingWindowManager,
+            "reachable_block_mask",
             return_value=[False, False, False, True],
         ):
             masks = coord.store_mask(512)
@@ -223,15 +118,16 @@ class TestAscendStoreCoordinator(unittest.TestCase):
 
     def test_lookup_mask_uses_reachability_without_retention(self):
         coord = AscendStoreCoordinator(
-            [KVCacheGroupSpec(["layer.0"], _sliding_spec(block_size=128, sliding_window=256))],
+            [_group(["layer.0"], _sliding_config(block_size=128, sliding_window=256))],
             scheduler_block_size=512,
             hash_block_size=128,
             group_block_sizes=[128],
             group_cache_families=["c1"],
             retention_interval=256,
         )
-        with patch(
-            "vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.coordinator._reachable_block_mask",
+        with patch.object(
+            SlidingWindowManager,
+            "reachable_block_mask",
             return_value=[False, False, False, True],
         ) as reachable:
             masks = coord.lookup_mask(512)
@@ -239,39 +135,9 @@ class TestAscendStoreCoordinator(unittest.TestCase):
         self.assertEqual(masks, ([False, False, False, True],))
         self.assertEqual(reachable.call_args.kwargs["retention_interval"], 256)
 
-    def test_reachable_mask_preserves_optional_kwargs_for_flexible_signature(self):
-        class FlexibleManager:
-            @staticmethod
-            def reachable_block_mask(
-                start_block,
-                end_block,
-                alignment_tokens,
-                kv_cache_spec,
-                use_eagle,
-                retention_interval=None,
-                **kwargs,
-            ):
-                return [retention_interval, kwargs["num_prompt_tokens"]]
-
-        result = _reachable_block_mask(
-            FlexibleManager,
-            start_block=0,
-            end_block=8,
-            alignment_tokens=128,
-            kv_cache_spec=None,
-            use_eagle=False,
-            retention_interval=256,
-            num_prompt_tokens=1024,
-        )
-
-        self.assertEqual(result, [256, 1024])
-
     def test_mamba_replay_boundary_and_partial_prefix_lookup(self):
-        from vllm.v1.core.single_type_kv_cache_manager import MambaManager
-
-        if "reachable_boundaries" not in inspect.signature(MambaManager.reachable_block_mask).parameters:
-            self.skipTest("requires the reachable_boundaries vLLM API")
-        spec = MambaSpec(block_size=256, shapes=((1,),), dtypes=(torch.float32,), mamba_cache_mode="align")
+        spec = MambaSpec(block_size=256, shapes=((1,),), dtypes=(torch.float32,))
+        state_config = MambaManager.layer_config(spec, mamba_cache_mode="align")
         for interval, expected in [
             (0, [False, False, True, False]),
             (512, [False, True, True, True]),
@@ -279,7 +145,7 @@ class TestAscendStoreCoordinator(unittest.TestCase):
         ]:
             with self.subTest(retention_interval=interval):
                 coord = AscendStoreCoordinator(
-                    [KVCacheGroupSpec(["attention"], _full_spec(256)), KVCacheGroupSpec(["state"], spec)],
+                    [_group(["attention"], _full_config(256)), _group(["state"], state_config)],
                     scheduler_block_size=256,
                     hash_block_size=256,
                     group_block_sizes=[256, 256],
@@ -297,33 +163,6 @@ class TestAscendStoreCoordinator(unittest.TestCase):
 
                 self.assertEqual(coord.find_reachable_hit_tokens(hashes, 1024, query), 768)
 
-    def test_legacy_reachable_mask_ignores_new_boundary_argument(self):
-        class LegacyManager:
-            @staticmethod
-            def reachable_block_mask(
-                start_block,
-                end_block,
-                alignment_tokens,
-                kv_cache_spec,
-                use_eagle,
-                retention_interval=None,
-                num_prompt_tokens=None,
-            ):
-                return [retention_interval, num_prompt_tokens]
-
-        result = _reachable_block_mask(
-            LegacyManager,
-            start_block=0,
-            end_block=1,
-            alignment_tokens=128,
-            kv_cache_spec=None,
-            use_eagle=False,
-            retention_interval=0,
-            num_prompt_tokens=129,
-            reachable_boundaries=(128,),
-        )
-        self.assertEqual(result, [0, 129])
-
     def test_store_mask_propagates_eagle_to_same_spec_siblings(self):
         calls = []
 
@@ -331,11 +170,11 @@ class TestAscendStoreCoordinator(unittest.TestCase):
             calls.append(kwargs["use_eagle"])
             return [True, False, True, False]
 
-        shared_spec = _sliding_spec(block_size=128, sliding_window=256)
+        shared_spec = _sliding_config(block_size=128, sliding_window=256)
         coord = AscendStoreCoordinator(
             [
-                KVCacheGroupSpec(["layer.0"], shared_spec),
-                KVCacheGroupSpec(["layer.mtp"], shared_spec, is_eagle_group=True),
+                _group(["layer.0"], shared_spec),
+                _group(["layer.mtp"], shared_spec, is_eagle_group=True),
             ],
             scheduler_block_size=512,
             hash_block_size=128,
@@ -343,8 +182,9 @@ class TestAscendStoreCoordinator(unittest.TestCase):
             group_cache_families=["c1", "c1"],
         )
 
-        with patch(
-            "vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.coordinator._reachable_block_mask",
+        with patch.object(
+            SlidingWindowManager,
+            "reachable_block_mask",
             side_effect=fake_reachable_block_mask,
         ):
             masks = coord.store_mask(512)
@@ -354,14 +194,15 @@ class TestAscendStoreCoordinator(unittest.TestCase):
 
     def test_reachable_mask_cache_preserves_inputs_and_caller_isolation(self):
         coord = AscendStoreCoordinator(
-            [KVCacheGroupSpec(["layer.0"], _sliding_spec(16, 32))],
+            [_group(["layer.0"], _sliding_config(16, 32))],
             scheduler_block_size=16,
             hash_block_size=16,
             group_block_sizes=[16],
             group_cache_families=["c1"],
         )
-        with patch(
-            "vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.coordinator._reachable_block_mask",
+        with patch.object(
+            SlidingWindowManager,
+            "reachable_block_mask",
             side_effect=lambda *args, **kwargs: [True] + [False] * (kwargs["end_block"] - 1),
         ) as build_mask:
             coord.store_mask(32, 33)[0][0] = False
@@ -383,7 +224,7 @@ class TestAscendStoreCoordinator(unittest.TestCase):
 
     def test_compressed_masks_use_full_attention_reachability(self):
         coord = AscendStoreCoordinator(
-            [KVCacheGroupSpec(["layer.0"], _full_spec(block_size=512))],
+            [_group(["layer.0"], _full_config(block_size=512))],
             scheduler_block_size=2048,
             hash_block_size=128,
             group_block_sizes=[512],
@@ -411,7 +252,7 @@ class TestFindReachableHitTokens(unittest.TestCase):
 
     def test_passes_mask_allowed_hashes_to_query_callback(self):
         coord = AscendStoreCoordinator(
-            [KVCacheGroupSpec(["layer.0"], _sliding_spec(block_size=128, sliding_window=256))],
+            [_group(["layer.0"], _sliding_config(block_size=128, sliding_window=256))],
             scheduler_block_size=256,
             hash_block_size=128,
             group_block_sizes=[128],
@@ -423,8 +264,9 @@ class TestFindReachableHitTokens(unittest.TestCase):
             calls.append((group_id, list(group_block_hashes), list(lookup_mask) if lookup_mask is not None else None))
             return []
 
-        with patch(
-            "vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.coordinator._reachable_block_mask",
+        with patch.object(
+            SlidingWindowManager,
+            "reachable_block_mask",
             return_value=[False, True],
         ):
             hit = coord.find_reachable_hit_tokens(_hashes(2), 256, query_group_hits)
@@ -433,17 +275,13 @@ class TestFindReachableHitTokens(unittest.TestCase):
         self.assertEqual(calls, [(0, _hashes(2), [False, True])])
 
     def test_hit_length_derived_from_callback_hits(self):
-        with patch(
-            "vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.coordinator._get_manager_class",
-            return_value=_FakePrefixManager,
-        ):
-            coord = AscendStoreCoordinator(
-                [KVCacheGroupSpec(["layer.0"], _full_spec(128))],
-                scheduler_block_size=256,
-                hash_block_size=128,
-                group_block_sizes=[128],
-                group_cache_families=["c4"],
-            )
+        coord = AscendStoreCoordinator(
+            [_group(["layer.0"], _full_config(128))],
+            scheduler_block_size=256,
+            hash_block_size=128,
+            group_block_sizes=[128],
+            group_cache_families=["c4"],
+        )
         block_hashes = _hashes(4)
         received: list[list] = []
 
@@ -462,17 +300,13 @@ class TestFindReachableHitTokens(unittest.TestCase):
         self.assertFalse(derive.call_args.kwargs["apply_eagle"])
 
     def test_no_hits_returns_zero_without_deriving(self):
-        with patch(
-            "vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.coordinator._get_manager_class",
-            return_value=_FakePrefixManager,
-        ):
-            coord = AscendStoreCoordinator(
-                [KVCacheGroupSpec(["layer.0"], _full_spec(128))],
-                scheduler_block_size=256,
-                hash_block_size=128,
-                group_block_sizes=[128],
-                group_cache_families=["c4"],
-            )
+        coord = AscendStoreCoordinator(
+            [_group(["layer.0"], _full_config(128))],
+            scheduler_block_size=256,
+            hash_block_size=128,
+            group_block_sizes=[128],
+            group_cache_families=["c4"],
+        )
 
         with patch.object(coord, "find_longest_cache_hit") as derive:
             hit = coord.find_reachable_hit_tokens(_hashes(2), 256, lambda *args: [])

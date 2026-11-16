@@ -31,7 +31,8 @@ import tests.ut.distributed.ascend_store._mock_deps  # noqa: F401, E402
 import torch
 from vllm.model_executor.layers.mamba.mamba_utils import MambaStateCopyFuncCalculator
 from vllm.v1.core.kv_cache_utils import maybe_convert_block_hash
-from vllm.v1.kv_cache_interface import FullAttentionSpec, KVCacheGroupSpec, MambaSpec, UniformTypeKVCacheSpecs
+from vllm.v1.core.single_type_kv_cache_manager import FullAttentionManager, MambaManager, SlidingWindowManager
+from vllm.v1.kv_cache_interface import AttentionSpec, KVCacheGroup, MambaSpec
 
 from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.ascend_store_connector import (
     AscendStoreConnector,
@@ -233,8 +234,14 @@ class TestPCPPoolWorker(unittest.TestCase):
                 self.assertEqual(worker._is_layerwise_save_owner(0), expected)
 
     def test_non_align_sharded_mamba_save_ownership_respects_write_role(self):
-        spec = MambaSpec(block_size=16, shapes=((8,),), dtypes=(torch.float32,), mamba_cache_mode="all")
-        plan = SimpleNamespace(kv_cache_groups=[KVCacheGroupSpec(["model.layers.0.attn"], spec)])
+        spec = MambaSpec(block_size=16, shapes=((8,),), dtypes=(torch.float32,))
+        plan = SimpleNamespace(
+            kv_cache_groups=[
+                KVCacheGroup.from_layers(
+                    {"model.layers.0.attn": MambaManager.layer_config(spec, mamba_cache_mode="all")}
+                )
+            ]
+        )
         for tp_size, tp_rank, pcp_size, pcp_rank in ((2, 1, 1, 0), (1, 0, 2, 1)):
             worker = make_worker(
                 self,
@@ -262,14 +269,17 @@ class TestPCPPoolWorker(unittest.TestCase):
     def test_single_mamba_group_uses_pcp_state_shards(self):
         plan = SimpleNamespace(
             kv_cache_groups=[
-                KVCacheGroupSpec(
-                    ["model.layers.0.attn"],
-                    MambaSpec(
-                        block_size=16,
-                        shapes=((8,),),
-                        dtypes=(torch.float32,),
-                        mamba_cache_mode="align",
-                    ),
+                KVCacheGroup.from_layers(
+                    {
+                        "model.layers.0.attn": MambaManager.layer_config(
+                            MambaSpec(
+                                block_size=16,
+                                shapes=((8,),),
+                                dtypes=(torch.float32,),
+                            ),
+                            mamba_cache_mode="align",
+                        )
+                    }
                 )
             ]
         )
@@ -291,18 +301,17 @@ class TestPCPPoolWorker(unittest.TestCase):
     def test_dspark_draft_pool_exclusion_requires_layerwise_reuse(self):
         target_names = [f"model.layers.{index}.attn" for index in range(4)]
         draft_names = [f"draft.layers.{index}.attn" for index in range(4, 6)]
-        target = FullAttentionSpec(block_size=16, num_kv_heads=1, head_size=4, dtype=torch.int8)
-        draft = FullAttentionSpec(block_size=16, num_kv_heads=1, head_size=4, dtype=torch.bfloat16)
+        target = AttentionSpec(block_size=16, num_kv_heads=1, head_size=4, dtype=torch.int8)
+        draft = AttentionSpec(block_size=16, num_kv_heads=1, head_size=4, dtype=torch.bfloat16)
         config = SimpleNamespace(
             num_blocks=2,
             prefix_cache_retention_interval=0,
             kv_cache_groups=[
-                KVCacheGroupSpec(
-                    layer_names=target_names + draft_names,
-                    kv_cache_spec=UniformTypeKVCacheSpecs(
-                        block_size=16,
-                        kv_cache_specs=dict.fromkeys(target_names, target) | dict.fromkeys(draft_names, draft),
-                    ),
+                KVCacheGroup.from_layers(
+                    {
+                        **dict.fromkeys(target_names, FullAttentionManager.layer_config(target)),
+                        **dict.fromkeys(draft_names, FullAttentionManager.layer_config(draft)),
+                    }
                 ),
             ],
             dspark_draft_layer_names=tuple(draft_names),
@@ -362,7 +371,9 @@ class TestPCPPoolWorker(unittest.TestCase):
         # Adding same-spec draft layers must not turn a non-reused target
         # layout into scratch reuse: allocation keeps those draft pages private.
         config.kv_cache_groups = [
-            KVCacheGroupSpec(layer_names=target_names + draft_names, kv_cache_spec=target),
+            KVCacheGroup.from_layers(
+                dict.fromkeys(target_names + draft_names, FullAttentionManager.layer_config(target))
+            ),
         ]
         worker = make_worker(
             self,
@@ -410,9 +421,13 @@ class TestLayerwiseAttentionSave(unittest.TestCase):
     def make_worker(self):
         plan = SimpleNamespace(
             kv_cache_groups=[
-                KVCacheGroupSpec(
-                    [f"model.layers.{layer}.attn"],
-                    FullAttentionSpec(block_size=16, num_kv_heads=1, head_size=8, dtype=torch.float32),
+                KVCacheGroup.from_layers(
+                    dict.fromkeys(
+                        [f"model.layers.{layer}.attn"],
+                        FullAttentionManager.layer_config(
+                            AttentionSpec(block_size=16, num_kv_heads=1, head_size=8, dtype=torch.float32)
+                        ),
+                    )
                 )
                 for layer in range(2)
             ],
@@ -426,14 +441,17 @@ class TestLayerwiseAttentionSave(unittest.TestCase):
     def test_single_group_recurrent_layer_keeps_post_compute_save(self):
         plan = SimpleNamespace(
             kv_cache_groups=[
-                KVCacheGroupSpec(
-                    ["model.layers.7.attn"],
-                    MambaSpec(
-                        block_size=16,
-                        shapes=((8,), (8,)),
-                        dtypes=(torch.float32, torch.float32),
-                        mamba_cache_mode="align",
-                    ),
+                KVCacheGroup.from_layers(
+                    {
+                        "model.layers.7.attn": MambaManager.layer_config(
+                            MambaSpec(
+                                block_size=16,
+                                shapes=((8,), (8,)),
+                                dtypes=(torch.float32, torch.float32),
+                            ),
+                            mamba_cache_mode="align",
+                        )
+                    }
                 )
             ]
         )
@@ -452,22 +470,27 @@ class TestLayerwiseAttentionSave(unittest.TestCase):
         self.assertIsNone(gate.on_start)
 
     def test_pp_maps_global_mamba_layer_to_local_post_compute_save(self):
-        from vllm.v1.kv_cache_interface import UniformTypeKVCacheSpecs
 
-        full_spec = FullAttentionSpec(block_size=16, num_kv_heads=1, head_size=8, dtype=torch.float32)
+        full_spec = AttentionSpec(block_size=16, num_kv_heads=1, head_size=8, dtype=torch.float32)
         mamba_spec = MambaSpec(
             block_size=16,
             shapes=((8,), (8,)),
             dtypes=(torch.float32, torch.float32),
-            mamba_cache_mode="align",
         )
         for wrapped in (False, True):
             with self.subTest(wrapped=wrapped):
                 groups = []
                 for layer, spec in zip((2, 3), (full_spec, mamba_spec), strict=True):
                     layer_name = f"model.layers.{layer}.attn"
-                    group_spec = UniformTypeKVCacheSpecs.from_specs({layer_name: spec}) if wrapped else spec
-                    groups.append(KVCacheGroupSpec([layer_name], group_spec))
+                    layer_config = (
+                        MambaManager.layer_config(spec, mamba_cache_mode="align")
+                        if isinstance(spec, MambaSpec)
+                        else FullAttentionManager.layer_config(spec)
+                    )
+                    group = KVCacheGroup.from_layers({layer_name: layer_config})
+                    if wrapped:
+                        group.unprojected_specs = group.distinct_specs
+                    groups.append(group)
                 worker = make_worker(
                     self,
                     num_layers=2,
@@ -818,14 +841,11 @@ class TestKVPoolWorkerHelpers(unittest.TestCase):
 
     def test_uses_mamba_kv_cache_inside_uniform_group(self):
         import torch
-        from vllm.v1.kv_cache_interface import MambaSpec, UniformTypeKVCacheSpecs
 
         cls = self._make_worker_class()
-        # vLLM #53896 now compares page sizes while forming uniform groups.
         mamba_spec = MambaSpec(block_size=384, shapes=((1,),), dtypes=(torch.float32,))
-        uniform_spec = UniformTypeKVCacheSpecs.from_specs({"mamba.layer": mamba_spec})
-        self.assertIsNotNone(uniform_spec)
-        kv_cache_config = SimpleNamespace(kv_cache_groups=[SimpleNamespace(kv_cache_spec=uniform_spec)])
+        group = KVCacheGroup.from_layers({"mamba.layer": MambaManager.layer_config(mamba_spec)})
+        kv_cache_config = SimpleNamespace(kv_cache_groups=[group])
 
         self.assertTrue(cls._uses_mamba_kv_cache(True, kv_cache_config))
 
@@ -930,28 +950,17 @@ class TestKVPoolWorkerHelpers(unittest.TestCase):
 
     def _make_sparse_swa_coordinator(self):
         import torch
-        from vllm.v1.kv_cache_interface import KVCacheGroupSpec, SlidingWindowSpec
 
         from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.coordinator import AscendStoreCoordinator
 
-        with patch(
-            "vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.coordinator._get_manager_class",
-            return_value=_SparseSWAHitManager,
-        ):
-            return AscendStoreCoordinator(
-                [
-                    KVCacheGroupSpec(
-                        ["layer.0"],
-                        SlidingWindowSpec(
-                            block_size=128, num_kv_heads=1, head_size=1, dtype=torch.float32, sliding_window=256
-                        ),
-                    )
-                ],
-                scheduler_block_size=256,
-                hash_block_size=128,
-                group_block_sizes=[128],
-                group_cache_families=["c1"],
-            )
+        spec = AttentionSpec(block_size=128, num_kv_heads=1, head_size=1, dtype=torch.float32)
+        return AscendStoreCoordinator(
+            [KVCacheGroup.from_layers({"layer.0": SlidingWindowManager.layer_config(spec, sliding_window=128)})],
+            scheduler_block_size=256,
+            hash_block_size=128,
+            group_block_sizes=[128],
+            group_cache_families=["c1"],
+        )
 
     @staticmethod
     def _make_lookup_worker(cls, coordinator):
@@ -1022,7 +1031,7 @@ class TestKVPoolWorkerHelpers(unittest.TestCase):
 
     def test_layerwise_multi_group_layout_includes_mtp(self):
         import torch
-        from vllm.v1.kv_cache_interface import FullAttentionSpec
+        from vllm.v1.kv_cache_interface import AttentionSpec
 
         cls = LayerwiseKVPoolWorker
         worker = object.__new__(cls)
@@ -1032,13 +1041,13 @@ class TestKVPoolWorkerHelpers(unittest.TestCase):
         worker.hf_config = SimpleNamespace(num_hidden_layers=4)
         worker.use_layerwise_transfer = True
         worker._extra_config = {"layerwise_num_shared_buffers": 2}
-        main_spec = FullAttentionSpec(
+        main_spec = AttentionSpec(
             block_size=2,
             num_kv_heads=1,
             head_size=8,
             dtype=torch.float16,
         )
-        indexer_spec = FullAttentionSpec(
+        indexer_spec = AttentionSpec(
             block_size=2,
             num_kv_heads=1,
             head_size=4,
@@ -1849,17 +1858,21 @@ class TestKVPoolWorkerProcessLayerData(unittest.TestCase):
         worker = self._make_gva_worker(num_groups=3)
         target_names = ["model.layers.0.attn", "model.layers.1.attn"]
         draft_names = ["draft.layers.2.attn", "draft.layers.3.attn"]
-        spec = FullAttentionSpec(block_size=16, num_kv_heads=1, head_size=4, dtype=torch.bfloat16)
+        spec = AttentionSpec(block_size=16, num_kv_heads=1, head_size=4, dtype=torch.bfloat16)
         worker.hf_config = SimpleNamespace(num_hidden_layers=2)
         worker.original_block_size = [16, 16, 16]
         worker.kv_cache_config = SimpleNamespace(
             num_blocks=16,
             kv_cache_groups=[
-                KVCacheGroupSpec(
-                    layer_names=[target_names[0]] + ([draft_names[0]] if mixed else []), kv_cache_spec=spec
+                KVCacheGroup.from_layers(
+                    dict.fromkeys(
+                        [target_names[0]] + ([draft_names[0]] if mixed else []), FullAttentionManager.layer_config(spec)
+                    )
                 ),
-                KVCacheGroupSpec(layer_names=draft_names[1:] if mixed else draft_names, kv_cache_spec=spec),
-                KVCacheGroupSpec(layer_names=[target_names[1]], kv_cache_spec=spec),
+                KVCacheGroup.from_layers(
+                    dict.fromkeys(draft_names[1:] if mixed else draft_names, FullAttentionManager.layer_config(spec))
+                ),
+                KVCacheGroup.from_layers(dict.fromkeys([target_names[1]], FullAttentionManager.layer_config(spec))),
             ],
             dspark_draft_layer_names=tuple(draft_names),
         )

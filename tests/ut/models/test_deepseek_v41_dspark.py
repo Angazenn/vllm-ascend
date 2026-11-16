@@ -15,9 +15,8 @@ pytest.importorskip(
 
 import torch
 from vllm.v1.core.single_type_kv_cache_manager import SlidingWindowManager
-from vllm.v1.kv_cache_spec_registry import KVCacheSpecRegistry
+from vllm.v1.kv_cache_interface import MLAAttentionSpec
 
-from vllm_ascend.core.kv_cache_interface import AscendSlidingWindowMLASpec, register_ascend_kv_cache_specs
 from vllm_ascend.models.deepseek_v41 import dspark as deepseek_v41_dspark_module
 from vllm_ascend.models.deepseek_v41.dspark import (
     DeepseekV41DSparkAttention,
@@ -26,37 +25,31 @@ from vllm_ascend.models.deepseek_v41.dspark import (
     DeepseekV41DSparkSWACache,
     DSparkDeepseekV41ForCausalLM,
 )
-from vllm_ascend.models.deepseek_v41.model import AscendDeepseekV41SWACache, DeepseekV41Model
+from vllm_ascend.models.deepseek_v41.model import DeepseekV41Model
 
 
-def test_draft_cache_uses_v41_backend_and_explicit_deepseek_v41_spec(monkeypatch):
-    spec = AscendSlidingWindowMLASpec(
+def test_draft_cache_uses_v41_backend_and_sliding_window_manager():
+    spec = MLAAttentionSpec(
         block_size=128,
         num_kv_heads=1,
         head_size=512,
         dtype=torch.bfloat16,
-        sliding_window=128,
         cache_dtype_str="bfloat16",
         model_version="deepseek_v41",
     )
-    with patch.object(AscendDeepseekV41SWACache, "get_kv_cache_spec", return_value=spec):
-        cache = DeepseekV41DSparkSWACache.__new__(DeepseekV41DSparkSWACache)
-        draft = cache.get_kv_cache_spec(None)
+    cache = DeepseekV41DSparkSWACache.__new__(DeepseekV41DSparkSWACache)
+    cache.spec = spec
+    cache.window_size = 128
+    cache.bounded_replay = False
+    draft = cache.get_kv_cache_config(None)
     from vllm_ascend.attention.dsa_v41 import DeepseekV41CacheBackend
 
     assert DeepseekV41DSparkSWACache.get_attn_backend(None) is DeepseekV41CacheBackend
-    assert type(draft) is AscendSlidingWindowMLASpec
-    assert draft.page_size_bytes == 131072
+    assert draft.spec is spec
+    assert draft.spec.page_size_bytes == 131072
+    assert draft.manager_config == SlidingWindowManager.config(sliding_window=128)
     assert DeepseekV41DSparkDecoderLayer.attention_cls is DeepseekV41DSparkAttention
     assert DeepseekV41DSparkAttention.swa_cache_cls is DeepseekV41DSparkSWACache
-    registrations = {}
-
-    def record(kvcache_spec_cls, manager_class, uniform_type_base_spec):
-        registrations[kvcache_spec_cls] = manager_class
-
-    monkeypatch.setattr(KVCacheSpecRegistry, "register", record)
-    register_ascend_kv_cache_specs()
-    assert registrations[type(draft)] is SlidingWindowManager
 
 
 def test_target_exports_residual_entering_selected_layers(monkeypatch):

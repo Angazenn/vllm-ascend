@@ -11,13 +11,12 @@ import pytest
 import torch
 from vllm.config import ParallelConfig
 from vllm.v1.attention.backends.registry import MambaAttentionBackendEnum
+from vllm.v1.core.single_type_kv_cache_manager import CircularBufferManager, FullAttentionManager
 from vllm.v1.kv_cache_interface import (
-    CircularBufferSpec,
-    FullAttentionSpec,
+    AttentionSpec,
     KVCacheConfig,
-    KVCacheGroupSpec,
+    KVCacheGroup,
     MambaSpec,
-    UniformTypeKVCacheSpecs,
 )
 from vllm.v1.outputs import KVConnectorOutput
 
@@ -58,6 +57,7 @@ from vllm_ascend.distributed.kv_transfer.kv_pool.kv_offload.preempt_offload.work
     MambaConvCacheBinding,
     PreemptOffloadWorker,
 )
+from vllm_ascend.models.glm5next.kv_cache import KpoolTailManager  # noqa: E402
 
 for _module_name, _module in _saved_modules.items():
     sys.modules[_module_name] = _module
@@ -1152,9 +1152,8 @@ def test_worker_keeps_mamba_views_separate_from_attention(reverse, attention_sca
 
 
 @pytest.mark.parametrize("glm_tail", [False, True])
-@pytest.mark.parametrize("uniform", [False, True])
 @pytest.mark.parametrize("load_start", [0, 48])
-def test_preempt_offload_ring_uses_single_private_block(glm_tail, uniform, load_start):
+def test_preempt_offload_ring_uses_single_private_block(glm_tail, load_start):
     if glm_tail:
         spec = AscendIndexerKPoolTailSpec(
             block_size=4,
@@ -1162,15 +1161,13 @@ def test_preempt_offload_ring_uses_single_private_block(glm_tail, uniform, load_
             num_kv_heads=1,
             head_size=8,
             dtype=torch.float32,
-            sliding_window=4,
             compress_ratio=4,
         )
     else:
-        spec = CircularBufferSpec(block_size=16, num_kv_heads=1, head_size=8, dtype=torch.float32)
-    if uniform:
-        spec = UniformTypeKVCacheSpecs.from_specs({"ring": spec})
-        assert spec is not None
-    config = SimpleNamespace(kv_cache_groups=[SimpleNamespace(kv_cache_spec=spec)])
+        spec = AttentionSpec(block_size=16, num_kv_heads=1, head_size=8, dtype=torch.float32)
+    manager = KpoolTailManager if glm_tail else CircularBufferManager
+    group = KVCacheGroup.from_layers({"ring": manager.layer_config(spec)})
+    config = SimpleNamespace(kv_cache_groups=[group])
     scheduler = PreemptOffloadScheduler.__new__(PreemptOffloadScheduler)
     scheduler.dcp_world_size = 1
     scheduler.cpu_kv_cache_config = config
@@ -1316,15 +1313,18 @@ def test_pcp_offload_local_round_trip_waits_for_all_workers(pcp, tp, pp, dcp, sh
         num_blocks=8,
         kv_cache_tensors=[],
         kv_cache_groups=[
-            KVCacheGroupSpec(
-                ["layer"],
-                FullAttentionSpec(
-                    block_size=384,
-                    num_kv_heads=1,
-                    head_size=1,
-                    dtype=torch.float16,
-                    dcp_sharded=sharded,
-                ),
+            KVCacheGroup.from_layers(
+                {
+                    "layer": FullAttentionManager.layer_config(
+                        AttentionSpec(
+                            block_size=384,
+                            num_kv_heads=1,
+                            head_size=1,
+                            dtype=torch.float16,
+                            dcp_sharded=sharded,
+                        )
+                    )
+                }
             )
         ],
     )

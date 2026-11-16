@@ -27,7 +27,7 @@ if "mooncake.engine" not in sys.modules:
         _fake_engine.__dict__["TransferEngine"] = MagicMock()
         sys.modules["mooncake.engine"] = _fake_engine
 
-from vllm_ascend.core.kv_cache_interface import AscendSlidingWindowMLASpec  # noqa: E402
+from vllm_ascend.core.kv_cache_interface import AscendMLAAttentionSpec  # noqa: E402
 from vllm_ascend.distributed.kv_transfer.kv_p2p import mooncake_d2rh_connector as d2rh  # noqa: E402
 
 
@@ -730,13 +730,12 @@ class TestSchedulerBlockSize:
     """
 
     @staticmethod
-    def _swa_spec(block_size: int, model_version: str | None) -> AscendSlidingWindowMLASpec:
-        return AscendSlidingWindowMLASpec(
+    def _swa_spec(block_size: int, model_version: str | None) -> AscendMLAAttentionSpec:
+        return AscendMLAAttentionSpec(
             block_size=block_size,
             num_kv_heads=1,
             head_size=16,
             dtype=torch.float16,
-            sliding_window=128,
             model_version=model_version,
         )
 

@@ -21,6 +21,7 @@ import inspect
 import logging
 from contextlib import AbstractContextManager, contextmanager, nullcontext
 from copy import deepcopy
+from dataclasses import replace
 from typing import Any
 
 import numpy as np
@@ -120,8 +121,11 @@ from vllm_ascend.worker.device_metadata import TargetDeviceMetadata
 from vllm_ascend.worker.utils import disable_compilation
 from vllm_ascend.worker.v2.aclgraph_utils import ModelAclGraphManager
 from vllm_ascend.worker.v2.attn_utils import (
+    _get_layer_kv_cache_specs,
     build_attn_state,
+    get_kv_cache_layer_configs,
     skip_ring_state_update,
+    uses_unified_deepseek_cache,
 )
 from vllm_ascend.worker.v2.eplb import AscendEPLBController
 from vllm_ascend.worker.v2.input_batch import AscendInputBatch, AscendInputBuffers
@@ -375,17 +379,27 @@ class NPUModelRunner(GPUModelRunner):
         self._finalize_dump_data()
         return output
 
-    def get_kv_cache_spec(self) -> dict[str, KVCacheSpec]:
-        kv_cache_spec = super().get_kv_cache_spec()
-
-        return apply_dspark_resident_kv_specs(
-            kv_cache_spec,
+    def get_kv_cache_layer_configs(self):
+        if uses_unified_deepseek_cache(self.vllm_config):
+            return super().get_kv_cache_layer_configs()
+        configs = get_kv_cache_layer_configs(self.vllm_config)
+        draft_names = getattr(self.speculator, "draft_attn_layer_names", set())
+        if getattr(self.speculator, "dcp_size", None) == 1 and self.dcp_size > 1:
+            for name in configs.keys() & draft_names:
+                config = configs[name]
+                configs[name] = replace(config, spec=replace(config.spec, dcp_sharded=False))
+        specs = apply_dspark_resident_kv_specs(
+            {name: config.spec for name, config in configs.items()},
             self.vllm_config,
             self.speculator,
             sparse_offload_enabled=self.ascend_config.sparse_kv_offload_config.enabled,
             is_last_pp_rank=self.is_last_pp_rank,
             shared_kv_cache_layers=getattr(self, "shared_kv_cache_layers", None),
         )
+        return {name: replace(configs[name], spec=spec) for name, spec in specs.items()}
+
+    def get_kv_cache_spec(self) -> dict[str, KVCacheSpec]:
+        return {name: config.spec for name, config in self.get_kv_cache_layer_configs().items()}
 
     def _init_kv_zero_meta(self) -> None:
         """Use a tuple-aware zeroer for Ascend V1-compatible cache protocols."""
@@ -432,7 +446,7 @@ class NPUModelRunner(GPUModelRunner):
     def _has_target_flashmla_attention(self) -> bool:
         # Draft attention has its own graph dispatch. Only target layers may
         # restrict target batches containing decode-like PD prompt tails.
-        draft_layer_names = getattr(self.speculator, "draft_attn_layer_names", ())
+        draft_layer_names = getattr(self.speculator, "draft_attn_layer_names", set())
         return any(
             any(layer_name not in draft_layer_names for layer_name in group.layer_names)
             and getattr(group.get_metadata_builder(0), "flashmla_state", None) is not None
@@ -493,7 +507,7 @@ class NPUModelRunner(GPUModelRunner):
             self.model_state._offload_draft_attn_groups = (
                 [] if resident_draft_names else getattr(self.speculator, "attn_groups", [])
             )
-        if any(is_circular_kv_cache_spec(group.kv_cache_spec) for group in self.kv_cache_config.kv_cache_groups):
+        if any(is_circular_kv_cache_spec(spec) for spec in _get_layer_kv_cache_specs(self.kv_cache_config).values()):
             from vllm_ascend.models.deepseek_v41.compressor import DeepseekV41Compressor
 
             for module in self.model.modules():

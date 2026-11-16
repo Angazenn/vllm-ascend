@@ -15,7 +15,8 @@ fake_engine = types.ModuleType("mooncake.engine")
 fake_engine.TransferEngine = MagicMock()  # type: ignore[attr-defined]
 sys.modules["mooncake.engine"] = fake_engine
 
-from vllm.v1.kv_cache_interface import MambaSpec  # noqa: E402
+from vllm.v1.core.single_type_kv_cache_manager import FullAttentionManager, MambaManager  # noqa: E402
+from vllm.v1.kv_cache_interface import AttentionSpec, KVCacheGroup, MambaSpec  # noqa: E402
 from vllm.v1.request import RequestStatus  # noqa: E402
 
 from vllm_ascend.distributed.kv_transfer.kv_p2p.mooncake_hybrid_connector import (  # noqa: E402
@@ -371,15 +372,20 @@ class TestMooncakeHybridConnectorWorker(unittest.TestCase):
             cache_config=types.SimpleNamespace(block_size=128),
             scheduler_config=types.SimpleNamespace(disable_hybrid_kv_cache_manager=False),
         )
-        state_spec = (
-            MagicMock(spec=MambaSpec, block_size=128, shapes=((2, 2), (2, 2)), dtypes=(torch.float32, torch.float32))
+        spec = AttentionSpec(block_size=512, num_kv_heads=1, head_size=8, dtype=torch.float16)
+        state_layer = (
+            MambaManager.layer_config(
+                MambaSpec(block_size=128, shapes=((2, 2), (2, 2)), dtypes=(torch.float32, torch.float32))
+            )
             if use_mamba
-            else types.SimpleNamespace(block_size=128)
+            else FullAttentionManager.layer_config(
+                AttentionSpec(block_size=128, num_kv_heads=1, head_size=8, dtype=torch.float16)
+            )
         )
         cache_config = types.SimpleNamespace(
             kv_cache_groups=[
-                types.SimpleNamespace(kv_cache_spec=types.SimpleNamespace(block_size=512), layer_names=["layer.0"]),
-                types.SimpleNamespace(kv_cache_spec=state_spec, layer_names=["layer.1"]),
+                KVCacheGroup.from_layers({"layer.0": FullAttentionManager.layer_config(spec)}),
+                KVCacheGroup.from_layers({"layer.1": state_layer}),
             ]
         )
         host = f"192.0.2.{pcp_rank * tp_size + tp_rank + 1}"

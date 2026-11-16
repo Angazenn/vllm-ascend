@@ -6,7 +6,8 @@ from unittest.mock import Mock
 import pytest
 import torch
 from vllm.model_executor.layers.attention import MLAAttention
-from vllm.v1.kv_cache_interface import SlidingWindowSpec
+from vllm.v1.core.single_type_kv_cache_manager import SlidingWindowManager
+from vllm.v1.kv_cache_interface import KVCacheConfig, KVCacheGroup
 
 from tests.ut.kvpp_utils import indexer_name, layer_name, make_dspark_kvpp_case, make_kvpp_config, make_kvpp_specs
 from vllm_ascend.ascend_config import KVPPConfig
@@ -150,14 +151,15 @@ def test_dspark_draft_only_stage_has_no_scratch_cost():
     assert plan.get_num_blocks(3 * 384) == 3
 
 
-def test_mtp_still_rejects_sliding_window_cache_specs():
-    config, specs, drafts = make_dspark_kvpp_case()
-    config.speculative_config.method = "mtp"
-    specs[drafts[0]] = SlidingWindowSpec(
-        block_size=2, num_kv_heads=2, head_size=8, dtype=torch.float16, sliding_window=4
-    )
-    with pytest.raises(ValueError, match="KVPP requires one full-attention cache group"):
-        placement.create_kvpp_cache_allocation_plan(config, specs, 0)
+def test_kvpp_rejects_sliding_window_allocation():
+    from vllm_ascend.worker.kvpp_cache import get_kvpp_cache_specs
+
+    _, specs, drafts = make_dspark_kvpp_case()
+    name = drafts[0]
+    sliding = KVCacheGroup.from_layers({name: SlidingWindowManager.layer_config(specs[name], sliding_window=4)})
+    config = KVCacheConfig(num_blocks=1, kv_cache_tensors=[], kv_cache_groups=[sliding])
+    with pytest.raises(ValueError, match="KVPP requires full-attention cache allocation"):
+        get_kvpp_cache_specs(config)
 
 
 def test_dspark_draft_names_are_filtered_to_local_cache_specs():

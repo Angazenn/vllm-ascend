@@ -9,7 +9,7 @@ import pytest
 import torch
 import torch_npu
 from vllm.v1.attention.backend import AttentionCGSupport
-from vllm.v1.kv_cache_interface import FullAttentionSpec
+from vllm.v1.kv_cache_interface import AttentionSpec
 
 from vllm_ascend.attention.indexer import (
     AscendSFAIndexerBackend,
@@ -28,7 +28,7 @@ def _make_builder(
     num_speculative_tokens: int | None = None,
     physical_block_size: int = 128,
 ) -> AscendSFAIndexerMetadataBuilder:
-    kv_cache_spec = FullAttentionSpec(
+    kv_cache_spec = AttentionSpec(
         block_size=physical_block_size,
         num_kv_heads=1,
         head_size=160,

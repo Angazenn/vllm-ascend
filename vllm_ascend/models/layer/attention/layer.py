@@ -17,7 +17,8 @@ from vllm.platforms import current_platform
 from vllm.utils.torch_utils import kv_cache_dtype_str_to_dtype
 from vllm.v1.attention.backend import AttentionBackend
 from vllm.v1.attention.backends.mla.sparse_swa import DeepseekV4SWACache
-from vllm.v1.kv_cache_interface import KVCacheSpec
+from vllm.v1.core.single_type_kv_cache_manager import FullAttentionManager
+from vllm.v1.kv_cache_interface import KVCacheLayerConfig
 
 from vllm_ascend.attention.dsa_attn_kv_plan import is_a5_bf16_kv_enabled
 from vllm_ascend.attention.dsa_v1 import (
@@ -205,7 +206,7 @@ class DSAAttention(nn.Module, AttentionLayerBase):
     def get_attn_backend(self) -> type[AttentionBackend]:
         return self.attn_backend
 
-    def get_kv_cache_spec(self, vllm_config: VllmConfig) -> KVCacheSpec:
+    def get_kv_cache_config(self, vllm_config: VllmConfig) -> KVCacheLayerConfig | None:
         if self.compress_ratio <= 1:  # SWA part. Allocated separately as DeepseekV4SWACache.
             return None
         kv_cache_dtype = kv_cache_dtype_str_to_dtype(self.kv_cache_dtype, vllm_config.model_config)
@@ -218,10 +219,7 @@ class DSAAttention(nn.Module, AttentionLayerBase):
         if is_turboquant(vllm_config) and self.compress_ratio == 4:
             cached_head_size = SLOT_BYTES
         storage_block_size = dsv4_block_sizes(vllm_config)[vllm_config.cache_config.block_size][0][0]
-        # vLLM #51718 replaced MLAAttentionSpec.compress_ratio with
-        # AttentionSpec.tokens_per_state on main.
-        ratio_kwargs: dict[str, Any] = {"tokens_per_state": self.compress_ratio}
-        return AscendMLAAttentionSpec(
+        spec = AscendMLAAttentionSpec(
             # The scheduler operates in raw-token units. Ascend kernels keep
             # using the compressed page exposed by storage_block_size.
             block_size=storage_block_size * self.compress_ratio,
@@ -231,5 +229,6 @@ class DSAAttention(nn.Module, AttentionLayerBase):
             dtype=kv_cache_dtype,
             model_version="deepseek_v4",
             cache_dtype_str=vllm_config.cache_config.cache_dtype,
-            **ratio_kwargs,
+            tokens_per_state=self.compress_ratio,
         )
+        return FullAttentionManager.layer_config(spec)

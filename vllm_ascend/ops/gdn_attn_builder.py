@@ -1200,7 +1200,7 @@ class AscendGDNHostMetadataBuilder(AscendGDNAttentionMetadataBuilder):
         if (
             self._spec_conv_indices is None
             or self.vllm_config.cache_config.mamba_cache_mode != "align"
-            or (num_spec_decodes > 0 and self.kv_cache_spec.num_speculative_blocks < self.num_spec)
+            or (num_spec_decodes > 0 and self.num_speculative_blocks < self.num_spec)
         ):
             return None
 

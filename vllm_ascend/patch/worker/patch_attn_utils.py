@@ -15,7 +15,6 @@ from vllm_ascend.utils import vllm_version_is
 from vllm_ascend.worker.utils import prepare_ascend_kernel_block_sizes
 from vllm_ascend.worker.v2.attn_utils import (
     allocate_kv_cache_main,
-    get_kv_cache_spec,
 )
 
 
@@ -94,4 +93,14 @@ vllm.v1.worker.gpu.attn_utils.bind_kv_cache_to_layers = bind_kv_cache_to_layers
 v1_worker_utils.bind_kv_cache = bind_kv_cache
 v1_worker_utils.bind_kv_cache_to_layers = bind_kv_cache_to_layers
 
-vllm.v1.worker.gpu.model_runner.get_kv_cache_spec = get_kv_cache_spec
+
+def _bind_kv_caches(kv_caches, forward_context, kv_cache_config, vllm_config, attn_groups=()):
+    # Ascend allocation already split the manager pages into kernel views.
+    bind_kv_cache_to_layers(
+        {name: cache for name, cache in kv_caches.items() if name in forward_context},
+        forward_context,
+    )
+    return kv_caches
+
+
+vllm.v1.worker.gpu.attn_utils.bind_kv_caches = _bind_kv_caches

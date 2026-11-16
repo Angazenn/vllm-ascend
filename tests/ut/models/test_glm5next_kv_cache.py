@@ -11,7 +11,7 @@ import numpy as np
 import pytest
 import torch
 from vllm.v1.core.block_pool import BlockPool
-from vllm.v1.kv_cache_spec_registry import KVCacheSpecRegistry
+from vllm.v1.kv_cache_interface import KVCacheGroup
 from vllm.v1.worker.utils import select_common_block_size
 
 from vllm_ascend.attention.attention_v1 import AscendCommonAttentionMetadata
@@ -26,8 +26,6 @@ from vllm_ascend.core.kv_cache_interface import (
     AscendMLAAttentionSpec,
     get_kv_cache_compression_ratio,
     get_storage_block_size,
-    is_prefix_cacheable,
-    register_ascend_kv_cache_specs,
 )
 from vllm_ascend.models.glm5next.kv_cache import (
     Glm5NextIndexerCache,
@@ -70,11 +68,9 @@ def test_tail_ring_capacity_retains_speculative_lookahead(pool, lookahead, capac
 
 @pytest.mark.parametrize("capacity", [4, 9, 12])
 def test_tail_uses_one_full_precision_page(capacity):
-    register_ascend_kv_cache_specs()
     spec = AscendIndexerKPoolTailSpec(
         block_size=4,
         ring_capacity=capacity,
-        sliding_window=4,
         compress_ratio=4,
         num_kv_heads=1,
         head_size=128,
@@ -94,21 +90,9 @@ def test_tail_uses_one_full_precision_page(capacity):
     assert padded_spec.real_page_size_bytes == padded_spec.unpadded_page_size_bytes == spec.page_size_bytes
     with pytest.raises(AssertionError):
         _ = replace(spec, page_size_padded=spec.page_size_bytes - 1).page_size_bytes
-    merged_spec = AscendIndexerKPoolTailSpec.merge([spec, replace(spec)])
-    assert merged_spec == spec and merged_spec is not spec
-    with pytest.raises(AssertionError):
-        AscendIndexerKPoolTailSpec.merge([spec, padded_spec])
-    larger_ring = replace(spec, ring_capacity=capacity + 1)
-    assert not spec.is_uniform_with_collection({"larger_ring": larger_ring})
-    with pytest.raises(AssertionError):
-        AscendIndexerKPoolTailSpec.merge([spec, larger_ring])
-    with pytest.raises(AssertionError):
-        AscendIndexerKPoolTailSpec.merge([object()])
-    assert KVCacheSpecRegistry.get_manager_class(spec) is KpoolTailManager
-    assert spec.max_admission_blocks_per_request(16, 1024) == 1
-    assert spec.max_admission_blocks_per_request(8192, 131072) == 1
-    assert not spec.prefix_cacheable
-    assert not is_prefix_cacheable(spec)
+    group = KVCacheGroup.from_layers({"tail": KpoolTailManager.layer_config(spec)})
+    assert group.max_allocated_blocks_per_request(None) == 1
+    assert not group.prefix_cacheable
     assert spec.is_circular
     context_parallel_config = SimpleNamespace(
         model_config=SimpleNamespace(max_model_len=1024),
@@ -117,22 +101,21 @@ def test_tail_uses_one_full_precision_page(capacity):
             prefill_context_parallel_size=2,
         ),
     )
-    assert spec.max_memory_usage_bytes(context_parallel_config) == spec.page_size_bytes
+    assert group.max_memory_usage_bytes(context_parallel_config) == spec.page_size_bytes
 
 
 @pytest.mark.parametrize(
-    ("dtype", "block_size", "sliding_window"),
+    ("dtype", "block_size"),
     [
-        (torch.bfloat16, 4, 4),
-        (torch.float32, 2, 4),
+        (torch.bfloat16, 4),
+        (torch.float32, 2),
     ],
 )
-def test_invalid_state_layout_is_rejected(dtype, block_size, sliding_window):
+def test_invalid_state_layout_is_rejected(dtype, block_size):
     with pytest.raises(ValueError):
         AscendIndexerKPoolTailSpec(
             block_size=4,
             ring_capacity=block_size,
-            sliding_window=sliding_window,
             compress_ratio=4,
             num_kv_heads=1,
             head_size=256,
@@ -151,14 +134,15 @@ def test_tail_manager_retains_one_private_block_until_free():
     spec = AscendIndexerKPoolTailSpec(
         block_size=4,
         ring_capacity=4,
-        sliding_window=4,
         compress_ratio=4,
         num_kv_heads=1,
         head_size=128,
         dtype=torch.float32,
     )
     pool = BlockPool(12, True, 4)
-    manager = KpoolTailManager(spec, pool, True, 1, scheduler_block_size=16)
+    manager = KpoolTailManager(
+        KVCacheGroup.from_layers({"tail": KpoolTailManager.layer_config(spec)}), pool, True, 1, scheduler_block_size=16
+    )
     initially_free = pool.get_num_free_blocks()
     assert manager.get_num_blocks_to_allocate("a", 1000, [], 0, 0, 1000, prefill_end=1000) == 1
     a = manager.allocate_new_blocks("a", 1000, 1000)
@@ -173,8 +157,7 @@ def test_tail_manager_retains_one_private_block_until_free():
             manager.get_num_blocks_to_allocate("a", tokens, [], tokens - 1, tokens - 1, tokens, prefill_end=1000) == 0
         )
     request = SimpleNamespace(request_id="a")
-    manager.cache_blocks(request, 131072)
-    manager.cache_blocks(request, 131072, replay_boundary=16)
+    manager.cache_blocks(request, 131072, replay_boundaries=())
     manager.cache_blocks(request, 131072, replay_boundaries=[16])
     assert a[0].block_hash is None
     assert manager.get_num_common_prefix_blocks("a") == 0
@@ -189,15 +172,23 @@ def test_tail_manager_prefix_hit_has_no_shared_blocks():
     spec = AscendIndexerKPoolTailSpec(
         block_size=4,
         ring_capacity=4,
-        sliding_window=4,
         compress_ratio=4,
         num_kv_heads=1,
         head_size=128,
         dtype=torch.float32,
     )
     pool = BlockPool(8, True, 4)
-    manager = KpoolTailManager(spec, pool, True, 1, scheduler_block_size=16, needs_kv_cache_zeroing=True)
-    blocks, hit = manager.find_longest_cache_hit([], 4096, [1, 3], pool, spec, False, 16)
+    manager = KpoolTailManager(
+        KVCacheGroup.from_layers({"tail": KpoolTailManager.layer_config(spec)}),
+        pool,
+        True,
+        1,
+        scheduler_block_size=16,
+        needs_kv_cache_zeroing=True,
+    )
+    blocks, hit = manager.find_longest_cache_hit(
+        [], 4096, [1, 3], pool, spec.block_size, KpoolTailManager.config(), False, 16
+    )
     assert blocks == ([], []) and hit == 0
     manager.allocate_external_computed_blocks("hit", 1024, 0, record_for_zeroing=False)
     assert len(manager.req_to_blocks["hit"]) == 1
@@ -319,7 +310,7 @@ def test_model_cache_layers_publish_source_compatible_specs(dtype, lookahead):
     if dtype == torch.float8_e4m3fn:
         assert indexer_spec.scale_dtype == torch.float32
         assert indexer_spec.real_page_size_bytes == 16 * (128 + 4)
-    assert state_spec.block_size == state_spec.sliding_window == 16
+    assert state_spec.block_size == state_spec.compress_ratio == 16
     assert state_spec.ring_capacity == state_spec.num_states == 16 + lookahead
     assert state_spec.head_size == 128
     assert state_spec.dtype == torch.float32
@@ -503,7 +494,6 @@ def test_pcp_kpool_metadata_writes_global_token_order(keypool_kernels, capture, 
         AscendIndexerKPoolTailSpec(
             block_size=4,
             ring_capacity=4,
-            sliding_window=4,
             compress_ratio=4,
             num_kv_heads=1,
             head_size=128,
@@ -733,7 +723,6 @@ def test_tail_inputs_pass_page_stride_and_isolate_step_buffers(width, ring_capac
         num_kv_heads=1,
         head_size=128,
         dtype=torch.float32,
-        sliding_window=4,
         compress_ratio=4,
         page_size_padded=81920,
     )

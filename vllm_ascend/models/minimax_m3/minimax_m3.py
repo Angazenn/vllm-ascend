@@ -92,8 +92,7 @@ from vllm.sequence import IntermediateTensors
 from vllm.triton_utils import HAS_TRITON
 from vllm.utils.torch_utils import kv_cache_dtype_str_to_dtype
 from vllm.v1.kv_cache_interface import (
-    FullAttentionSpec,
-    KVCacheSpec,
+    AttentionSpec,
     get_kv_quant_mode,
 )
 
@@ -355,8 +354,13 @@ class MiniMaxM3SparseAttention(nn.Module, AttentionLayerBase):
     def get_attn_backend(self) -> type[AscendMiniMaxM3SparseBackend]:
         return self.attn_backend
 
-    def get_kv_cache_spec(self, vllm_config: VllmConfig) -> KVCacheSpec | None:
-        return FullAttentionSpec(
+    def get_kv_cache_config(self, vllm_config: VllmConfig):
+        from vllm.v1.core.single_type_kv_cache_manager import FullAttentionManager
+
+        return FullAttentionManager.layer_config(self.get_kv_cache_spec(vllm_config))
+
+    def get_kv_cache_spec(self, vllm_config: VllmConfig) -> AttentionSpec:
+        return AttentionSpec(
             block_size=vllm_config.cache_config.block_size,
             num_kv_heads=self.num_kv_heads,
             head_size=self.head_dim,

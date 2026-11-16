@@ -15,7 +15,7 @@ from unittest.mock import MagicMock, patch
 import pytest
 import torch
 from vllm.config.compilation import CUDAGraphMode
-from vllm.v1.kv_cache_interface import FullAttentionSpec
+from vllm.v1.kv_cache_interface import AttentionSpec
 
 from vllm_ascend.attention.utils import AscendCommonAttentionMetadata
 from vllm_ascend.core.kv_cache_interface import AscendSFAIndexerCacheSpec
@@ -219,7 +219,7 @@ def _make_sparse_builder(
 ) -> AscendMiniMaxM3SparseMetadataBuilder:
     vllm_config = _make_vllm_config()
     vllm_config.speculative_config = SimpleNamespace(num_speculative_tokens=7, parallel_drafting=False)
-    spec = FullAttentionSpec(
+    spec = AttentionSpec(
         block_size=128,
         num_kv_heads=2,
         head_size=128,
@@ -241,7 +241,7 @@ def _make_indexer_builder(
 ) -> AscendMiniMaxM3IndexerMetadataBuilder:
     vllm_config = _make_vllm_config()
     vllm_config.parallel_config.tensor_parallel_size = tp_size
-    spec = FullAttentionSpec(
+    spec = AttentionSpec(
         block_size=128,
         num_kv_heads=1,
         head_size=128,
@@ -277,7 +277,7 @@ def test_indexer_cache_uses_sfa_indexer_spec(mock_get_vllm_config: MagicMock) ->
         prefix="layer0.attn.index_cache",
     )
     spec = index_cache.get_kv_cache_spec(vllm_config)
-    old_full_spec = FullAttentionSpec(
+    old_full_spec = AttentionSpec(
         block_size=128,
         num_kv_heads=1,
         head_size=128,
@@ -2255,7 +2255,7 @@ def test_sparse_builder_refreshes_captured_gbsa_buffer_for_padded_decode(
 def test_sparse_builder_keeps_unverified_gbsa_paths_in_layers(dtype, block_size, query_len, mock_gbsa_ops):
     config = _make_vllm_config()
     config.model_config.dtype = dtype
-    spec = FullAttentionSpec(block_size=block_size, num_kv_heads=2, head_size=128, dtype=dtype)
+    spec = AttentionSpec(block_size=block_size, num_kv_heads=2, head_size=128, dtype=dtype)
     config.speculative_config = SimpleNamespace(num_speculative_tokens=3, parallel_drafting=False)
     with patch.object(
         msa_m3_module, "get_current_hardware_profile", return_value=get_hardware_profile(AscendDeviceType.A3)
@@ -2821,7 +2821,7 @@ def test_gbsa_schedule_lengths_follow_speculative_config(spec_tokens, mock_gbsa_
     config.speculative_config = (
         SimpleNamespace(num_speculative_tokens=spec_tokens, parallel_drafting=False) if spec_tokens else None
     )
-    spec = FullAttentionSpec(block_size=128, num_kv_heads=2, head_size=128, dtype=torch.bfloat16)
+    spec = AttentionSpec(block_size=128, num_kv_heads=2, head_size=128, dtype=torch.bfloat16)
     builder = AscendMiniMaxM3SparseMetadataBuilder(spec, ["layer0.attn"], config, torch.device("cpu"))
     widths = range(1, spec_tokens + 2)
     assert list(builder.decode_gbsa_query_lengths) == list(widths)

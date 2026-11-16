@@ -8,14 +8,16 @@ from types import SimpleNamespace
 import pytest
 import torch
 from vllm.v1.core.single_type_kv_cache_manager import (
-    register_all_kvcache_specs,
+    FullAttentionManager,
+    MambaManager,
+    SlidingWindowManager,
 )
 from vllm.v1.kv_cache_interface import (
-    KVCacheGroupSpec,
+    AttentionSpec,
+    KVCacheGroup,
     KVCacheTensor,
     MambaSpec,
     MLAAttentionSpec,
-    SlidingWindowSpec,
 )
 
 from vllm_ascend.core.kv_cache_interface import AscendIndexerKPoolTailSpec, AscendMLAAttentionSpec
@@ -27,6 +29,7 @@ from vllm_ascend.models.glm5next.cache_config import (
     get_glm5_next_pool_bytes_per_block,
 )
 from vllm_ascend.models.glm5next.cache_views import view_compressed_indexer_cache, view_kpool_tail_cache
+from vllm_ascend.models.glm5next.kv_cache import KpoolTailManager
 from vllm_ascend.utils import get_kv_cache_tensor_layers
 
 
@@ -42,11 +45,7 @@ def test_platform_builder_accounts_for_both_glm_page_classes(pool, speculative_b
 
     config = make_config()
     config.attention_config = SimpleNamespace(hisparse_config=None)
-    specs = {
-        name: replace(spec, num_speculative_blocks=speculative_blocks) if isinstance(spec, MambaSpec) else spec
-        for name, spec in make_specs(pool).items()
-    }
-    groups = get_glm5_next_kv_cache_groups(config, specs)
+    groups = get_glm5_next_kv_cache_groups(config, make_layer_configs(make_specs(pool), speculative_blocks))
     physical = get_glm5_next_kv_cache_config(config, groups, get_glm5_next_pool_bytes_per_block(groups))
     assert len({tensor.size for tensor in physical.kv_cache_tensors}) == 2
     expected = sum(tensor.size for tensor in physical.kv_cache_tensors)
@@ -60,8 +59,8 @@ def test_platform_builder_preserves_default_non_glm_accounting():
     pytest.importorskip("vllm.v1.core.kv_cache_planning")
     from vllm_ascend.core.kv_cache_config_builder import AscendKVCacheConfigBuilder
 
-    groups = [KVCacheGroupSpec(layer_names=["attn"], kv_cache_spec=make_specs()["model.layers.3.attn"])]
-    groups[0].kv_cache_spec = replace(groups[0].kv_cache_spec, model_version=None)
+    spec = replace(make_specs()["model.layers.3.attn"], model_version=None)
+    groups = [KVCacheGroup.from_layers({"attn": FullAttentionManager.layer_config(spec)})]
     assert AscendKVCacheConfigBuilder()._get_pool_bytes_per_block(make_config(), groups) is None
 
 
@@ -90,7 +89,7 @@ def make_config(*, retention_interval: int | None = 0):
 @pytest.mark.parametrize("retention_interval", [None, 0, 4096])
 def test_kv_cache_config_preserves_retention_interval(retention_interval):
     config = make_config(retention_interval=retention_interval)
-    groups = get_glm5_next_kv_cache_groups(config, make_specs())
+    groups = get_glm5_next_kv_cache_groups(config, make_layer_configs(make_specs()))
     layout = _get_glm5_next_cache_layout(groups)
     assert layout is not None
     budget = 10 * (layout.main_page_size + layout.small_page_size)
@@ -118,7 +117,6 @@ def make_specs(pool: int = 16):
         "model.layers.3.indexer.tail_cache": AscendIndexerKPoolTailSpec(
             block_size=pool,
             ring_capacity=pool,
-            sliding_window=pool,
             compress_ratio=pool,
             num_kv_heads=1,
             head_size=128,
@@ -136,17 +134,26 @@ def make_specs(pool: int = 16):
     return specs
 
 
-@pytest.fixture(autouse=True)
-def register_cache_specs():
-    # Match production: vLLM registers built-in specs before the Ascend hook.
-    register_all_kvcache_specs(None)
+def make_layer_configs(specs, speculative_blocks=0, mamba_cache_mode="none"):
+    configs = {}
+    for name, spec in specs.items():
+        if isinstance(spec, MambaSpec):
+            config = MambaManager.layer_config(
+                spec, mamba_cache_mode=mamba_cache_mode, num_speculative_blocks=speculative_blocks
+            )
+        elif isinstance(spec, AscendIndexerKPoolTailSpec):
+            config = KpoolTailManager.layer_config(spec)
+        else:
+            config = FullAttentionManager.layer_config(spec)
+        configs[name] = config
+    return configs
 
 
 @pytest.mark.parametrize("pool", [4, 16])
 def test_groups_share_block_ids_and_pack_two_page_classes(pool):
     config = make_config()
     specs = make_specs(pool)
-    groups = get_glm5_next_kv_cache_groups(config, dict(reversed(list(specs.items()))))
+    groups = get_glm5_next_kv_cache_groups(config, make_layer_configs(dict(reversed(list(specs.items())))))
     layout = _get_glm5_next_cache_layout(groups)
     assert layout is not None
     assert groups[0].layer_names == [
@@ -190,18 +197,14 @@ def test_groups_share_block_ids_and_pack_two_page_classes(pool):
     }
 
     # Scheduler groups consume disjoint IDs from the shared global BlockPool.
-    required_blocks = sum(
-        (group.kv_cache_spec.max_memory_usage_bytes(config) + group.kv_cache_spec.page_size_bytes - 1)
-        // group.kv_cache_spec.page_size_bytes
-        for group in groups
-    )
+    required_blocks = sum(group.max_allocated_blocks_per_request(config) for group in groups)
     assert get_glm5_next_pool_bytes_per_block(groups) == bytes_per_block
     assert get_glm5_next_max_memory_usage(config, groups) == required_blocks * bytes_per_block
 
 
 def test_standalone_mtp_layout_has_no_mamba_groups():
     specs = {name: spec for name, spec in make_specs().items() if not isinstance(spec, MambaSpec)}
-    groups = get_glm5_next_kv_cache_groups(make_config(), specs)
+    groups = get_glm5_next_kv_cache_groups(make_config(), make_layer_configs(specs))
     layout = _get_glm5_next_cache_layout(groups)
     assert len(groups) == 2
     assert layout is not None
@@ -223,7 +226,7 @@ def test_fp8_shared_pages_preserve_tail_rows_and_kernel_scale_alignment():
         model_version="glm5_next",
         tokens_per_state=4,
     )
-    groups = get_glm5_next_kv_cache_groups(make_config(), specs)
+    groups = get_glm5_next_kv_cache_groups(make_config(), make_layer_configs(specs))
     plan = get_glm5_next_kv_cache_config(make_config(), groups, 3 * get_glm5_next_pool_bytes_per_block(groups))
     descriptor = next(tensor for tensor in plan.kv_cache_tensors if indexer_name in get_kv_cache_tensor_layers(tensor))
     raw = torch.zeros(descriptor.size, dtype=torch.uint8)
@@ -265,7 +268,7 @@ def test_fp8_cache_budget_accounts_for_scales_tail_and_padding(block_size, looka
         specs["model.layers.3.indexer.tail_cache"] = replace(
             specs["model.layers.3.indexer.tail_cache"], ring_capacity=4 + lookahead
         )
-        groups = get_glm5_next_kv_cache_groups(config, specs)
+        groups = get_glm5_next_kv_cache_groups(config, make_layer_configs(specs))
         layout = _get_glm5_next_cache_layout(groups)
         assert layout is not None and layout.small_page_size == expected_page_bytes
         plan = get_glm5_next_kv_cache_config(config, groups, budget)
@@ -283,12 +286,13 @@ def test_fp8_cache_budget_accounts_for_scales_tail_and_padding(block_size, looka
 
 def test_pipeline_projection_supports_a_mamba_only_worker():
     config = make_config()
-    groups = get_glm5_next_kv_cache_groups(config, make_specs())
+    groups = get_glm5_next_kv_cache_groups(config, make_layer_configs(make_specs()))
     local_mamba_name = groups[2].layer_names[0]
     projected_groups = [
-        KVCacheGroupSpec(
-            [local_mamba_name] if group is groups[2] else [],
-            group.kv_cache_spec,
+        replace(
+            group,
+            kv_cache_specs={local_mamba_name: group.kv_cache_specs[local_mamba_name]} if group is groups[2] else {},
+            unprojected_specs=group.distinct_specs,
         )
         for group in groups
     ]
@@ -310,7 +314,7 @@ def test_missing_paired_cache_is_rejected():
     specs = make_specs()
     del specs["model.layers.3.indexer.tail_cache"]
     with pytest.raises(ValueError, match="requires"):
-        get_glm5_next_kv_cache_groups(make_config(), specs)
+        get_glm5_next_kv_cache_groups(make_config(), make_layer_configs(specs))
 
 
 def test_sliding_window_draft_caches_use_independent_physical_tensors():
@@ -320,15 +324,16 @@ def test_sliding_window_draft_caches_use_independent_physical_tensors():
     for layer_idx in range(10, 14):
         name = f"model.layers.{layer_idx}.self_attn.attn"
         draft_names.append(name)
-        specs[name] = SlidingWindowSpec(
+        specs[name] = AttentionSpec(
             block_size=16,
             num_kv_heads=1,
             head_size=8,
             dtype=torch.bfloat16,
-            sliding_window=16,
         )
 
-    groups = get_glm5_next_kv_cache_groups(config, specs)
+    configs = make_layer_configs(specs)
+    configs.update({name: SlidingWindowManager.layer_config(specs[name], sliding_window=16) for name in draft_names})
+    groups = get_glm5_next_kv_cache_groups(config, configs)
     layout = _get_glm5_next_cache_layout(groups)
     assert layout is not None
     assert layout.draft_groups
@@ -351,7 +356,7 @@ def test_misaligned_logical_block_is_rejected():
         15,
     )
     with pytest.raises(ValueError, match="divisible"):
-        get_glm5_next_kv_cache_groups(make_config(), specs)
+        get_glm5_next_kv_cache_groups(make_config(), make_layer_configs(specs))
 
 
 @pytest.mark.parametrize("use_sparse", [False, True])
@@ -376,7 +381,7 @@ def test_worker_preserves_glm5_next_physical_pool_budget(monkeypatch, use_sparse
             model_version="glm5_next",
             indexes_kv_by_block_stride=True,
         )
-    groups = get_glm5_next_kv_cache_groups(config, specs)
+    groups = get_glm5_next_kv_cache_groups(config, make_layer_configs(specs))
     # Supply exactly enough physical memory for the configured context. The
     # generic discount incorrectly makes this valid shared pool fail admission.
     required = get_glm5_next_max_memory_usage(config, groups)

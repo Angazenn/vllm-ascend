@@ -10,7 +10,10 @@ from vllm.model_executor.layers.attention_layer_base import AttentionLayerBase
 from vllm.model_executor.models.extract_hidden_states import CacheOnlyAttentionLayer
 from vllm.model_executor.models.utils import extract_layer_index
 from vllm.utils.torch_utils import get_dtype_size
-from vllm.v1.kv_cache_interface import FullAttentionSpec, KVCacheSpec
+from vllm.v1.kv_cache_interface import (
+    AttentionSpec,
+    KVCacheSpec,
+)
 
 from vllm_ascend.ascend_config import KVPPConfig
 from vllm_ascend.core.kv_cache_interface import AscendMLAAttentionSpec, AscendSFAIndexerCacheSpec
@@ -194,7 +197,7 @@ def create_kvpp_cache_allocation_plan(
     """Keep upstream's logical group while budgeting actual allocations."""
     logical_spec = dict(worker_spec)
     if (
-        any(not isinstance(spec, FullAttentionSpec) for spec in logical_spec.values())
+        any(not isinstance(spec, AttentionSpec) for spec in logical_spec.values())
         or len({spec.block_size for spec in logical_spec.values()}) > 1
     ):
         raise ValueError("KVPP requires one full-attention cache group with a common block size.")

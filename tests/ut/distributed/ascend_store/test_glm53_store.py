@@ -16,12 +16,11 @@ import numpy as np
 import torch
 from vllm.model_executor.layers.mamba.mamba_utils import MambaStateCopyFuncCalculator
 from vllm.v1.attention.backends.registry import MambaAttentionBackendEnum
-from vllm.v1.core.single_type_kv_cache_manager import register_all_kvcache_specs
-from vllm.v1.kv_cache_interface import MambaSpec, UniformTypeKVCacheSpecs
+from vllm.v1.kv_cache_interface import MambaSpec
 
 from tests.ut.distributed.ascend_store.test_mooncake_hybrid import MemoryRangeStore
 from tests.ut.distributed.ascend_store.test_pool_worker import make_worker, start_patch
-from tests.ut.models.test_glm5next_cache_config import make_config, make_specs
+from tests.ut.models.test_glm5next_cache_config import make_config, make_layer_configs, make_specs
 from vllm_ascend.core.kv_cache_interface import AscendIndexerKPoolTailSpec
 from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.ascend_store_connector import create_kv_pool_scheduler
 from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.attention_fence import attention_transfer_window
@@ -41,13 +40,12 @@ from vllm_ascend.utils import get_kv_cache_tensor_layers
 
 
 def make_glm53_plan(layer_offset=0, *, use_recoverssm=False):
-    register_all_kvcache_specs(None)
     specs = {}
     for name, spec in make_specs(pool=4).items():
         parts = name.split(".")
         parts[2] = str(int(parts[2]) + layer_offset)
         if isinstance(spec, MambaSpec):
-            spec = replace(spec, mamba_cache_mode="align", mamba_type=MambaAttentionBackendEnum.GDN_ATTN)
+            spec = replace(spec, mamba_type=MambaAttentionBackendEnum.GDN_ATTN)
             if use_recoverssm:
                 spec = replace(
                     spec,
@@ -56,7 +54,7 @@ def make_glm53_plan(layer_offset=0, *, use_recoverssm=False):
                 )
         specs[".".join(parts)] = spec
     config = make_config()
-    groups = get_glm5_next_kv_cache_groups(config, specs)
+    groups = get_glm5_next_kv_cache_groups(config, make_layer_configs(specs, mamba_cache_mode="align"))
     return get_glm5_next_kv_cache_config(config, groups, 24 * get_glm5_next_pool_bytes_per_block(groups))
 
 
@@ -72,13 +70,7 @@ def make_glm53_caches(plan):
             storage[name] = raw
     caches = {}
     for group in plan.kv_cache_groups:
-        specs = group.kv_cache_spec
-        specs = (
-            specs.kv_cache_specs
-            if isinstance(specs, UniformTypeKVCacheSpecs)
-            else dict.fromkeys(group.layer_names, specs)
-        )
-        for name, spec in specs.items():
+        for name, spec in group.kv_cache_specs.items():
             raw = storage[name]
             if isinstance(spec, MambaSpec):
                 views = []
@@ -292,16 +284,14 @@ class TestGLM53Store(unittest.TestCase):
         # One persistent state, two states with extra records, and two states
         # whose verification records live outside the KV cache.
         for group, backend, components in zip(plan.kv_cache_groups[2:], (short_conv, gdn, gdn), (1, 5, 2)):
-            spec = group.kv_cache_spec
+            (spec,) = group.distinct_specs
             spec = replace(
                 spec,
                 mamba_type=backend,
                 shapes=(*spec.shapes, (1, 6))[:components],
                 dtypes=(*spec.dtypes, torch.float32)[:components],
             )
-            group.kv_cache_spec = UniformTypeKVCacheSpecs(
-                block_size=spec.block_size, kv_cache_specs=dict.fromkeys(group.layer_names, spec)
-            )
+            group.kv_cache_specs = dict.fromkeys(group.layer_names, spec)
         caches = make_glm53_caches(plan)
         worker = make_worker(
             self, kv_cache_config=plan, use_mla=True, num_layers=4, use_recoverssm=True, mamba_copy_funcs=copy_funcs

@@ -276,6 +276,11 @@ class AscendMiniMaxM3IndexerCache(nn.Module, AttentionLayerBase):
             raise ValueError(f"Duplicate layer name: {prefix}")
         compilation_config.static_forward_context[prefix] = self
 
+    def get_kv_cache_config(self, vllm_config: VllmConfig):
+        from vllm.v1.core.single_type_kv_cache_manager import FullAttentionManager
+
+        return FullAttentionManager.layer_config(self.get_kv_cache_spec(vllm_config))
+
     def get_kv_cache_spec(self, vllm_config: VllmConfig) -> KVCacheSpec:
         return AscendSFAIndexerCacheSpec(
             block_size=vllm_config.cache_config.block_size,

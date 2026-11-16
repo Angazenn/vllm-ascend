@@ -105,7 +105,7 @@ def build_draft_kv_metadata(kv_cache_config: Any, kv_caches: Mapping[str, Any]) 
     """Use loader-owned names; never infer draft ownership from layer numbers."""
     names = tuple(getattr(kv_cache_config, "dspark_draft_layer_names", ()))
     groups = {
-        name: (group_id, group.kv_cache_spec.block_size)
+        name: (group_id, group.block_size)
         for group_id, group in enumerate(kv_cache_config.kv_cache_groups)
         for name in group.layer_names
     }

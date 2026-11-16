@@ -17,9 +17,9 @@ from vllm.logger import logger
 from vllm.utils.math_utils import cdiv
 from vllm.utils.network_utils import get_ip, make_zmq_path
 from vllm.v1.core.sched.output import SchedulerOutput
+from vllm.v1.core.single_type_kv_cache_manager import CircularBufferManager, MambaManager
 from vllm.v1.kv_cache_interface import (
     MambaSpec,
-    UniformTypeKVCacheSpecs,
 )
 from vllm.v1.outputs import KVConnectorOutput
 from zmq.constants import SocketOption, SocketType
@@ -29,7 +29,6 @@ from vllm_ascend.ascend_config import (
     get_ascend_config,
     init_ascend_config,
 )
-from vllm_ascend.core.kv_cache_interface import is_circular_kv_cache_spec
 from vllm_ascend.distributed.kv_transfer.kv_p2p.mooncake.metadata import (
     MooncakePCPTransferMetadata,
     MooncakePPTransferMetadata,
@@ -412,8 +411,7 @@ class MooncakeBaseConnectorScheduler:
         )
 
         self.kv_cache_groups = kv_cache_config.kv_cache_groups
-        self.group_block_size = [group.kv_cache_spec.block_size for group in self.kv_cache_groups]
-        self.group_unique_specs = [self._get_group_unique_specs(group) for group in self.kv_cache_groups]
+        self.group_block_size = [group.block_size for group in self.kv_cache_groups]
         self.need_truncate = self._needs_prefill_token_truncation()
         self._logged_mamba_allocation = False
 
@@ -422,8 +420,11 @@ class MooncakeBaseConnectorScheduler:
     def _log_mamba_request_allocation(self, request_id: str, blocks: "KVCacheBlocks") -> None:
         if self._logged_mamba_allocation:
             return
-        for group_id, group_specs in enumerate(self.group_unique_specs):
-            for spec in group_specs:
+        for group_id, group in enumerate(self.kv_cache_groups):
+            params = group.manager_config.params
+            if not isinstance(params, MambaManager.Params):
+                continue
+            for spec in group.distinct_specs:
                 if not isinstance(spec, MambaSpec):
                     continue
                 block_ids = [block.block_id for block in blocks.blocks[group_id] if not block.is_null]
@@ -434,7 +435,7 @@ class MooncakeBaseConnectorScheduler:
                     self.engine_id,
                     request_id,
                     group_id,
-                    spec.num_speculative_blocks,
+                    params.num_speculative_blocks,
                     len(block_ids),
                     block_ids,
                     spec.page_size_bytes,
@@ -449,22 +450,8 @@ class MooncakeBaseConnectorScheduler:
         hf_config = getattr(self.vllm_config.model_config, "hf_config", None)
         compress_ratios = getattr(hf_config, "compress_ratios", None)
         uses_compressed_cache = isinstance(compress_ratios, (list, tuple, dict))
-        has_state_group = any(
-            isinstance(spec, MambaSpec) for group_specs in self.group_unique_specs for spec in group_specs
-        )
+        has_state_group = any(issubclass(group.manager_cls, MambaManager) for group in self.kv_cache_groups)
         return uses_compressed_cache or has_state_group
-
-    @staticmethod
-    def _get_group_unique_specs(group: Any) -> list[Any]:
-        if not isinstance(group.kv_cache_spec, UniformTypeKVCacheSpecs):
-            return [group.kv_cache_spec]
-
-        specs = []
-        for layer_name in group.layer_names:
-            layer_spec = group.kv_cache_spec.kv_cache_specs[layer_name]
-            if layer_spec not in specs:
-                specs.append(layer_spec)
-        return specs
 
     def _get_transfer_block_ids(self, block_ids: BlockIds, prompt_len: int) -> BlockIds:
         """Return prompt blocks while retaining evicted-block padding.
@@ -476,27 +463,24 @@ class MooncakeBaseConnectorScheduler:
         if not block_ids:
             return block_ids
 
-        assert len(block_ids) == len(self.group_unique_specs), "Number of KV cache groups must match"
+        assert len(block_ids) == len(self.kv_cache_groups), "Number of KV cache groups must match"
 
         transfer_block_ids: list[list[int]] = []
-        for blocks, block_size, group_specs in zip(
-            block_ids,
-            self.group_block_size,
-            self.group_unique_specs,
-        ):
-            if all(is_circular_kv_cache_spec(spec) for spec in group_specs):
+        for blocks, group in zip(block_ids, self.kv_cache_groups, strict=True):
+            block_size = group.block_size
+            if issubclass(group.manager_cls, CircularBufferManager):
                 # Circular caches own one request-lifetime ring block. It is
                 # state, not a prompt-aligned attention-block sequence.
                 transfer_block_ids.append(blocks)
-            elif any(isinstance(spec, MambaSpec) for spec in group_specs):
+            elif issubclass(group.manager_cls, MambaManager):
                 # RecoverSSM stores its whole verify window in one state page,
                 # so draft tokens do not imply extra checkpoint blocks.
-                num_speculative_blocks = max(
-                    spec.num_speculative_blocks for spec in group_specs if isinstance(spec, MambaSpec)
-                )
+                params = group.manager_config.params
+                assert isinstance(params, MambaManager.Params)
+                num_speculative_blocks = params.num_speculative_blocks
                 transfer_block_ids.append(blocks[:-num_speculative_blocks] if num_speculative_blocks else blocks)
             else:
-                cp_size = max(1, self.dcp_size) if any(spec.dcp_sharded for spec in group_specs) else 1
+                cp_size = max(1, self.dcp_size) if group.dcp_sharded else 1
                 num_prompt_blocks = cdiv(prompt_len, block_size * cp_size)
                 transfer_block_ids.append(blocks[:num_prompt_blocks])
         return tuple(transfer_block_ids)

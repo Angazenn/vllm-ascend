@@ -4,7 +4,7 @@ from unittest.mock import MagicMock, patch
 import pytest
 import torch
 from vllm.config.compilation import CUDAGraphMode
-from vllm.v1.kv_cache_interface import FullAttentionSpec
+from vllm.v1.kv_cache_interface import AttentionSpec
 
 import vllm_ascend.attention.attention_v1 as attn_module
 from tests.ut.base import TestBase
@@ -39,7 +39,7 @@ class TestAttentionGraphHelpers(TestBase):
     @patch("vllm_ascend.attention.utils.using_paged_attention", return_value=True)
     def test_pa_contiguous_cache_requirement_is_limited_to_normal_impl(self, mock_using_pa):
         config = SimpleNamespace(model_config=SimpleNamespace(runner_type="generate"))
-        spec = FullAttentionSpec(block_size=8, num_kv_heads=2, head_size=128, dtype=torch.float16)
+        spec = AttentionSpec(block_size=8, num_kv_heads=2, head_size=128, dtype=torch.float16)
         for impl_cls in (AscendAttentionBackendImpl, AscendC8AttentionBackendImpl, AscendAttentionDCPImpl):
             with self.subTest(impl=impl_cls):
                 impl = impl_cls.__new__(impl_cls)
@@ -56,7 +56,7 @@ class TestAttentionGraphHelpers(TestBase):
         config.model_config.runner_type = "pooling"
         self.assertFalse(requires_contiguous_pa_kv_cache(SimpleNamespace(impl=impl), config, spec))
         config.model_config.runner_type = "generate"
-        padded_spec = FullAttentionSpec(
+        padded_spec = AttentionSpec(
             block_size=8,
             num_kv_heads=2,
             head_size=128,

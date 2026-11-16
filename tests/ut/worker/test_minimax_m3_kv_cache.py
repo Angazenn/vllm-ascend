@@ -5,7 +5,8 @@ from types import SimpleNamespace
 
 import pytest
 import torch
-from vllm.v1.kv_cache_interface import KVCacheConfig, KVCacheGroupSpec
+from vllm.v1.core.single_type_kv_cache_manager import FullAttentionManager
+from vllm.v1.kv_cache_interface import KVCacheConfig, KVCacheGroup
 
 from vllm_ascend.core.kv_cache_interface import AscendSFAIndexerCacheSpec
 from vllm_ascend.models.minimax_m3.msa_m3 import AscendMiniMaxM3IndexerBackend
@@ -29,7 +30,7 @@ def test_indexer_views_split_scheduler_blocks_into_kernel_pages(
     config = KVCacheConfig(
         num_blocks=2,
         kv_cache_tensors=[],
-        kv_cache_groups=[KVCacheGroupSpec(layer_names=[name], kv_cache_spec=spec)],
+        kv_cache_groups=[KVCacheGroup.from_layers(dict.fromkeys([name], FullAttentionManager.layer_config(spec)))],
     )
     group = SimpleNamespace(
         kv_cache_spec=spec, kv_cache_group_id=0, layer_names=[name], backend=AscendMiniMaxM3IndexerBackend

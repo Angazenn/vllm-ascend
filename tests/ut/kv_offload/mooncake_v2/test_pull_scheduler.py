@@ -12,6 +12,8 @@ import torch
 import zmq
 from cachetools import TTLCache
 from vllm.sampling_params import SamplingParams
+from vllm.v1.core.single_type_kv_cache_manager import CircularBufferManager, FullAttentionManager, MambaManager
+from vllm.v1.kv_cache_interface import KVCacheGroup
 from vllm.v1.request import Request, RequestStatus
 
 from vllm_ascend.distributed.kv_transfer.kv_p2p.mooncake import heartbeat as heartbeat_module
@@ -78,7 +80,9 @@ def make_pull_scheduler() -> MooncakePullConnectorScheduler:
     scheduler.dcp_size = 1
     scheduler.ascend_config = SimpleNamespace(kvpp_config=SimpleNamespace(size=1))
     scheduler.group_block_size = [16]
-    scheduler.group_unique_specs = [[make_full_spec()]]
+    scheduler.kv_cache_groups = [
+        KVCacheGroup.from_layers({"full": FullAttentionManager.layer_config(make_full_spec())})
+    ]
     scheduler.engine_id = "engine-p"
     scheduler.side_channel_host = "10.0.0.10"
     scheduler.side_channel_port = 6000
@@ -429,7 +433,10 @@ def test_base_scheduler_clips_attention_and_keeps_mamba_state_blocks() -> None:
     scheduler.dcp_size = 1
     scheduler.num_speculative_tokens = 2
     scheduler.group_block_size = [16, 16]
-    scheduler.group_unique_specs = [[make_full_spec()], [replace(make_mamba_spec(), num_speculative_blocks=2)]]
+    scheduler.kv_cache_groups = [
+        KVCacheGroup.from_layers({"full": FullAttentionManager.layer_config(make_full_spec())}),
+        KVCacheGroup.from_layers({"state": MambaManager.layer_config(make_mamba_spec(), num_speculative_blocks=2)}),
+    ]
 
     result = scheduler._get_transfer_block_ids(
         ([10, 11, 12, 13], [20, 21, 22, 23]),
@@ -714,17 +721,21 @@ class _StopLoop(BaseException):
 def test_base_scheduler_detects_state_and_compressed_prefill_truncation() -> None:
     scheduler = MooncakeBaseConnectorScheduler.__new__(MooncakeBaseConnectorScheduler)
     scheduler.vllm_config = SimpleNamespace(model_config=SimpleNamespace(hf_config=SimpleNamespace()))
-    scheduler.group_unique_specs = [[make_full_spec()]]
+    scheduler.kv_cache_groups = [
+        KVCacheGroup.from_layers({"full": FullAttentionManager.layer_config(make_full_spec())})
+    ]
     assert scheduler._needs_prefill_token_truncation() is False
 
     scheduler.vllm_config.model_config.hf_config.compress_ratios = [2]
     assert scheduler._needs_prefill_token_truncation() is True
 
     scheduler.vllm_config.model_config.hf_config.compress_ratios = None
-    scheduler.group_unique_specs = [[make_full_spec()], [make_mamba_spec()]]
+    scheduler.kv_cache_groups.append(KVCacheGroup.from_layers({"state": MambaManager.layer_config(make_mamba_spec())}))
     assert scheduler._needs_prefill_token_truncation() is True
 
-    scheduler.group_unique_specs = [[make_full_spec()], [make_circular_spec()]]
+    scheduler.kv_cache_groups[1] = KVCacheGroup.from_layers(
+        {"ring": CircularBufferManager.layer_config(make_circular_spec())}
+    )
     assert scheduler._needs_prefill_token_truncation() is False
 
 

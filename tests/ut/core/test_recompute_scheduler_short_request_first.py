@@ -21,10 +21,11 @@ import torch
 from vllm.config import CacheConfig, ModelConfig, SchedulerConfig, VllmConfig
 from vllm.utils.hashing import sha256
 from vllm.v1.core.kv_cache_utils import init_none_hash
+from vllm.v1.core.single_type_kv_cache_manager import FullAttentionManager
 from vllm.v1.kv_cache_interface import (
-    FullAttentionSpec,
+    AttentionSpec,
     KVCacheConfig,
-    KVCacheGroupSpec,
+    KVCacheGroup,
 )
 from vllm.v1.structured_output import StructuredOutputManager
 
@@ -102,14 +103,18 @@ class TestRecomputeSchedulerWithoutShortRequestFirst(TestBase):
             num_blocks=10000,
             kv_cache_tensors=[],
             kv_cache_groups=[
-                KVCacheGroupSpec(
-                    ["layer"],
-                    FullAttentionSpec(
-                        block_size=BLOCK_SIZE,
-                        num_kv_heads=1,
-                        head_size=1,
-                        dtype=torch.float32,
-                    ),
+                KVCacheGroup.from_layers(
+                    dict.fromkeys(
+                        ["layer"],
+                        FullAttentionManager.layer_config(
+                            AttentionSpec(
+                                block_size=BLOCK_SIZE,
+                                num_kv_heads=1,
+                                head_size=1,
+                                dtype=torch.float32,
+                            )
+                        ),
+                    )
                 )
             ],
         )

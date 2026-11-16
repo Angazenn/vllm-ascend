@@ -13,12 +13,19 @@ from numpy.typing import NDArray
 import tests.ut.distributed.ascend_store._mock_deps  # noqa: F401
 
 # isort: split
+from dataclasses import replace
+
+import torch
+from vllm.v1.core.single_type_kv_cache_manager import (
+    CircularBufferManager,
+    FullAttentionManager,
+    MambaManager,
+    SlidingWindowManager,
+)
 from vllm.v1.kv_cache_interface import (
-    FullAttentionSpec,
-    KVCacheGroupSpec,
+    AttentionSpec,
+    KVCacheGroup,
     MambaSpec,
-    SlidingWindowSpec,
-    UniformTypeKVCacheSpecs,
 )
 
 from tests.ut.distributed.ascend_store import test_pool_scheduler as scheduler_tests
@@ -129,40 +136,44 @@ class TestMooncakeHybrid(unittest.TestCase):
         pcp_rank=0,
     ):
         groups = [
-            KVCacheGroupSpec(
-                ["model.layers.0.kv", "model.layers.2.kv"],
-                FullAttentionSpec(block_size=16, num_kv_heads=1, head_size=1, dtype="uint8"),
+            KVCacheGroup.from_layers(
+                dict.fromkeys(
+                    ["model.layers.0.kv", "model.layers.2.kv"],
+                    FullAttentionManager.layer_config(
+                        AttentionSpec(block_size=16, num_kv_heads=1, head_size=1, dtype=torch.uint8)
+                    ),
+                )
             ),
-            KVCacheGroupSpec(
-                ["model.layers.1.c4", "model.layers.2.c4", "model.layers.3.c4"],
-                FullAttentionSpec(block_size=32, num_kv_heads=1, head_size=1, dtype="uint8"),
+            KVCacheGroup.from_layers(
+                dict.fromkeys(
+                    ["model.layers.1.c4", "model.layers.2.c4", "model.layers.3.c4"],
+                    FullAttentionManager.layer_config(
+                        AttentionSpec(block_size=32, num_kv_heads=1, head_size=1, dtype=torch.uint8)
+                    ),
+                )
             ),
-            KVCacheGroupSpec(
-                ["model.layers.0.state", "model.layers.3.state"],
-                SlidingWindowSpec(block_size=16, sliding_window=16, num_kv_heads=1, head_size=1, dtype="uint8"),
+            KVCacheGroup.from_layers(
+                dict.fromkeys(
+                    ["model.layers.0.state", "model.layers.3.state"],
+                    SlidingWindowManager.layer_config(
+                        AttentionSpec(block_size=16, num_kv_heads=1, head_size=1, dtype=torch.uint8), sliding_window=16
+                    ),
+                )
             ),
         ]
         if extra_entry:
-            groups[1].layer_names.append("model.layers.2.c4_indexer")
+            groups[1].kv_cache_specs["model.layers.2.c4_indexer"] = groups[1].distinct_specs[0]
         if private_tail:
-            groups[2].kv_cache_spec = MambaSpec(
-                block_size=16,
-                shapes=((4,), (4,)),
-                dtypes=("uint8", "uint8"),
-                mamba_cache_mode="align",
-                num_speculative_blocks=3,
+            state = MambaSpec(block_size=16, shapes=((4,), (4,)), dtypes=(torch.uint8, torch.uint8))
+            groups[2] = KVCacheGroup.from_layers(
+                dict.fromkeys(
+                    groups[2].layer_names,
+                    MambaManager.layer_config(state, mamba_cache_mode="align", num_speculative_blocks=3),
+                )
             )
-
-            # A private ring's capacity is unrelated to token/hash pages.
-            # Wrap it like the per-layer specs supplied to real workers.
-            class PrivateTailSpec(FullAttentionSpec):
-                @property
-                def prefix_cacheable(self):
-                    return False
-
             name = "model.layers.2.indexer.tail_cache"
-            tail = PrivateTailSpec(block_size=7, num_kv_heads=1, head_size=1, dtype="uint8")
-            groups.append(KVCacheGroupSpec([name], UniformTypeKVCacheSpecs.from_specs({name: tail})))
+            tail = AttentionSpec(block_size=7, num_kv_heads=1, head_size=1, dtype=torch.uint8)
+            groups.append(KVCacheGroup.from_layers({name: CircularBufferManager.layer_config(tail)}))
         config = SimpleNamespace(num_blocks=8, kv_cache_groups=groups)
         with patch(
             "vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.pool_worker.BaseKVPoolWorker._build_cache_coordinator",
@@ -398,39 +409,28 @@ class TestMooncakeHybrid(unittest.TestCase):
     def test_layout_fingerprint_covers_group_membership_and_page_size(self):
         config = SimpleNamespace(
             kv_cache_groups=[
-                KVCacheGroupSpec(
-                    ["model.layers.0.kv"],
-                    FullAttentionSpec(block_size=16, num_kv_heads=1, head_size=1, dtype="uint8"),
+                KVCacheGroup.from_layers(
+                    dict.fromkeys(
+                        ["model.layers.0.kv"],
+                        FullAttentionManager.layer_config(
+                            AttentionSpec(block_size=16, num_kv_heads=1, head_size=1, dtype=torch.uint8)
+                        ),
+                    )
                 ),
             ]
         )
         original = hybrid_layout_id(config)
         self.assertEqual(original, hybrid_layout_id(config))
-        config.kv_cache_groups[0].layer_names.append("model.layers.1.kv")
+        group = config.kv_cache_groups[0]
+        (spec,) = group.distinct_specs
+        group.kv_cache_specs["model.layers.1.kv"] = spec
         self.assertNotEqual(original, hybrid_layout_id(config))
-        config.kv_cache_groups[0].layer_names.pop()
-        config.kv_cache_groups[0].kv_cache_spec = FullAttentionSpec(
-            block_size=16, num_kv_heads=1, head_size=1, dtype="float16"
-        )
+        del group.kv_cache_specs["model.layers.1.kv"]
+        group.kv_cache_specs["model.layers.0.kv"] = replace(spec, dtype=torch.float16)
         self.assertEqual(original, hybrid_layout_id(config))
-        config.kv_cache_groups[0].kv_cache_spec = FullAttentionSpec(
-            block_size=32, num_kv_heads=1, head_size=1, dtype="float16"
-        )
+        group.block_size = 32
+        group.kv_cache_specs["model.layers.0.kv"] = replace(spec, block_size=32)
         self.assertNotEqual(original, hybrid_layout_id(config))
-
-    def test_layout_fingerprint_normalizes_uniform_wrapper(self):
-        spec = FullAttentionSpec(block_size=16, num_kv_heads=1, head_size=1, dtype="uint8")
-        layer_names = ["model.layers.0.kv", "model.layers.1.kv"]
-        scheduler_config = SimpleNamespace(kv_cache_groups=[KVCacheGroupSpec(layer_names, spec)])
-        worker_config = SimpleNamespace(
-            kv_cache_groups=[
-                KVCacheGroupSpec(
-                    layer_names,
-                    UniformTypeKVCacheSpecs.from_specs({name: spec for name in layer_names}),
-                )
-            ]
-        )
-        self.assertEqual(hybrid_layout_id(scheduler_config), hybrid_layout_id(worker_config))
 
     def test_attention_window_drains_before_communication_and_on_exception(self):
         for fail in (False, True):
@@ -638,19 +638,22 @@ class TestMooncakeHybrid(unittest.TestCase):
     def test_shared_coordinator_requires_reachable_state_in_all_groups(self):
         group_config = SimpleNamespace(
             kv_cache_groups=[
-                KVCacheGroupSpec(
-                    ["model.layers.0.kv"],
-                    FullAttentionSpec(block_size=16, num_kv_heads=1, head_size=1, dtype="uint8"),
+                KVCacheGroup.from_layers(
+                    dict.fromkeys(
+                        ["model.layers.0.kv"],
+                        FullAttentionManager.layer_config(
+                            AttentionSpec(block_size=16, num_kv_heads=1, head_size=1, dtype=torch.uint8)
+                        ),
+                    )
                 ),
-                KVCacheGroupSpec(
-                    ["model.layers.1.state"],
-                    SlidingWindowSpec(
-                        block_size=16,
-                        sliding_window=16,
-                        num_kv_heads=1,
-                        head_size=1,
-                        dtype="uint8",
-                    ),
+                KVCacheGroup.from_layers(
+                    dict.fromkeys(
+                        ["model.layers.1.state"],
+                        SlidingWindowManager.layer_config(
+                            AttentionSpec(block_size=16, num_kv_heads=1, head_size=1, dtype=torch.uint8),
+                            sliding_window=16,
+                        ),
+                    )
                 ),
             ]
         )

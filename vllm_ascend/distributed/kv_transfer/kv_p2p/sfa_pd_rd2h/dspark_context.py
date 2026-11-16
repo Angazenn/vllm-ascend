@@ -76,16 +76,14 @@ def get_pd_dspark_aux_layer_ids(vllm_config: VllmConfig) -> tuple[int, ...]:
 
 
 def resident_mla_context_group_ids(groups: Sequence[Any]) -> tuple[int, ...]:
-    """Resolve residency before scheduler conversion drops per-layer specs.
+    """Resolve residency from the whole group, including pipeline projections.
 
     A uniform scheduler block group may contain host target and resident draft
     tensors. Sharing block IDs does not mean sharing physical KV storage.
     """
     result = []
     for group_id, group in enumerate(groups):
-        spec = group.kv_cache_spec
-        layer_specs = getattr(spec, "kv_cache_specs", None)
-        specs = layer_specs.values() if layer_specs is not None else (spec,)
+        specs = group.distinct_specs
         if any(isinstance(item, AscendMLAAttentionSpec) and not item.store_on_host for item in specs):
             result.append(group_id)
     return tuple(result)

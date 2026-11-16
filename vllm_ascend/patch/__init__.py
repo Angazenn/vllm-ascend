@@ -233,123 +233,6 @@
 #       Remove this patch and its platform import once all supported vLLM
 #       release tags and verified main pins include the upstream fix.
 #
-# ** 9. File: platform/patch_kv_cache_coordinator.py**
-# ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-#   1. `vllm.v1.core.kv_cache_coordinator.HybridKVCacheCoordinator.find_longest_cache_hit_per_group`
-#    Why:
-#       In PD disaggregation with hybrid Mamba models, the D side receives
-#       FullAttention KV blocks from the P side but has no local prefix-cache
-#       hit for Mamba groups. Upstream's min-reduction across all KV groups
-#       collapses the FullAttention hit length to 0, preventing partial
-#       FullAttention-only prefix cache reuse on the D side.
-#    How:
-#       Override the per-group lookup so the FullAttention hit length is
-#       reported directly; `num_new_local_computed_tokens` then carries the
-#       FA hit length. This value is passed to the connector's
-#       get_num_new_matched_tokens which computes:
-#       external = total - local_computed.
-#       Using the FA hit skips re-transferring FA blocks
-#       already cached on D-side. The override also injects the producer drop
-#       exemption of entry 2 into the per-group lookup.
-#    Related PR (if no, explain why):
-#       https://github.com/vllm-project/vllm/pull/42524
-#       https://github.com/vllm-project/vllm/pull/44243
-#    Future Plan:
-#       vLLM #44243 has landed in the supported upstream version, so this
-#       override is kept only for the drop exemption of entry 2; remove it
-#       together with entry 2 once upstream exposes the PD role.
-#   2. `get_kv_cache_config_from_groups` (in `vllm.v1.core.kv_cache_planning`
-#      on both supported versions, vLLM #61183),
-#      `HybridKVCacheCoordinator.find_longest_cache_hit` and
-#      `...find_longest_cache_hit_per_group`
-#    Why:
-#       On a pure PD prefill producer (`kv_transfer_config.is_kv_producer`
-#       and not `is_kv_consumer`), every content-hash match is a verified
-#       prompt block, so the EAGLE last-block drop is never needed. With
-#       hybrid Mamba align pages (1536 tokens) the drop erases the whole
-#       shared prefix of typical ~2K prompts, pinning producer prefix hits
-#       to 0 (the MTP prefix-cache "kill band").
-#    How:
-#       Attach the live `kv_transfer_config` onto KVCacheConfig while it is
-#       built (the coordinator factory never receives VllmConfig; the
-#       attribute survives the scheduler-side deepcopy and is dropped by
-#       worker pickle IPC), read the PD role back in the coordinator, and
-#       skip the EAGLE drop in both lookup entry points on a pure producer.
-#       The EAGLE-group fallback marks FullAttention groups only.
-#    Related PR (if no, explain why):
-#       No upstream PR; producer-side drop exemption for hybrid PD.
-#    Future Plan:
-#       Remove once upstream exposes the PD role to the coordinator or
-#       removes the EAGLE last-block drop for verified prompt blocks.
-#
-# ** 10. File: platform/patch_kv_cache_utils.py**
-# ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-#   1. `vllm.v1.core.kv_cache_planning.get_kv_cache_config_from_groups`,
-#      `..._max_memory_usage_bytes_from_groups`, `..._pool_bytes_per_block`
-#    Why:
-#       Ascend cache layouts need platform-specific materialization and memory
-#       accounting.
-#    How:
-#       Both supported versions select AscendKVCacheConfigBuilder through
-#       NPUPlatform. Its default materialization delegates to the patched
-#       planning functions.
-#    Related PR:
-#       https://github.com/vllm-project/vllm/pull/53558
-#   2. `vllm.v1.core.kv_cache_planning.get_kv_cache_config_from_groups`
-#      `vllm.v1.core.kv_cache_planning._pool_bytes_per_block`
-#    Why:
-#       Ascend dense GQA attention requires contiguous K/V pools. Replicated
-#       draft pages cannot alias block-strided target/Mamba pages with different
-#       scheduler block IDs in hybrid DCP models.
-#    How:
-#       Use dcp_sharded to identify replicated dense attention groups, then
-#       delegate each physical pool's descriptors to the upstream planner.
-#       Sum the pools' bytes per block to keep allocation within the budget.
-#    Related PR:
-#       https://github.com/vllm-project/vllm/pull/56723 supplies dcp_sharded;
-#       the remaining physical-layout restriction is specific to Ascend.
-#    Future Plan:
-#       Remove pool separation when Ascend dense attention supports the
-#       upstream block-strided shared-pool layout.
-#
-# ** 11. File: platform/patch_mamba_block_aligned_split.py**
-# ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-#   1. `vllm.v1.core.sched.scheduler.Scheduler._mamba_block_aligned_split`
-#    Why:
-#       On a PD decode consumer, a request with one prompt token remaining can
-#       be padded to a `1 + K` speculative verifier window before Mamba
-#       alignment runs. Splitting that window at the next block boundary makes
-#       its physical width smaller than the advertised speculative placeholder
-#       count.
-#    How:
-#       Return the complete requested width on KV consumers. Delegate producers
-#       and non-PD deployments to the original upstream method unchanged.
-#    Related issue:
-#       https://github.com/vllm-project/vllm/issues/54392
-#    Future Plan:
-#       Remove this compatibility patch once upstream preserves speculative
-#       window atomicity for PD-admitted requests.
-#   2. `vllm.v1.core.sched.scheduler.Scheduler._mamba_block_aligned_split`
-#    Why:
-#       Scheduler-side companion of fix 8.2: upstream backs the last cacheable
-#       mamba-align page off by one block while the EAGLE block drop is
-#       active, so the producer never ends a prefill chunk at the final full
-#       page boundary. Mamba "align" state materializes only across a chunk
-#       boundary (copy-on-write in MambaManager.allocate_new_blocks), so the
-#       final full state page stays unhashed and hybrid hits reconcile one
-#       page short (1600-token prompts -> 0 hit, 3200-token -> 1536).
-#    How:
-#       Delegate to the original method, but on a pure PD producer suppress
-#       the drop bit for the duration of that call and restore it afterwards.
-#       The gate is `_skips_eagle_block_drop(self.vllm_config.kv_transfer_config)`
-#       and is evaluated at call time, so consumers, kv_both and standalone
-#       instances pass through unchanged.
-#    Related PR (if no, explain why):
-#       No upstream PR; producer-side scheduler companion of fix 8.2.
-#    Future Plan:
-#       Remove together with fix 8.2 once upstream splits mamba-align pages
-#       without the EAGLE backoff on PD producers.
-#
 # ** 10a. File: platform/patch_mamba_config.py**
 # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 #   1. `vllm.model_executor.models.config.HybridAttentionMambaModelConfig.verify_and_update_config`
@@ -378,26 +261,6 @@
 #       No, 310P-specific kernel alignment requirement.
 #    Future Plan:
 #       Remove this patch once upstream supports 310P-aligned mamba block sizing.
-#
-# ** 13. File: platform/patch_mamba_manager.py**
-# ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-#   1. `vllm.v1.core.single_type_kv_cache_manager.MambaManager`
-#    Why:
-#       1. Upstream hybrid prefix cache lookup does not support DCP.
-#       2. Upstream MambaManager#get_num_blocks_to_allocate give the
-#          wrong number of blocks when an external cache hit occurred
-#    How:
-#       1. Replace MambaManager with AscendMambaManager for prefix cache hit lookup
-#          on hybrid Mamba paths (logical mamba block_size when caching is enabled).
-#       2. Override the get_num_blocks_to_allocate method to fix the number of blocks
-#          when hitting the external cache and loading synchronously
-#    Related PR (if no, explain why):
-#       1. https://github.com/vllm-project/vllm/pull/40996
-#       2. https://github.com/vllm-project/vllm/pull/46892
-#    Future Plan:
-#       1. Remove this patch once the supported upstream revision includes
-#          hybrid prefix cache lookup for DCP.
-#       2. Remove this patch once upstream accept 46892 pr or fixed the bug by other pr.
 #
 # ** 14. File: platform/patch_minimax_m2_config.py**
 # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -737,36 +600,6 @@
 #    Future Plan:
 #       Remove once xgrammar >= 0.2.9 (which fixes separators handling) is
 #       pinned.
-#
-# ** 20. File: platform/patch_swa_bounded_replay.py (V1 resume)**
-# ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-#   1. `vllm.v1.core.sched.output.CachedRequestData` (new field `replay_start`)
-#   2. `vllm.v1.core.sched.scheduler.Scheduler._make_cached_request_data`
-#    Why:
-#       Sliding-window bounded replay (vLLM #56227) rebuilds the sliding-window KV
-#       of a prefix hit by recomputing the hit's last window, and tells the
-#       worker where that run begins through `NewRequestData.replay_start`.
-#       Upstream's V2 model runner folds resumed requests into that same
-#       new-request list, so one field covers them. The V1 runner resumes a
-#       preempted request through `CachedRequestData` instead, and a resumed
-#       request is exactly the one that can be rewound a second time --
-#       preemption clears the computed count, so readmission runs the prefix
-#       lookup again and re-sets the replay start. Without the field on that
-#       payload, the worker would not know to stop writing the replayed
-#       positions and would overwrite blocks still shared with every other
-#       request that hit the same prefix.
-#    How:
-#       Declare `replay_start` on the payload -- msgpack encodes only declared
-#       fields, so an attribute set after construction never crosses the process
-#       boundary -- and fill it from the resumed requests inside the single
-#       method upstream builds that payload in. The field list is redeclared at
-#       import time because msgspec caches it per type. Inert on a pin that
-#       predates the feature, which is probed rather than version-compared.
-#    Related PR (if no, explain why):
-#       https://github.com/vllm-project/vllm/pull/56227
-#    Future Plan:
-#       Remove this patch once upstream carries the replay start on the V1
-#       resume path as well, i.e. once `CachedRequestData` declares the field.
 #
 # ** 21. File: platform/patch_torch_accelerator.py**
 # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~

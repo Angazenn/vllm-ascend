@@ -9,10 +9,11 @@ from vllm.config import VllmConfig
 from vllm.model_executor.models import ModelRegistry
 from vllm.v1.core.sched.async_scheduler import AsyncScheduler
 from vllm.v1.core.sched.scheduler import Scheduler
+from vllm.v1.core.single_type_kv_cache_manager import FullAttentionManager
 from vllm.v1.kv_cache_interface import (
-    FullAttentionSpec,
+    AttentionSpec,
     KVCacheConfig,
-    KVCacheGroupSpec,
+    KVCacheGroup,
 )
 from vllm.v1.request import RequestStatus, StreamingUpdate
 from vllm.v1.structured_output import StructuredOutputManager
@@ -90,14 +91,18 @@ def create_dyntra_lb_scheduler(
         num_blocks=num_blocks,
         kv_cache_tensors=[],
         kv_cache_groups=[
-            KVCacheGroupSpec(
-                ["layer"],
-                FullAttentionSpec(
-                    block_size=block_size,
-                    num_kv_heads=1,
-                    head_size=1,
-                    dtype=torch.float16,
-                ),
+            KVCacheGroup.from_layers(
+                dict.fromkeys(
+                    ["layer"],
+                    FullAttentionManager.layer_config(
+                        AttentionSpec(
+                            block_size=block_size,
+                            num_kv_heads=1,
+                            head_size=1,
+                            dtype=torch.float16,
+                        )
+                    ),
+                )
             )
         ],
     )

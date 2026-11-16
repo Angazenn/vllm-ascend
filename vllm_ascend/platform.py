@@ -203,12 +203,6 @@ class NPUPlatform(Platform):
         torch.npu.set_device(device)
 
     @classmethod
-    def register_custom_kv_cache_specs(cls, vllm_config: VllmConfig) -> None:
-        from vllm_ascend.core.kv_cache_interface import register_ascend_kv_cache_specs
-
-        register_ascend_kv_cache_specs()
-
-    @classmethod
     def get_pass_manager_cls(cls) -> str:
         """
         Get the pass manager class for this platform.

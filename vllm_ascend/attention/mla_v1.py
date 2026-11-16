@@ -1366,7 +1366,7 @@ class AscendMLAImpl(MLAAttentionImpl):
         attn_module = config.compilation_config.static_forward_context.get(self.layer_name)
         if not isinstance(attn_module, MLAAttention):
             return
-        cache_spec = attn_module.get_kv_cache_spec(config)
+        cache_spec = attn_module.get_kv_cache_config(config).spec
         if supports_strided_mla_cache(config, attn_module, cache_spec):
             self._prepare_prolog_v3_weights()
 

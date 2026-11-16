@@ -25,9 +25,9 @@ from vllm.distributed.kv_transfer.kv_connector.v1.base import KVConnectorRole
 from vllm.logger import logger
 from vllm.utils.network_utils import get_ip, make_zmq_path, make_zmq_socket
 from vllm.v1.core import kv_cache_utils
-from vllm.v1.kv_cache_interface import KVCacheConfig, MambaSpec
+from vllm.v1.kv_cache_interface import KVCacheConfig, KVCacheGroup, MambaSpec
 
-from vllm_ascend.core.kv_cache_interface import AscendMLAAttentionSpec, AscendSlidingWindowMLASpec
+from vllm_ascend.core.kv_cache_interface import AscendMLAAttentionSpec
 from vllm_ascend.distributed.kv_transfer.kv_p2p.mooncake_connector import (
     GroupPull,
     GroupTransferInfo,
@@ -1788,13 +1788,14 @@ class MooncakeConnectorScheduler(BaseMooncakeConnectorScheduler):
 
     def _get_scheduler_block_size(self) -> int:
         for group in self.kv_cache_config.kv_cache_groups:
-            for spec in self._get_group_unique_specs(group):
-                if isinstance(spec, AscendSlidingWindowMLASpec) and spec.model_version == "deepseek_v4":
-                    return spec.block_size
+            if group.sliding_window_reach and any(
+                getattr(spec, "model_version", None) == "deepseek_v4" for spec in group.distinct_specs
+            ):
+                return group.block_size
         return self.vllm_config.cache_config.block_size
 
-    def _get_group_transfer_info(self, group: Any) -> GroupTransferInfo:
-        specs = self._get_group_unique_specs(group)
+    def _get_group_transfer_info(self, group: KVCacheGroup) -> GroupTransferInfo:
+        specs = group.distinct_specs
         if specs and all(
             isinstance(spec, AscendMLAAttentionSpec) and spec.model_version == "deepseek_v4" for spec in specs
         ):
@@ -2044,7 +2045,7 @@ class MooncakeConnectorScheduler(BaseMooncakeConnectorScheduler):
             prefill_pp_rank = remote_rank // prefill_tp_size
             group_pulls: list[GroupPull] = []
             for group_id, group in enumerate(self.kv_cache_groups):
-                if isinstance(group.kv_cache_spec, MambaSpec):
+                if any(isinstance(spec, MambaSpec) for spec in group.distinct_specs):
                     num_group_pulls = max(1, prefill_tp_size // self._decode_tp_size)
                 else:
                     group_spec = self._serialize_group_for_scheduler(group)
@@ -2068,9 +2069,8 @@ class MooncakeConnectorScheduler(BaseMooncakeConnectorScheduler):
             pulls_by_port.append(group_pulls)
         return pulls_by_port
 
-    @staticmethod
-    def _serialize_group_for_scheduler(group: Any) -> dict[str, Any]:
-        kv_cache_spec = group.kv_cache_spec
+    def _serialize_group_for_scheduler(self, group: KVCacheGroup) -> dict[str, Any]:
+        kv_cache_spec = next(iter(group.distinct_specs))
         return {
             "kv_cache_spec_type": type(kv_cache_spec).__name__,
             "kv_cache_spec": {

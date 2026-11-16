@@ -17,11 +17,12 @@ import torch
 from vllm.distributed.kv_transfer.kv_connector.v1.offloading.config import (
     get_offloading_group_ids,
 )
+from vllm.v1.core.single_type_kv_cache_manager import FullAttentionManager
 from vllm.v1.kv_cache_interface import (
-    FullAttentionSpec,
+    AttentionSpec,
     KVCacheConfig,
+    KVCacheGroup,
     KVCacheGroupRole,
-    KVCacheGroupSpec,
 )
 from vllm.v1.kv_offload.base import CanonicalKVCaches
 
@@ -36,8 +37,8 @@ HEAD_SIZE = 3
 DTYPE = torch.bfloat16
 
 
-def _attention_spec() -> FullAttentionSpec:
-    return FullAttentionSpec(
+def _attention_spec() -> AttentionSpec:
+    return AttentionSpec(
         block_size=BLOCK_SIZE,
         num_kv_heads=1,
         head_size=HEAD_SIZE,
@@ -51,17 +52,16 @@ def _group(
     enable_kv_transfer: bool = True,
     spec: object | None = None,
     role: KVCacheGroupRole = KVCacheGroupRole.DEFAULT,
-) -> KVCacheGroupSpec:
-    return KVCacheGroupSpec(
-        layer_names=[layer_name],
-        kv_cache_spec=_attention_spec() if spec is None else spec,
+) -> KVCacheGroup:
+    return KVCacheGroup.from_layers(
+        dict.fromkeys([layer_name], FullAttentionManager.layer_config(_attention_spec() if spec is None else spec)),
         enable_kv_transfer=enable_kv_transfer,
         role=role,
     )
 
 
 def _config(
-    groups: list[KVCacheGroupSpec],
+    groups: list[KVCacheGroup],
     *,
     hisparse_host_num_blocks: int | None = None,
 ) -> KVCacheConfig:

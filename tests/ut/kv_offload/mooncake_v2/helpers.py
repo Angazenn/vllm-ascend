@@ -6,15 +6,10 @@ from typing import Any
 from unittest.mock import MagicMock
 
 import torch
-from vllm.v1.kv_cache_interface import (
-    CircularBufferSpec,
-    FullAttentionSpec,
-    KVCacheTensor,
-    MambaSpec,
-    SlidingWindowSpec,
-)
+from vllm.v1.kv_cache_interface import AttentionSpec, KVCacheTensor, MambaSpec
 
 from vllm_ascend.core.kv_cache_interface import (
+    AscendCircularBufferSpec,
     AscendIndexerKPoolTailSpec,
     AscendSFAIndexerCacheSpec,
 )
@@ -33,23 +28,23 @@ def make_kv_cache_tensor(
     return KVCacheTensor(size=size, layers=layers, layer_stride=layer_stride, block_stride=block_stride, offset=offset)
 
 
-def make_full_spec(block_size: int = 16, num_kv_heads: int = 1) -> FullAttentionSpec:
-    return FullAttentionSpec(
+def make_full_spec(block_size: int = 16, num_kv_heads: int = 1) -> AttentionSpec:
+    return AttentionSpec(
         block_size=block_size,
         num_kv_heads=num_kv_heads,
         head_size=8,
         head_size_v=8,
         dtype=torch.float16,
+        dcp_sharded=True,
     )
 
 
-def make_sliding_spec(block_size: int = 16) -> SlidingWindowSpec:
-    return SlidingWindowSpec(
+def make_sliding_spec(block_size: int = 16) -> AttentionSpec:
+    return AttentionSpec(
         block_size=block_size,
         num_kv_heads=1,
         head_size=8,
         dtype=torch.float16,
-        sliding_window=64,
         dcp_sharded=False,
     )
 
@@ -62,8 +57,8 @@ def make_mamba_spec(block_size: int = 16) -> MambaSpec:
     )
 
 
-def make_circular_spec(block_size: int = 16) -> CircularBufferSpec:
-    return CircularBufferSpec(
+def make_circular_spec(block_size: int = 16) -> AscendCircularBufferSpec:
+    return AscendCircularBufferSpec(
         block_size=block_size,
         num_kv_heads=1,
         head_size=8,
@@ -79,7 +74,6 @@ def make_kpool_tail_spec(block_size: int = 16) -> AscendIndexerKPoolTailSpec:
         num_kv_heads=1,
         head_size=8,
         dtype=torch.float32,
-        sliding_window=8,
         compress_ratio=8,
     )
 

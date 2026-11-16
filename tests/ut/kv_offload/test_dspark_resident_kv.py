@@ -7,7 +7,8 @@ from unittest.mock import Mock, patch
 import pytest
 import torch
 from vllm.config import CUDAGraphMode
-from vllm.v1.kv_cache_interface import FullAttentionSpec, KVCacheConfig, KVCacheGroupSpec, KVCacheTensor
+from vllm.v1.core.single_type_kv_cache_manager import FullAttentionManager
+from vllm.v1.kv_cache_interface import AttentionSpec, KVCacheConfig, KVCacheGroup, KVCacheTensor
 from vllm.v1.worker.gpu.model_runner import GPUModelRunner
 
 from vllm_ascend.core.kv_cache_interface import AscendMLAAttentionSpec, AscendSFAIndexerCacheSpec
@@ -334,7 +335,7 @@ def test_dspark_missing_loaded_ownership_fails_closed(names):
 
 def test_dspark_rejects_gqa_checkpoint_cache():
     runner = _runner()
-    spec = FullAttentionSpec(block_size=128, num_kv_heads=8, head_size=128, dtype=torch.bfloat16)
+    spec = AttentionSpec(block_size=128, num_kv_heads=8, head_size=128, dtype=torch.bfloat16)
     with (
         patch.object(GPUModelRunner, "get_kv_cache_spec", return_value={"draft.layers.0.attn": spec}),
         pytest.raises(ValueError, match="MLA DSpark"),
@@ -369,7 +370,10 @@ def test_d_side_and_local_dspark_do_not_enable_p_prefill_generation(producer, co
 
 
 def _cache_config(specs, num_blocks=3):
-    groups = [KVCacheGroupSpec(layer_names=[name], kv_cache_spec=spec) for name, spec in specs.items()]
+    groups = [
+        KVCacheGroup.from_layers(dict.fromkeys([name], FullAttentionManager.layer_config(spec)))
+        for name, spec in specs.items()
+    ]
     return KVCacheConfig(num_blocks=num_blocks, kv_cache_tensors=[], kv_cache_groups=groups)
 
 
@@ -504,7 +508,7 @@ def test_layerwise_reuse_retains_independent_draft_descriptors():
     layer_bytes = 3 * spec.page_size_bytes
     config = KVCacheConfig(
         num_blocks=3,
-        kv_cache_groups=[KVCacheGroupSpec(layer_names=names, kv_cache_spec=spec)],
+        kv_cache_groups=[KVCacheGroup.from_layers(dict.fromkeys(names, FullAttentionManager.layer_config(spec)))],
         kv_cache_tensors=[
             KVCacheTensor(
                 size=len(names) * layer_bytes,

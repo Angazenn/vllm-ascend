@@ -24,20 +24,17 @@ from vllm.utils.mem_constants import GiB_bytes
 from vllm.utils.mem_utils import MemorySnapshot, memory_profiling
 from vllm.utils.torch_utils import set_random_seed  # noqa: E402
 
-# KV-cache planning lives in kv_cache_planning on both supported versions.
-from vllm.v1.core.kv_cache_planning import get_kv_cache_groups
-
 from vllm_ascend._310p.kv_cache_sharing import get_310p_shared_cache_slots
 from vllm_ascend.utils import is_rc_device
-from vllm_ascend.worker.worker import NPUWorker, init_workspace_manager
+from vllm_ascend.worker.worker import NPUWorker, get_kv_cache_groups, init_workspace_manager
 
 
 class NPUWorker310(NPUWorker):
     def _scale_kv_cache_memory_for_multi_group(self, available_memory: int) -> int:
-        kv_cache_spec = self.get_kv_cache_spec()
+        layer_configs = self.get_kv_cache_layer_configs()
         layout_resolver = getattr(self.vllm_config.cache_config, "get_resolved_kv_cache_layout", None)
-        if isinstance(kv_cache_spec, dict) and callable(layout_resolver):
-            groups = get_kv_cache_groups(self.vllm_config, kv_cache_spec)
+        if callable(layout_resolver):
+            groups = get_kv_cache_groups(self.vllm_config, layer_configs)
             share_slots = get_310p_shared_cache_slots(groups, layout_resolver()) if groups else {}
         else:
             share_slots = {}

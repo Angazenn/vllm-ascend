@@ -3,7 +3,6 @@ from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 from torch import Tensor
-from vllm.v1.kv_cache_interface import UniformTypeKVCacheSpecs
 
 from vllm_ascend.distributed.kv_transfer.sparse_kv_offload import (
     sparse_kv_offload_manager as manager_module,
@@ -198,13 +197,7 @@ class TestSparseKVOffloadMemoryPlanning(unittest.TestCase):
         specs, _, alignment_reserve = _make_memory_plan_inputs()
         kv_cache_config = SimpleNamespace(
             num_blocks=200,
-            kv_cache_groups=[
-                SimpleNamespace(
-                    layer_names=[name],
-                    kv_cache_spec=spec,
-                )
-                for name, spec in specs.items()
-            ],
+            kv_cache_groups=[SimpleNamespace(kv_cache_specs={name: spec}) for name, spec in specs.items()],
         )
 
         self.assertEqual(
@@ -212,20 +205,11 @@ class TestSparseKVOffloadMemoryPlanning(unittest.TestCase):
             200 * 2048 + alignment_reserve,
         )
 
-    def test_cpu_pool_size_supports_uniform_specs(self):
+    def test_cpu_pool_size_supports_grouped_layer_specs(self):
         specs, _, alignment_reserve = _make_memory_plan_inputs()
-        uniform_specs = UniformTypeKVCacheSpecs(
-            block_size=128,
-            kv_cache_specs=specs,
-        )
         kv_cache_config = SimpleNamespace(
             num_blocks=200,
-            kv_cache_groups=[
-                SimpleNamespace(
-                    layer_names=list(specs),
-                    kv_cache_spec=uniform_specs,
-                )
-            ],
+            kv_cache_groups=[SimpleNamespace(kv_cache_specs=specs)],
         )
 
         self.assertEqual(

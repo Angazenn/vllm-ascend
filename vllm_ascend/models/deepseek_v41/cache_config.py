@@ -2,26 +2,22 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Framework-side V4.1 cache placements within a shared allocation."""
 
+from collections.abc import Iterable
 from dataclasses import replace
 
 import torch
 from vllm.config import VllmConfig
-
-# Both supported versions expose planning helpers in kv_cache_planning.
-from vllm.v1.core.kv_cache_planning import may_override_num_blocks
+from vllm.utils.torch_utils import get_dtype_size
 from vllm.v1.kv_cache_interface import (
-    CircularBufferSpec,
     KVCacheConfig,
-    KVCacheGroupSpec,
+    KVCacheGroup,
+    KVCacheLayerConfig,
+    KVCacheSpec,
     KVCacheTensor,
-    UniformTypeKVCacheSpecs,
+    MLAAttentionSpec,
 )
 
-from vllm_ascend.core.kv_cache_interface import (
-    AscendMLAAttentionSpec,
-    AscendSlidingWindowMLASpec,
-    declared_kwarg,
-)
+from vllm_ascend.core.kv_cache_interface import AscendCircularBufferSpec, AscendMLAAttentionSpec
 from vllm_ascend.device.hardware_profile import (
     HardwareCapability,
     get_current_hardware_profile,
@@ -42,25 +38,29 @@ def uses_a5_packed_cache() -> bool:
     return get_current_hardware_profile().supports(HardwareCapability.DSV41_PACKED_CACHE)
 
 
-def make_swa_cache_spec(*, block_size, window_size, head_size, dtype, cache_dtype, bounded_replay=False):
+def make_swa_cache_layout(*, block_size, head_size, dtype, cache_dtype):
     if uses_a5_packed_cache():
         if head_size != MLA_HEAD_DIM:
             raise ValueError(f"A5 DeepSeek V4.1 requires head size {MLA_HEAD_DIM}, got {head_size}")
         # FP8 values followed by one BF16 scale per 32 values.
-        head_size += (head_size // 32) * torch.bfloat16.itemsize
+        head_size += (head_size // 32) * get_dtype_size(torch.bfloat16)
         dtype = torch.uint8
         cache_dtype = "a5_mxfp8_bf16_scale"
-    return AscendSlidingWindowMLASpec(
+    return MLAAttentionSpec(
         block_size=block_size,
         num_kv_heads=1,
         head_size=head_size,
         dtype=dtype,
-        sliding_window=window_size,
         cache_dtype_str=cache_dtype,
         model_version="deepseek_v41",
         alignment=None,
-        **declared_kwarg(AscendSlidingWindowMLASpec, "bounded_replay", bounded_replay),
     )
+
+
+def is_v41_swa_layout(spec):
+    # V4.1 uses the plain MLA layout for SWA and Ascend MLA layouts for
+    # compressed and indexer bytes.
+    return type(spec) is MLAAttentionSpec and spec.model_version == "deepseek_v41"
 
 
 def make_mla_cache_spec(*, block_size, head_size, compress_ratio):
@@ -68,7 +68,7 @@ def make_mla_cache_spec(*, block_size, head_size, compress_ratio):
         if head_size != MLA_HEAD_DIM:
             raise ValueError(f"A5 DeepSeek V4.1 requires head size {MLA_HEAD_DIM}, got {head_size}")
         # Two FP4 values per byte, followed by one BF16 scale per 16 values.
-        head_size = head_size // 2 + (head_size // 16) * torch.bfloat16.itemsize
+        head_size = head_size // 2 + (head_size // 16) * get_dtype_size(torch.bfloat16)
         dtype = torch.uint8
         scale_dtype = torch.bfloat16
     else:
@@ -81,8 +81,6 @@ def make_mla_cache_spec(*, block_size, head_size, compress_ratio):
         dtype=dtype,
         tokens_per_state=compress_ratio,
         model_version="deepseek_v41",
-        # Both supported vLLM lanes (#57169) omit MLA `storage_block_size`.
-        **{},
         scale_dtype=scale_dtype,
     )
 
@@ -106,8 +104,6 @@ def make_index_cache_spec(*, block_size, head_size, compress_ratio):
         dtype=dtype,
         tokens_per_state=compress_ratio,
         model_version="deepseek_v41",
-        # Both supported vLLM lanes (#57169) omit MLA `storage_block_size`.
-        **{},
         scale_dim=scale_dim,
         scale_dtype=scale_dtype,
     )
@@ -124,22 +120,10 @@ def make_folded_index_cache_spec(*, block_size):
         dtype=torch.uint8,
         tokens_per_state=INDEX_FOLD_ROWS,
         model_version="deepseek_v41",
-        # Both supported vLLM lanes (#57169) omit MLA `storage_block_size`.
-        **{},
     )
 
 
-def is_deepseek_v41_cache(specs_or_groups):
-    if isinstance(specs_or_groups, dict):
-        specs = list(specs_or_groups.values())
-    else:
-        specs = []
-        for item in specs_or_groups:
-            spec = getattr(item, "kv_cache_spec", item)
-            if isinstance(spec, UniformTypeKVCacheSpecs):
-                specs.extend(spec.kv_cache_specs.values())
-            else:
-                specs.append(spec)
+def is_deepseek_v41_cache(specs: Iterable[KVCacheSpec]) -> bool:
     return any(getattr(spec, "model_version", None) == "deepseek_v41" for spec in specs)
 
 
@@ -154,8 +138,10 @@ def _draft_layer_number(name):
 def get_layer_tuples(specs):
     """Return DSV4-style ordered layer tuples and their physical page sizes."""
     mla = {name for name, spec in specs.items() if isinstance(spec, AscendMLAAttentionSpec)}
-    state = sorted((name for name, spec in specs.items() if isinstance(spec, CircularBufferSpec)), key=_layer_number)
-    swa = {name for name, spec in specs.items() if isinstance(spec, AscendSlidingWindowMLASpec)}
+    state = sorted(
+        (name for name, spec in specs.items() if isinstance(spec, AscendCircularBufferSpec)), key=_layer_number
+    )
+    swa = {name for name, spec in specs.items() if is_v41_swa_layout(spec)}
 
     full = sorted((name for name in mla if name.endswith(".long_kv_cache")), key=_layer_number)
     target_swa = sorted((name for name in swa if ".mtp." not in f".{name}"), key=_layer_number)
@@ -183,18 +169,17 @@ def get_layer_tuples(specs):
         if slot_idx < len(draft_swa):
             aliases.append(draft_swa[slot_idx])
         capacity = max(
-            kv_bytes + index_bytes + folded_bytes,
-            *(specs[name].unpadded_page_size_bytes for name in aliases),
+            [kv_bytes + index_bytes + folded_bytes, *(specs[name].unpadded_page_size_bytes for name in aliases)]
         )
         layer_tuples.append((kv_name, index_name, *((folded_name,) if folded_spec is not None else ()), *aliases))
         page_sizes.append(capacity)
     return page_sizes, layer_tuples
 
 
-def group_cache_specs(specs):
+def _group_layer_specs(specs):
     """Merge full-context resources and pad layer tuples without mutating inputs."""
-    if specs and all(isinstance(spec, AscendSlidingWindowMLASpec) for spec in specs.values()):
-        return [UniformTypeKVCacheSpecs.from_specs({name: spec}) for name, spec in specs.items()]
+    if specs and all(is_v41_swa_layout(spec) for spec in specs.values()):
+        return [{name: spec} for name, spec in specs.items()]
     page_sizes, layer_tuples = get_layer_tuples(specs)
     padded = {}
     for page_size, layer_tuple in zip(page_sizes, layer_tuples):
@@ -213,66 +198,45 @@ def group_cache_specs(specs):
         padded.update((name, replace(specs[name], page_size_padded=page_size)) for name in aliases)
 
     mla_names = [name for name, spec in padded.items() if isinstance(spec, AscendMLAAttentionSpec)]
-    state_names = [name for name, spec in padded.items() if isinstance(spec, CircularBufferSpec)]
+    state_names = [name for name, spec in padded.items() if isinstance(spec, AscendCircularBufferSpec)]
     groups = [
-        UniformTypeKVCacheSpecs.from_specs({name: padded[name] for name in mla_names}),
-        UniformTypeKVCacheSpecs.from_specs({name: padded[name] for name in state_names}),
+        {name: padded[name] for name in mla_names},
+        {name: padded[name] for name in state_names},
     ]
 
     # Transpose the physical tuples. Each scheduler SWA group takes one layer
     # from every tuple, so its members use distinct slots at the same block ID.
     swa_columns = [
-        [
-            name
-            for name in layer_tuple
-            if isinstance(padded[name], AscendSlidingWindowMLASpec) and ".mtp." not in f".{name}"
-        ]
+        [name for name in layer_tuple if is_v41_swa_layout(padded[name]) and ".mtp." not in f".{name}"]
         for layer_tuple in layer_tuples
     ]
     for names in zip(*swa_columns):
-        groups.append(UniformTypeKVCacheSpecs.from_specs({name: padded[name] for name in names}))
+        groups.append({name: padded[name] for name in names})
 
     draft_names = [
         name
         for layer_tuple in layer_tuples
         for name in layer_tuple
-        if isinstance(padded[name], AscendSlidingWindowMLASpec) and ".mtp." in f".{name}"
+        if is_v41_swa_layout(padded[name]) and ".mtp." in f".{name}"
     ]
     if draft_names:
-        groups.append(UniformTypeKVCacheSpecs.from_specs({name: padded[name] for name in draft_names}))
+        groups.append({name: padded[name] for name in draft_names})
     return groups
 
 
-def make_cache_groups(grouped_specs):
-    return [KVCacheGroupSpec(layer_names=list(s.kv_cache_specs), kv_cache_spec=s) for s in grouped_specs]
+def group_layer_configs(layer_configs: dict[str, KVCacheLayerConfig]) -> list[KVCacheGroup]:
+    specs = {name: config.spec for name, config in layer_configs.items()}
+    return [
+        KVCacheGroup.from_layers({name: replace(layer_configs[name], spec=spec) for name, spec in group.items()})
+        for group in _group_layer_specs(specs)
+        if group
+    ]
 
 
-def _specs_from_groups(groups):
-    specs = {}
-    for group in groups:
-        for name in group.layer_names:
-            group_spec = group.kv_cache_spec
-            specs[name] = (
-                group_spec.kv_cache_specs[name] if isinstance(group_spec, UniformTypeKVCacheSpecs) else group_spec
-            )
-    return specs
-
-
-def get_deepseek_v41_pool_bytes_per_block(groups):
-    page_sizes, _ = get_layer_tuples(_specs_from_groups(groups))
-    return sum(page_sizes)
-
-
-def get_deepseek_v41_kv_cache_config(
-    vllm_config: VllmConfig,
-    groups: list[KVCacheGroupSpec],
-    available_memory: int,
-) -> KVCacheConfig:
+def place_deepseek_v41_cache(vllm_config: VllmConfig, groups: list[KVCacheGroup], num_blocks: int) -> KVCacheConfig:
     """Place resource pages in layer slots within one shared backing pool."""
-    specs = _specs_from_groups(groups)
+    specs = {name: spec for group in groups for name, spec in group.kv_cache_specs.items()}
     page_sizes, layer_tuples = get_layer_tuples(specs)
-    capacity = max(available_memory // sum(page_sizes), 0)
-    num_blocks = may_override_num_blocks(vllm_config, capacity)
     backing_size = num_blocks * sum(page_sizes)
     tensors: list[KVCacheTensor] = []
     slot_offset = 0

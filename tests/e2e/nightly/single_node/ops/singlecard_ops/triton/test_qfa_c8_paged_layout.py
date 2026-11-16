@@ -21,7 +21,7 @@ from vllm_ascend.device.hardware import AscendDeviceType
 def test_qfa_strided_scales_match_contiguous_reference(query_tokens, ratio):
     # Load A5-only dependencies after pytest evaluates the device marker.
     from cann_ops_transformer.ops import quant_flash_attn, quant_flash_attn_metadata
-    from vllm.v1.kv_cache_interface import FullAttentionSpec
+    from vllm.v1.kv_cache_interface import AttentionSpec
 
     from vllm_ascend.attention.attention_c8_mxfp import (
         fill_mxfp_v_scale_cache,
@@ -37,7 +37,7 @@ def test_qfa_strided_scales_match_contiguous_reference(query_tokens, ratio):
     torch.manual_seed(42)
     device = torch.device("npu")
     spec = mxfp_cache_spec(
-        FullAttentionSpec(
+        AttentionSpec(
             block_size=512 * ratio,
             num_kv_heads=1,
             head_size=256,

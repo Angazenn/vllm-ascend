@@ -11,7 +11,6 @@ from copy import copy
 from typing import TYPE_CHECKING, Any
 
 from vllm.logger import logger
-from vllm.v1.kv_cache_interface import UniformTypeKVCacheSpecs
 
 from vllm_ascend.ascend_config import KVPPConfig
 from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.metadata import (
@@ -127,29 +126,15 @@ def validate_pp_groups(kv_cache_config: Any, parallel_config: Any) -> None:
 
 
 def group_block_size_signature(group) -> tuple[int, ...]:
-    """Per-group page sizes, independent of how the spec is packaged.
-
-    The scheduler and a worker can hold the *same* group in two different
-    shapes: one merged spec versus a ``UniformTypeKVCacheSpecs`` mapping every
-    layer name to its own spec. Both describe the same pages, so reduce either
-    shape to the set of block sizes it contains rather than reading a single
-    representative (which depends on dict order).
-    """
-    spec = group.kv_cache_spec
-    specs = spec.kv_cache_specs.values() if isinstance(spec, UniformTypeKVCacheSpecs) else (spec,)
-    return tuple(sorted({int(sub.block_size) for sub in specs}))
+    """Return the scheduler block size shared by every layer in the group."""
+    return (group.block_size,)
 
 
 def hybrid_layout_id(kv_cache_config, tp_size: int = 1, *, namespace: str = "") -> str:
     """Namespace every pool key, and must agree across processes.
 
-    Only representation-independent fields participate. Hashing the spec
-    objects does *not* work: the scheduler holds one merged spec per group
-    while a worker holds the per-layer ``UniformTypeKVCacheSpecs`` for the same
-    group, so ``asdict`` yields different JSON on each side. That produced two
-    disjoint key spaces — writes landed under one prefix and the hit check
-    queried another, so the pool never reported a hit, silently and with no
-    error anywhere.
+    The scheduler and worker derive keys from group block sizes. Pipeline
+    projection can change the local layer mapping without changing those sizes.
 
     Without PP, layer membership, group order and page sizes are identical in
     both representations. With PP, membership is stage-local: use the shared

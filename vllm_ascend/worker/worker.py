@@ -60,14 +60,14 @@ from vllm.utils.torch_utils import STR_DTYPE_TO_TORCH_DTYPE
 from vllm.v1.core.kv_cache_config_builder import get_kv_cache_config_builder
 from vllm.v1.core.kv_cache_planning import unify_hybrid_kv_cache_specs
 from vllm.v1.core.sched.output import GrammarOutput, SchedulerOutput
+from vllm.v1.core.single_type_kv_cache_manager import FullAttentionManager, SlidingWindowManager
 from vllm.v1.kv_cache_interface import (
     AttentionSpec,
     KVCacheConfig,
-    KVCacheGroupSpec,
+    KVCacheGroup,
+    KVCacheLayerConfig,
     KVCacheSpec,
     MambaSpec,
-    SlidingWindowSpec,
-    UniformTypeKVCacheSpecs,
 )
 from vllm.v1.outputs import EMPTY_MODEL_RUNNER_OUTPUT, AsyncModelRunnerOutput, DraftTokenIds, ModelRunnerOutput
 from vllm.v1.utils import report_usage_stats
@@ -123,9 +123,9 @@ from vllm_ascend.utils import (
 
 def get_kv_cache_groups(
     vllm_config: VllmConfig,
-    kv_cache_spec: dict[str, KVCacheSpec],
-) -> list[KVCacheGroupSpec]:
-    return get_kv_cache_config_builder(vllm_config).get_kv_cache_groups(vllm_config, kv_cache_spec)
+    layer_configs: dict[str, KVCacheLayerConfig],
+) -> list[KVCacheGroup]:
+    return get_kv_cache_config_builder(vllm_config).get_kv_cache_groups(vllm_config, layer_configs)
 
 
 torch._dynamo.trace_rules.clear_lru_cache()  # noqa: E402
@@ -613,7 +613,14 @@ class NPUWorker(WorkerBase):
         if not sparse_kv_offload_config.enabled:
             return int(available_device_memory_bytes)
 
-        kv_cache_spec = getattr(self, "kv_cache_spec", None) or self.get_kv_cache_spec()
+        layer_configs = getattr(self, "_sparse_kv_layer_configs", None) or self.get_kv_cache_layer_configs()
+        kv_cache_spec = {name: config.spec for name, config in layer_configs.items()}
+        max_blocks_per_request = max(
+            config.manager_cls.max_allocated_blocks_per_request(
+                config.manager_config, config.spec.block_size, config.spec.dcp_sharded, self.vllm_config
+            )
+            for config in layer_configs.values()
+        )
         dram_limit_bytes = int(sparse_kv_offload_config.dram_size_per_dp_GB * GiB_bytes)
         budget = plan_sparse_kv_offload_memory(
             kv_cache_spec=kv_cache_spec,
@@ -621,6 +628,7 @@ class NPUWorker(WorkerBase):
             available_device_memory_bytes=available_device_memory_bytes,
             dram_limit_bytes=dram_limit_bytes,
             keep_device_kv_cache=sparse_kv_offload_config.keep_device_kv_cache,
+            max_blocks_per_request=max_blocks_per_request,
         )
         logger.info_once(
             "Sparse KV offload memory plan: npu_limit=%d blocks, "
@@ -772,37 +780,29 @@ class NPUWorker(WorkerBase):
         derives a num_blocks (and block pool) small enough for the per-layer
         buffers to fit.
         """
-        kv_cache_spec = self.get_kv_cache_spec()
-        if not isinstance(kv_cache_spec, dict):
+        from vllm_ascend.worker.v2.attn_utils import uses_unified_deepseek_cache
+
+        if uses_unified_deepseek_cache(self.vllm_config):
             return available_memory
-        kv_cache_groups = get_kv_cache_groups(self.vllm_config, kv_cache_spec)
+        layer_configs = self.get_kv_cache_layer_configs()
+        kv_cache_groups = get_kv_cache_groups(self.vllm_config, layer_configs)
         if not kv_cache_groups:
             return available_memory
         # Ascend's DSV4/V4.1 and GLM-Next planners already account for shared
         # physical storage across all groups. Their budgets must not take the
         # generic per-layer scale, including when the runner uses sparse SFA.
-        for group in kv_cache_groups:
-            group_spec = group.kv_cache_spec
-            specs = (
-                group_spec.kv_cache_specs.values() if isinstance(group_spec, UniformTypeKVCacheSpecs) else (group_spec,)
-            )
-            if any(
-                getattr(spec, "model_version", None) in {"deepseek_v4", "deepseek_v41", "glm5_next"} for spec in specs
-            ):
-                return available_memory
+        per_layer_specs = [spec for group in kv_cache_groups for spec in group.kv_cache_specs.values()]
+        if any(
+            getattr(spec, "model_version", None) in {"deepseek_v4", "deepseek_v41", "glm5_next"}
+            for spec in per_layer_specs
+        ):
+            return available_memory
 
         # vLLM #51718 overlays KV cache groups in one standardized backing
         # allocation. For block-compact layouts, Ascend can
         # preserve that contract for attention/Mamba and eligible full/sliding
         # attention models through supported cache views. Do not
         # shrink the planner budget when the runner can consume that layout.
-        per_layer_specs = []
-        for group in kv_cache_groups:
-            group_spec = group.kv_cache_spec
-            if isinstance(group_spec, UniformTypeKVCacheSpecs):
-                per_layer_specs.extend(group_spec.kv_cache_specs.values())
-            else:
-                per_layer_specs.append(group_spec)
         has_attention = any(isinstance(spec, AttentionSpec) for spec in per_layer_specs)
         has_mamba = any(isinstance(spec, MambaSpec) for spec in per_layer_specs)
         model_runner = getattr(self, "model_runner", None)
@@ -813,7 +813,7 @@ class NPUWorker(WorkerBase):
             # and must keep its original multi-group budget scaling.
             from vllm_ascend.worker.v2.attn_utils import can_share_full_and_sliding_kv_cache
 
-            shares_attention_pool = can_share_full_and_sliding_kv_cache(self.vllm_config, per_layer_specs)
+            shares_attention_pool = can_share_full_and_sliding_kv_cache(self.vllm_config, kv_cache_groups)
         # TODO: The Step-3.5/3.7 models will be sunset in the future. Once they
         # are, remove this is_step_model exemption: this line and the
         # `or is_step_model` budget gate below.
@@ -828,19 +828,9 @@ class NPUWorker(WorkerBase):
         ):
             return available_memory
 
-        bytes_per_block = 0
-        sum_pages = 0
-        for group in kv_cache_groups:
-            group_pages = 0
-            for layer_name in group.layer_names:
-                group_spec = group.kv_cache_spec
-                if isinstance(group_spec, UniformTypeKVCacheSpecs):
-                    layer_spec = group_spec.kv_cache_specs[layer_name]
-                else:
-                    layer_spec = group_spec
-                group_pages += layer_spec.page_size_bytes
-                sum_pages += layer_spec.page_size_bytes
-            bytes_per_block = max(bytes_per_block, group_pages)
+        group_page_bytes = [group.page_size_bytes for group in kv_cache_groups]
+        bytes_per_block = max(group_page_bytes)
+        sum_pages = sum(group_page_bytes)
         if bytes_per_block > 0 and sum_pages > bytes_per_block:
             scale = bytes_per_block / sum_pages
             logger.info(
@@ -1266,7 +1256,11 @@ class NPUWorker(WorkerBase):
         return num_layers, num_buffer_assignments, logical_page_bytes / physical_page_bytes
 
     def get_kv_cache_spec(self) -> dict[str, KVCacheSpec]:
-        kv_cache_spec = self.model_runner.get_kv_cache_spec()
+        return {name: config.spec for name, config in self.get_kv_cache_layer_configs().items()}
+
+    def get_kv_cache_layer_configs(self) -> dict[str, KVCacheLayerConfig]:
+        layer_configs = self.model_runner.get_kv_cache_layer_configs()
+        kv_cache_spec = {name: config.spec for name, config in layer_configs.items()}
         extra_config = get_layerwise_reuse_config(self.vllm_config.kv_transfer_config)
         if extra_config is not None:
             speculator = getattr(self.model_runner, "speculator", None)
@@ -1293,12 +1287,14 @@ class NPUWorker(WorkerBase):
             if (
                 speculative_config is not None
                 and speculative_config.use_eagle()
-                and any(isinstance(spec, SlidingWindowSpec) for spec in kv_cache_spec.values())
+                and any(config.manager_cls is SlidingWindowManager for config in layer_configs.values())
             ):
                 # Use the same full-allocation specs for KVPP budgeting and
                 # the engine's cache groups. Attention compute stays windowed.
-                kv_cache_spec = dict(kv_cache_spec)
-                unify_hybrid_kv_cache_specs(kv_cache_spec)
+                unify_hybrid_kv_cache_specs(layer_configs)
+                kv_cache_spec = {name: config.spec for name, config in layer_configs.items()}
+            if any(config.manager_cls is not FullAttentionManager for config in layer_configs.values()):
+                raise ValueError("KVPP requires full-attention cache allocation.")
             kvpp_rank = (
                 get_pcp_group().rank_in_group * self.vllm_config.parallel_config.tensor_parallel_size
                 + get_tp_group().rank_in_group
@@ -1309,9 +1305,8 @@ class NPUWorker(WorkerBase):
                 kvpp_rank,
             )
         if get_ascend_config().sparse_kv_offload_config.enabled:
-            # reserve kv_cache_spec for sparse kv offload memory profile usage.
-            self.kv_cache_spec = kv_cache_spec
-        return kv_cache_spec
+            self._sparse_kv_layer_configs = layer_configs
+        return layer_configs
 
     def update_max_model_len(self, max_model_len: int) -> None:
         """Update max_model_len after auto-fit to NPU memory.

@@ -13,10 +13,19 @@ from unittest.mock import Mock
 
 import msgspec
 import pytest
+import torch
+from vllm.v1.attention.backends.registry import MambaAttentionBackendEnum
+from vllm.v1.core.single_type_kv_cache_manager import (
+    CircularBufferManager,
+    FullAttentionManager,
+    MambaManager,
+    SlidingWindowManager,
+)
+from vllm.v1.kv_cache_interface import AttentionSpec, KVCacheConfig, KVCacheGroup, MambaSpec
 from zmq.constants import SocketOption, SocketType
 from zmq.sugar.context import Context
 
-from vllm_ascend.distributed.kv_transfer.kv_p2p.mooncake import base_worker, push_worker
+from vllm_ascend.distributed.kv_transfer.kv_p2p.mooncake import push_worker
 from vllm_ascend.distributed.kv_transfer.kv_p2p.mooncake.base_worker import MooncakeBaseConnectorWorker
 from vllm_ascend.distributed.kv_transfer.kv_p2p.mooncake.metadata import (
     MooncakeConnectorMetadata,
@@ -142,11 +151,30 @@ def drive(worker, predicate):
     pytest.fail("Push worker did not make progress")
 
 
+def set_group_manager(worker, group_id, manager_config):
+    groups = worker.kv_cache_config.kv_cache_groups
+    groups[group_id] = replace(groups[group_id], manager_config=manager_config)
+
+
+def set_mamba_group(worker):
+    groups = worker.kv_cache_config.kv_cache_groups
+    spec = MambaSpec(
+        block_size=4,
+        shapes=((2, 6), (1, 2, 2)),
+        dtypes=(torch.uint8, torch.uint8),
+        mamba_type=MambaAttentionBackendEnum.GDN_ATTN,
+    )
+    groups[0] = replace(
+        groups[0],
+        kv_cache_specs=dict.fromkeys(groups[0].layer_names, spec),
+        manager_config=MambaManager.config(),
+    )
+    worker._build_kv_cache_spec_mappings()
+
+
 @pytest.fixture
 def worker(monkeypatch, request):
-    spec = Mock(spec=push_worker.FullAttentionSpec)
-    spec.sliding_window = None
-    spec.is_circular = False
+    spec = AttentionSpec(block_size=4, num_kv_heads=2, head_size=2, dtype=torch.float16)
     config = SimpleNamespace(
         speculative_config=None, model_config=SimpleNamespace(hf_text_config=SimpleNamespace(model_type="test"))
     )
@@ -186,8 +214,18 @@ def worker(monkeypatch, request):
                 indexer_replication_sizes=[0, 0, 0],
                 dcp_sharded=[True] * 3,
             )
-        self.kv_cache_specs = [spec]
-        self.layer_name_to_spec_index = {name: 0 for name in self.transfer_metadata.layer_names}
+        by_group = {}
+        for name, group_id in zip(self.transfer_metadata.layer_names, self.transfer_metadata.group_indices):
+            by_group.setdefault(group_id, {})[name] = spec
+        self.kv_cache_config = KVCacheConfig(
+            num_blocks=4,
+            kv_cache_tensors=[],
+            kv_cache_groups=[
+                KVCacheGroup(by_group[group_id], FullAttentionManager.config(), block_size=4)
+                for group_id in sorted(by_group)
+            ],
+        )
+        self._build_kv_cache_spec_mappings()
         self.engine = SimpleNamespace(batch_transfer_sync_write=Mock(return_value=0))
 
     monkeypatch.setattr(MooncakeBaseConnectorWorker, "__init__", initialize)
@@ -248,11 +286,7 @@ def test_partial_block_waits_for_later_chunk(worker):
 
 
 def test_swa_is_final_chunk_only_and_pcp_replicated(worker):
-    spec = Mock(spec=push_worker.SlidingWindowSpec)
-    spec.sliding_window = 4
-    spec.num_retained_tokens = 3
-    spec.is_circular = False
-    worker.kv_cache_specs = [spec]
+    set_group_manager(worker, 0, SlidingWindowManager.config(sliding_window=4))
     worker.pcp_size = 2
     assert worker._get_transfer_partition("model.layers.0.attn", remote_metadata(), (0, 0, 0)) == (0, 0, 2)
     worker.pcp_rank = 1
@@ -287,7 +321,7 @@ def test_tp_head_slices_and_replicas(worker):
 
 
 def test_mamba_flattens_pcp_tp(worker):
-    worker.kv_cache_specs = [Mock(spec=push_worker.MambaSpec, tp_replicated=False)]
+    set_mamba_group(worker)
     worker.pcp_size = 2
     worker.pcp_rank = 1
     assert worker._get_transfer_partition("model.layers.0.attn", remote_metadata(tp_size=2), (0, 0, 1)) is not None
@@ -482,7 +516,7 @@ def test_metadata_query_and_done_real_sockets(worker, monkeypatch, write_fails):
 
 
 def test_circular_waits_for_final_chunk(worker):
-    worker.kv_cache_specs = [SimpleNamespace(is_circular=True, sliding_window=None)]
+    set_group_manager(worker, 0, CircularBufferManager.config())
     message = destination_message()
     message["block_ids"] = [[10]]
     first = source_meta(target=message)
@@ -554,18 +588,7 @@ def test_head_split_copies_correct_bytes(worker, monkeypatch):
 
 
 def test_mamba_final_chunk_merges_pcp_conv_projections_and_state(worker, monkeypatch):
-    backends = SimpleNamespace(MAMBA1="mamba1", MAMBA2="mamba2", GDN_ATTN="gdn")
-    monkeypatch.setattr(base_worker, "MambaAttentionBackendEnum", backends, raising=False)
-    monkeypatch.setattr(
-        base_worker, "torch", SimpleNamespace(tensor=lambda *args, **kwargs: SimpleNamespace(element_size=lambda: 1))
-    )
-    spec = Mock(spec=push_worker.MambaSpec)
-    spec.tp_replicated = False
-    spec.mamba_type = backends.GDN_ATTN
-    spec.dtypes = ("byte", "byte")
-    spec.sliding_window = None
-    spec.is_circular = False
-    worker.kv_cache_specs = [spec]
+    set_mamba_group(worker)
     worker.pcp_size = 2
     worker.pcp_rank = 1
     local = worker.transfer_metadata
@@ -757,8 +780,7 @@ def test_draft_namespace_does_not_share_target_readiness(worker, monkeypatch, dr
 def test_shared_layer_event_preserves_final_chunk_only_state(worker, monkeypatch):
     monkeypatch.setattr(worker, "_get_remote_metadata", lambda message: multi_cache_remote(worker))
     attention, circular, _ = worker.transfer_metadata.layer_names
-    worker.kv_cache_specs.append(SimpleNamespace(is_circular=True, sliding_window=None))
-    worker.layer_name_to_spec_index[circular] = 1
+    set_group_manager(worker, worker.layer_name_to_group_index[circular], CircularBufferManager.config())
     message = destination_message()
     message["block_ids"] = [[20], [10, 11]]
     meta = MooncakeConnectorMetadata()
