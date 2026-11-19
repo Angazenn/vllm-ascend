@@ -10,6 +10,7 @@ with a separate region in the backing for every draft layer.
 """
 
 from dataclasses import replace
+from itertools import pairwise
 
 from vllm.config import VllmConfig
 from vllm.model_executor.models.utils import extract_layer_index
@@ -27,26 +28,14 @@ from vllm_ascend.utils import vllm_version_is
 
 # vLLM main moved this helper to kv_cache_planning after v0.32.0.
 if vllm_version_is("0.32.0"):
-    from vllm.v1.core.kv_cache_utils import may_override_num_blocks
+    from vllm.v1.core.kv_cache_utils import create_kv_cache_group_specs, may_override_num_blocks
 else:
-    from vllm.v1.core.kv_cache_planning import may_override_num_blocks
-
-
-def _draft_layer_specs(groups):
-    """Return local draft specs; empty PP-local groups allocate no tensors."""
-    result = {}
-    for group in groups:
-        group_spec = group.kv_cache_spec
-        for name in group.layer_names:
-            spec = group_spec.kv_cache_specs[name] if isinstance(group_spec, UniformTypeKVCacheSpecs) else group_spec
-            if spec.is_draft:
-                result[name] = spec
-    return result
+    from vllm.v1.core.kv_cache_planning import create_kv_cache_group_specs, may_override_num_blocks
 
 
 def _validate_paired_sfa_pages(specs) -> None:
     """Check the page geometry settled by NPUPlatform before spec creation."""
-    main = [s for s in specs.values() if isinstance(s, AscendMLAAttentionSpec) and not s.is_draft]
+    main = [s for s in specs.values() if isinstance(s, AscendMLAAttentionSpec)]
     recurrent = [s for s in specs.values() if isinstance(s, MambaSpec)]
     if not main:
         raise ValueError("A paired SFA cache requires main MLA specs.")
@@ -60,12 +49,16 @@ def _validate_paired_sfa_pages(specs) -> None:
 
 
 def paired_sfa_cache_groups(config, specs):
+    if config.scheduler_config.disable_hybrid_kv_cache_manager:
+        raise ValueError("Paired SFA cache requires the hybrid KV cache manager.")
+    # Worker-local profiling can see only KDA layers on a short PP stage.
+    if specs and all(isinstance(spec, MambaSpec) for spec in specs.values()):
+        return create_kv_cache_group_specs(specs, [list(specs)])
     draft = {name: spec for name, spec in specs.items() if spec.is_draft}
+    target = {name: spec for name, spec in specs.items() if name not in draft}
+    groups = _paired_sfa_target_cache_groups(target)
     if not draft:
-        return _paired_sfa_target_cache_groups(config, specs)
-    target = {name: spec for name, spec in specs.items() if not spec.is_draft}
-    groups = _paired_sfa_target_cache_groups(config, target)
-    specs.update(target)
+        return groups
     if any(isinstance(spec, AscendMLAAttentionSpec) and spec.uses_packed_sfa_main_cache for spec in draft.values()):
         raise ValueError("Kimi DSpark draft groups require ordinary attention cache specs.")
     ordered = dict(sorted(draft.items(), key=lambda item: extract_layer_index(item[0])))
@@ -115,9 +108,7 @@ def paired_sfa_cache_groups(config, specs):
     return groups
 
 
-def _paired_sfa_target_cache_groups(config, specs):
-    if config.scheduler_config.disable_hybrid_kv_cache_manager:
-        raise ValueError("Paired SFA cache requires the hybrid KV cache manager.")
+def _paired_sfa_target_cache_groups(specs):
     _validate_paired_sfa_pages(specs)
     main = sorted((n for n, s in specs.items() if isinstance(s, AscendMLAAttentionSpec)), key=extract_layer_index)
     indexer = sorted((n for n, s in specs.items() if isinstance(s, AscendSFAIndexerCacheSpec)), key=extract_layer_index)
@@ -143,34 +134,53 @@ def _paired_sfa_target_cache_groups(config, specs):
     return groups
 
 
-def _layout(groups):
-    full = next(
-        g
-        for g in groups
-        if isinstance(g.kv_cache_spec, UniformTypeKVCacheSpecs)
-        and any(isinstance(spec, AscendSFAIndexerCacheSpec) for spec in g.kv_cache_spec.kv_cache_specs.values())
+def _paired_sfa_regions(groups):
+    """Return local tensor regions and their total size in bytes per block."""
+    # PP owns whole decoder layers, so each local target MLA is immediately
+    # followed by its indexer in the paired group. Draft layers follow those pairs.
+    full = groups[0]
+    regions = []
+    indexers = []
+    if isinstance(full.kv_cache_spec, UniformTypeKVCacheSpecs):
+        specs = full.kv_cache_spec.kv_cache_specs
+        main = []
+        for name, following in pairwise(full.layer_names):
+            if isinstance(specs[following], AscendSFAIndexerCacheSpec):
+                main.append(name)
+                indexers.append(following)
+        if main:
+            regions.append((main, 0, specs[main[0]].page_size_bytes))
+
+    # KDA pages are padded to the target MLA stride at spec creation; all
+    # local recurrent groups can therefore overlay the backing at offset zero.
+    regions.extend(
+        (group.layer_names, 0, group.kv_cache_spec.page_size_bytes)
+        for group in groups
+        if group.layer_names and isinstance(group.kv_cache_spec, MambaSpec)
     )
-    specs = full.kv_cache_spec.kv_cache_specs
-    # Draft layers share logical IDs but must not enlarge the target/KDA
-    # overlay or inherit the target's packed page geometry. Retain global
-    # specs here: a PP-local group can have no local target MLA layer.
-    target_main = {
-        n: spec for n, spec in specs.items() if isinstance(spec, AscendMLAAttentionSpec) and not spec.is_draft
-    }
-    main = [n for n in full.layer_names if n in target_main]
-    indexer = [n for n in full.layer_names if isinstance(specs[n], AscendSFAIndexerCacheSpec)]
-    recurrent = [g for g in groups if isinstance(g.kv_cache_spec, MambaSpec)]
-    main_page = next(iter(target_main.values())).page_size_bytes
-    indexer_page = next(s.page_size_bytes for s in specs.values() if isinstance(s, AscendSFAIndexerCacheSpec))
-    slots = max([len(main), *(len(g.layer_names) for g in recurrent)])
-    return full, main, indexer, recurrent, main_page, indexer_page, slots
+    offset = max((len(names) * page for names, _, page in regions), default=0)
+    if indexers:
+        page = specs[indexers[0]].page_size_bytes
+        regions.append((indexers, offset, page))
+        offset += len(indexers) * page
+
+    # Every remaining local layer owns an independent region using its own page size.
+    placed = {name for names, _, _ in regions for name in names}
+    for group in groups:
+        group_spec = group.kv_cache_spec
+        for name in group.layer_names:
+            if name not in placed:
+                spec = (
+                    group_spec.kv_cache_specs[name] if isinstance(group_spec, UniformTypeKVCacheSpecs) else group_spec
+                )
+                regions.append(([name], offset, spec.page_size_bytes))
+                offset += spec.page_size_bytes
+    return regions, offset
 
 
 def paired_sfa_pool_bytes(groups):
-    _, _, indexer, _, main_page, indexer_page, slots = _layout(groups)
-    # Every pool ID still reserves independent target/indexer/draft storage.
-    draft_bytes = sum(spec.page_size_bytes for spec in _draft_layer_specs(groups).values())
-    return slots * main_page + len(indexer) * indexer_page + draft_bytes
+    _, pool_bytes = _paired_sfa_regions(groups)
+    return pool_bytes
 
 
 def paired_sfa_cache_config(
@@ -178,58 +188,18 @@ def paired_sfa_cache_config(
     kv_cache_groups: list[KVCacheGroupSpec],
     available_memory: int,
 ) -> KVCacheConfig:
-    _, main_mla_names, indexer_names, kda_groups, main_page_size, indexer_page_size, num_main_slots = _layout(
-        kv_cache_groups
-    )
-    pool_bytes = paired_sfa_pool_bytes(kv_cache_groups)
+    regions, pool_bytes = _paired_sfa_regions(kv_cache_groups)
     num_blocks = may_override_num_blocks(vllm_config, available_memory // pool_bytes)
-    backing_size = pool_bytes * num_blocks
-    main_layer_size = main_page_size * num_blocks
-    # Recurrent groups overlay the target MLA region. Their block IDs are
-    # disjoint, while indexer and draft layers always own separate regions.
     tensors = [
         KVCacheTensor(
-            size=backing_size,
-            layers=main_mla_names,
-            offset=0,
-            layer_stride=main_layer_size,
-            block_stride=main_page_size,
+            size=pool_bytes * num_blocks,
+            layers=layers,
+            offset=offset * num_blocks,
+            layer_stride=page_size * num_blocks,
+            block_stride=page_size,
         )
+        for layers, offset, page_size in regions
     ]
-    for group in kda_groups:
-        tensors.append(
-            KVCacheTensor(
-                size=backing_size,
-                layers=group.layer_names,
-                offset=0,
-                layer_stride=main_layer_size,
-                block_stride=main_page_size,
-            )
-        )
-    offset = num_main_slots * main_layer_size
-    indexer_layer_size = indexer_page_size * num_blocks
-    tensors.append(
-        KVCacheTensor(
-            size=backing_size,
-            layers=indexer_names,
-            offset=offset,
-            layer_stride=indexer_layer_size,
-            block_stride=indexer_page_size,
-        )
-    )
-    offset += len(indexer_names) * indexer_layer_size
-    for name, spec in _draft_layer_specs(kv_cache_groups).items():
-        draft_layer_size = spec.page_size_bytes * num_blocks
-        tensors.append(
-            KVCacheTensor(
-                size=backing_size,
-                layers=[name],
-                offset=offset,
-                layer_stride=draft_layer_size,
-                block_stride=spec.page_size_bytes,
-            )
-        )
-        offset += draft_layer_size
     return KVCacheConfig(
         num_blocks=num_blocks,
         kv_cache_tensors=tensors,

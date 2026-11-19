@@ -7,7 +7,7 @@ from unittest.mock import Mock
 
 import pytest
 import torch
-from vllm.v1.kv_cache_interface import FullAttentionSpec, KVCacheGroupSpec, MambaSpec
+from vllm.v1.kv_cache_interface import FullAttentionSpec, MambaSpec
 
 from vllm_ascend.core.kv_cache_interface import AscendMLAAttentionSpec, AscendSFAIndexerCacheSpec
 from vllm_ascend.models.kimi_k3.paired_sfa_cache import (
@@ -103,15 +103,45 @@ def test_paired_config_propagates_prefix_cache_retention_interval(interval):
     assert plan.prefix_cache_retention_interval == interval
 
 
-def test_pipeline_projection_retains_only_local_slot_cost():
-    groups = paired_sfa_cache_groups(make_config(), make_specs())
-    projected = [
-        KVCacheGroupSpec([n for n in g.layer_names if int(n.split(".")[2]) < 24], g.kv_cache_spec) for g in groups
-    ]
-    assert paired_sfa_pool_bytes(projected) == 6 * (1007616 + 202752)
+@pytest.mark.parametrize(
+    ("partition", "target_pair_counts"),
+    [("25,25,24,19", [6, 6, 6, 6]), ("24,24,24,21", [6, 6, 6, 6]), ("3,90", [0, 24])],
+)
+def test_placement_uses_only_local_decoder_layers(monkeypatch, partition, target_pair_counts):
+    from vllm.distributed.utils import get_pp_indices
+    from vllm.v1.core.kv_cache_planning import _project_kv_cache_groups_to_worker
+
+    monkeypatch.setenv("VLLM_PP_LAYER_PARTITION", partition)
+    specs = make_specs()
+    config = make_config()
+    groups = paired_sfa_cache_groups(config, specs)
+    for rank, pair_count in enumerate(target_pair_counts):
+        start, end = get_pp_indices(93, rank, len(target_pair_counts))
+        local = {name: spec for name, spec in specs.items() if start <= int(name.split(".")[2]) < end}
+        projected = _project_kv_cache_groups_to_worker(groups, local)
+        plan = paired_sfa_cache_config(config, projected, 2**30)
+        by_layer = {name: tensor for tensor in plan.kv_cache_tensors for name in tensor.layers}
+        assert by_layer.keys() == local.keys()
+        assert sum(isinstance(spec, AscendSFAIndexerCacheSpec) for spec in local.values()) == pair_count
+        for name, spec in local.items():
+            tensor = by_layer[name]
+            assert tensor.block_stride == spec.page_size_bytes
+            if isinstance(spec, AscendSFAIndexerCacheSpec):
+                assert tensor.offset + len(tensor.layers) * tensor.layer_stride == tensor.size
+            else:
+                assert tensor.offset == 0
+        if pair_count == 0:
+            # Profiling groups the worker's local specs before global projection.
+            profile_groups = paired_sfa_cache_groups(config, local)
+            assert paired_sfa_pool_bytes(profile_groups) == sum(s.page_size_bytes for s in local.values())
 
 
-def test_dspark_preserves_target_recurrent_budget_and_order():
+def test_dspark_preserves_target_recurrent_budget_and_order(monkeypatch):
+    from vllm.platforms import current_platform
+    from vllm.v1.core.kv_cache_planning import get_kv_cache_configs
+
+    from vllm_ascend.core.kv_cache_config_builder import AscendKVCacheConfigBuilder
+
     config = make_config()
     config.model_config.max_model_len = 8192
     config.parallel_config = SimpleNamespace(decode_context_parallel_size=1)
@@ -123,7 +153,7 @@ def test_dspark_preserves_target_recurrent_budget_and_order():
         f"model.layers.{layer}.attn": AscendMLAAttentionSpec(
             block_size=1536,
             num_kv_heads=1,
-            head_size=576,
+            head_size=576 if layer % 2 else 512,
             dtype=torch.bfloat16,
             is_draft=True,
             non_causal_multi_token_decode=True,
@@ -131,7 +161,8 @@ def test_dspark_preserves_target_recurrent_budget_and_order():
         for layer in reversed(range(93, 108))
     }
     specs = {**draft, **dict(reversed(target.items()))}
-    groups = paired_sfa_cache_groups(config, specs)
+    config.speculative_config = SimpleNamespace(method="dspark")
+    groups = AscendKVCacheConfigBuilder().get_kv_cache_groups(config, specs)
     draft_names = [f"model.layers.{layer}.attn" for layer in range(93, 108)]
     assert [len(g.layer_names) for g in groups] == [63, 23, 23, 23]
     assert groups[0].layer_names == target_groups[0].layer_names + draft_names
@@ -141,11 +172,32 @@ def test_dspark_preserves_target_recurrent_budget_and_order():
     draft_bytes = sum(spec.page_size_bytes for spec in draft.values())
     assert paired_sfa_pool_bytes(groups) == paired_sfa_pool_bytes(target_groups) + draft_bytes
 
-    # PP filters only local layer names; the global full-history specs still
-    # identify the target geometry on a stage that owns only draft layers.
-    projected = [replace(g, layer_names=[n for n in g.layer_names if n in draft]) for g in groups]
-    assert projected[0].kv_cache_spec is groups[0].kv_cache_spec
-    assert paired_sfa_pool_bytes(projected) == draft_bytes
+    # A draft-only PP rank must use the original target geometry after the
+    # upstream planner projects its group and converges the ranks' block counts.
+    monkeypatch.setattr(
+        current_platform,
+        "get_kv_cache_config_builder_cls",
+        lambda _: "vllm_ascend.core.kv_cache_config_builder.AscendKVCacheConfigBuilder",
+    )
+    config.attention_config = SimpleNamespace(hisparse_config=None)
+    config.model_config.original_max_model_len = config.model_config.max_model_len
+    config.cache_config.enable_extensible_kv_cache = False
+    config.cache_config.mamba_cache_mode = "align"
+    config.parallel_config.tensor_parallel_size = 1
+    config.parallel_config.prefill_context_parallel_size = 1
+    target_budget = paired_sfa_pool_bytes(target_groups) * 40
+    _, plan = get_kv_cache_configs(config, [target, draft], [target_budget, 32 * draft_bytes], groups)
+    assert plan.num_blocks == 32
+    offset = 0
+    for tensor, name in zip((t for t in plan.kv_cache_tensors if t.layers), draft_names, strict=True):
+        page = draft[name].page_size_bytes
+        assert (tensor.layers, tensor.offset, tensor.block_stride, tensor.size) == (
+            [name],
+            offset,
+            page,
+            32 * draft_bytes,
+        )
+        offset += 32 * page
 
 
 @pytest.mark.parametrize("dcp_size", [1, 8])

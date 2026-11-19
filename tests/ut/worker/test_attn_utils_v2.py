@@ -1251,6 +1251,7 @@ def test_mla_cache_spec_uses_physical_heads_for_kimi_k3(
     assert spec.dcp_sharded is dcp_sharded
     assert spec.page_size_bytes == source_spec.page_size_bytes
     assert spec.is_draft is (source_is_draft or is_draft_layer)
+    assert layer.is_draft_layer is spec.is_draft
     assert spec.store_on_host is not spec.is_draft
     assert spec.non_causal_multi_token_decode is non_causal
 

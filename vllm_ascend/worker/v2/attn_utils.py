@@ -221,7 +221,9 @@ def get_kv_cache_spec(vllm_config: VllmConfig) -> dict[str, KVCacheSpec]:
 
         # Speculator.load_model marks draft modules before cache planning.
         # Apply the upstream ownership tag before Ascend rebuilds MLA specs.
-        if attn_module.is_draft_layer:
+        if spec.is_draft:
+            attn_module.is_draft_layer = True
+        elif attn_module.is_draft_layer:
             spec = replace(spec, is_draft=True)
 
         if isinstance(spec, MambaSpec):
@@ -1587,6 +1589,7 @@ def allocate_kv_cache_main(
         kernel_block_sizes=kernel_block_sizes,
         shared_kv_cache_layers=shared_layers,
         kv_cache_config=kv_cache_config,
+        draft_layer_names={name for name, layer in attn_layers.items() if getattr(layer, "is_draft_layer", False)},
     )
 
 
@@ -1617,6 +1620,8 @@ def _reshape_kv_cache_v2(
     kernel_block_sizes: list[int],
     shared_kv_cache_layers: dict[str, str],
     kv_cache_config: "KVCacheConfig | None" = None,
+    *,
+    draft_layer_names: frozenset[str] | set[str] = frozenset(),
 ) -> dict[str, Any]:
     if kv_cache_config is None:
         raise ValueError("Reshape KV cache requires KVCacheConfig.")
@@ -2014,7 +2019,9 @@ def _reshape_kv_cache_v2(
                 kernel_block_size,
                 kv_cache_spec.num_kv_heads,
                 kv_cache_spec.head_size,
-                (getattr(kv_cache_spec, "cache_dtype_str", None) or "auto") if kv_cache_spec.is_draft else cache_dtype,
+                (getattr(kv_cache_spec, "cache_dtype_str", None) or "auto")
+                if layer_name in draft_layer_names
+                else cache_dtype,
             )
             packed_sfa_main_cache = enable_sfa(vllm_config) and kv_cache_spec_uses_packed_sfa_main_cache(kv_cache_spec)
             if isinstance(kv_cache_spec, (AscendMLAAttentionSpec, MLAAttentionSpec)) and (

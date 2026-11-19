@@ -248,8 +248,9 @@ class TestAscendStoreConnector(unittest.TestCase):
                     connector = AscendStoreConnector(config, KVConnectorRole.SCHEDULER, cache)
                     self.assertIs(connector.connector_scheduler, scheduler.return_value)
 
-    def test_pp_handshake_metadata_is_ignored(self):
+    def test_pp_handshake_metadata_is_ignored_without_dspark_prefix_reuse(self):
         connector = AscendStoreConnector.__new__(AscendStoreConnector)
+        connector.dspark_prefix_cache_enabled = False
         metadata = {
             (0, 0): MagicMock(),
             (1, 0): MagicMock(),

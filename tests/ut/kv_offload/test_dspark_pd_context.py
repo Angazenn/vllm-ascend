@@ -107,11 +107,9 @@ def test_scheduler_conversion_retains_resident_draft_in_shared_block_group():
         monkeypatch.setattr(patch_kv_cache_utils, "_is_deepseek_v4_groups", lambda *a, **k: False)
         physical = patch_kv_cache_utils._ascend_get_kv_cache_config_from_groups(vllm_config, config.kv_cache_groups, 1)
     assert physical.dspark_context_group_ids == (0,)
-    assert physical.dspark_draft_only_group_ids == ()
     scheduler_config = generate_scheduler_kv_cache_config([physical])
     assert scheduler_config.kv_cache_groups[0].kv_cache_spec.store_on_host is True
     assert scheduler_config.dspark_context_group_ids == (0,)
-    assert scheduler_config.dspark_draft_only_group_ids == ()
     scheduler = _context_scheduler(draft_spec)
     scheduler.kv_cache_config = scheduler_config
     scheduler.main_group_idx = scheduler.indexer_group_idx = 0

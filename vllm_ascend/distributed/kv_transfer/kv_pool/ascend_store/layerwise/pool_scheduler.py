@@ -47,7 +47,7 @@ class LayerwiseKVPoolScheduler(BaseKVPoolScheduler):
         self.use_block_key_layerwise = use_layerwise and self.layerwise_data_plane == "block_key"
         self.use_layerwise_transfer = use_layerwise and self.layerwise_data_plane == "gva"
         self.dspark_prefix_keys: DSparkPrefixKeys | None = None
-        self.dspark_draft_only_group_ids = frozenset(getattr(kv_cache_config, "dspark_draft_only_group_ids", ()))
+        self.dspark_target_stages: dict[int, list[int]] | None = None
         super().__init__(vllm_config, use_layerwise, kv_cache_config)
         self.sharded_mamba_group_ids = get_sharded_mamba_group_ids(kv_cache_config)
         self.load_async = False
@@ -326,17 +326,21 @@ class LayerwiseKVPoolScheduler(BaseKVPoolScheduler):
         """
         assert self.layerwise_keys is not None
         draft_keys = self.dspark_prefix_keys
-        if draft_keys is not None and group_id in self.dspark_draft_only_group_ids:
-            # Draft-only groups have no ordinary layerwise target object.
-            return draft_keys.make_hit_check_keys(block_hash_hex)
         if group_id in self.sharded_mamba_group_ids or group_id in self.num_speculative_blocks_by_group:
             head_or_tp_ranks = self.tp_size
         else:
             head_or_tp_ranks = self.tp_size // self.put_step
-        keys = self.layerwise_keys.make_hit_check_keys(group_id, block_hash_hex, head_or_tp_ranks)
-        if draft_keys is not None:
-            keys.extend(draft_keys.make_hit_check_keys(block_hash_hex))
-        return keys
+        if draft_keys is None:
+            return self.layerwise_keys.make_hit_check_keys(group_id, block_hash_hex, head_or_tp_ranks)
+        if self.dspark_target_stages is None:
+            raise RuntimeError("DSpark prefix lookup requires worker cache registration metadata")
+        stages = self.dspark_target_stages.get(group_id, ())
+        keys = (
+            self.layerwise_keys.make_hit_check_keys(group_id, block_hash_hex, head_or_tp_ranks, stages)
+            if stages
+            else []
+        )
+        return keys + draft_keys.make_hit_check_keys(block_hash_hex)
 
     def _query_layerwise_block_hits(self, keys_by_block: list[list[str]]) -> list[bool]:
         """Probe backend readability and fold physical keys into block hits."""

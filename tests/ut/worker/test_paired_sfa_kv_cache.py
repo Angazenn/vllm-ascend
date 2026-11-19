@@ -170,8 +170,7 @@ def test_paired_cache_allocates_one_backing(
 
 @pytest.mark.parametrize("draft_layer", [8, 9])
 def test_draft_fia_reshape_uses_draft_cache_dtype_in_packed_target_group(monkeypatch, vllm_config, draft_layer):
-    plan, specs = make_paired_cache(vllm_config, torch.float16)
-    caches = attn_utils._allocate_kv_cache(plan, shared_layers={}, device=torch.device("cpu"))
+    plan, specs = make_paired_cache(vllm_config, torch.float16, local_layers=[draft_layer])
     name = f"model.layers.{draft_layer}.attn"
     spec = specs[name]
     backend = SimpleNamespace(
@@ -180,14 +179,11 @@ def test_draft_fia_reshape_uses_draft_cache_dtype_in_packed_target_group(monkeyp
     monkeypatch.setattr(attn_utils, "_uses_single_raw_mla_cache", lambda *_args: False)
     monkeypatch.setattr(attn_utils, "_get_attention_kv_cache_dims", lambda *_args: (512, 64))
 
-    reshaped = attn_utils._reshape_kv_cache_v2(
-        attn_groups=[AttentionGroup(backend, [name], spec, 0)],
-        kv_cache_raw_tensors=caches,
-        cache_dtype="int8",
-        kernel_block_sizes=[BLOCK_SIZE],
-        shared_kv_cache_layers={},
-        kv_cache_config=plan,
-    )
+    # The registered local owner supplies draft ownership at allocation time.
+    backend.full_cls_name = lambda: "draft_backend"
+    layers = {n: SimpleNamespace(get_attn_backend=lambda: backend, is_draft_layer=n == name) for n in specs}
+    monkeypatch.setattr(attn_utils, "get_layers_from_vllm_config", lambda *_: layers)
+    reshaped = attn_utils.allocate_kv_cache_main(plan, torch.device("cpu"), None, [BLOCK_SIZE])
 
     backend.get_kv_cache_shape.assert_called_once_with(NUM_BLOCKS, BLOCK_SIZE, 1, 576, "auto")
     k_cache, v_cache = reshaped[name]

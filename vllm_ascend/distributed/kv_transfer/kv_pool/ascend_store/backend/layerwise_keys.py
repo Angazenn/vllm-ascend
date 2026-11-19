@@ -3,7 +3,7 @@
 
 """Bound wire-key construction shared by writers and scheduler lookups."""
 
-from collections.abc import Callable
+from collections.abc import Callable, Iterable
 from dataclasses import dataclass, field
 
 
@@ -35,12 +35,14 @@ class LayerwiseKeyBuilder:
             key = f"{key}@dcp_size:{self.dcp_size}@dcp_rank:{dcp_rank}"
         return key
 
-    def make_hit_check_keys(self, group_id: int, block_hash: str, num_ranks: int) -> list[str]:
-        """Require every distinct shard on every PP stage."""
+    def make_hit_check_keys(
+        self, group_id: int, block_hash: str, num_ranks: int, stages: Iterable[int] | None = None
+    ) -> list[str]:
+        """Require every distinct shard on the participating PP stages."""
         pcp_size = self.pcp_size if group_id in self.pcp_sharded_group_ids else 1
         return [
             self.make_full_key(group_id, block_hash, rank, stage, pcp_rank, dcp_rank)
-            for stage in range(self.pp_size)
+            for stage in (range(self.pp_size) if stages is None else stages)
             for pcp_rank in range(pcp_size)
             for dcp_rank in range(self.dcp_size)
             for rank in range(num_ranks)

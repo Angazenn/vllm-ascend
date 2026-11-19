@@ -15,11 +15,9 @@
 # This file is a part of the vllm-ascend project.
 #
 
-import copy
 import tempfile
 import unittest
 from contextlib import ExitStack
-from dataclasses import replace
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
@@ -29,7 +27,6 @@ from vllm.v1.kv_cache_interface import (
     FullAttentionSpec,
     KVCacheGroupSpec,
     MambaSpec,
-    MLAAttentionSpec,
     SlidingWindowSpec,
     UniformTypeKVCacheSpecs,
 )
@@ -92,11 +89,14 @@ def test_joint_prefix_keys_keep_target_keys_and_require_every_final_pp_draft_rep
     scheduler.tp_size, scheduler.put_step = 4, 4
     scheduler.num_speculative_blocks_by_group = {}
     scheduler.dspark_prefix_keys = DSparkPrefixKeys("draft-contract", pp_size=2, tp_size=4) if dspark else None
-    scheduler.dspark_draft_only_group_ids = frozenset()
+    scheduler.dspark_target_stages = {0: [0, 1]}
     scheduler.layerwise_max_transfer_blocks = 0
 
     keys = scheduler._make_layerwise_hit_check_keys(0, "block-hash")
-    scheduler.layerwise_keys.make_hit_check_keys.assert_called_once_with(0, "block-hash", 1)
+    if dspark:
+        scheduler.layerwise_keys.make_hit_check_keys.assert_called_once_with(0, "block-hash", 1, [0, 1])
+    else:
+        scheduler.layerwise_keys.make_hit_check_keys.assert_called_once_with(0, "block-hash", 1)
     expected_draft = [f"dspark-prefix-v1@draft-contract@pp1@tp{rank}@block-hash" for rank in range(4)] if dspark else []
     assert keys == target_keys + expected_draft
     scheduler.store_scheduler = SimpleNamespace(batch_is_readable=MagicMock(return_value=[True] * len(keys)))
@@ -117,7 +117,7 @@ def test_joint_prefix_draft_only_group_uses_companion_keys_without_losing_mixed_
     scheduler.tp_size, scheduler.put_step = 4, 4
     scheduler.num_speculative_blocks_by_group = {}
     scheduler.dspark_prefix_keys = DSparkPrefixKeys("draft-contract", pp_size=2, tp_size=4)
-    scheduler.dspark_draft_only_group_ids = frozenset({3}) if draft_only else frozenset()
+    scheduler.dspark_target_stages = {} if draft_only else {3: [0]}
     scheduler.layerwise_max_transfer_blocks = 0
 
     keys = scheduler._make_layerwise_hit_check_keys(3, "block-hash")
@@ -127,7 +127,7 @@ def test_joint_prefix_draft_only_group_uses_companion_keys_without_losing_mixed_
     if draft_only:
         scheduler.layerwise_keys.make_hit_check_keys.assert_not_called()
     else:
-        scheduler.layerwise_keys.make_hit_check_keys.assert_called_once_with(3, "block-hash", 1)
+        scheduler.layerwise_keys.make_hit_check_keys.assert_called_once_with(3, "block-hash", 1, [0])
     scheduler.store_scheduler = SimpleNamespace(batch_is_readable=MagicMock(return_value=[True] * len(keys)))
     assert scheduler._query_layerwise_block_hits([keys]) == [True]
     for missing_key in range(len(keys)):
@@ -151,7 +151,7 @@ def test_prefix_lookup_rechecks_after_save_and_eviction(mode):
         DSparkPrefixKeys("draft-contract", pp_size=2, tp_size=4) if mode == "dspark" else None
     )
     scheduler.layerwise_offload = mode == "reuse"
-    scheduler.dspark_draft_only_group_ids = frozenset({1})
+    scheduler.dspark_target_stages = {0: [0, 1]}
     scheduler.layerwise_max_transfer_blocks = 0
     scheduler.hash_block_size = 16
     scheduler.grouped_block_size = [16, 16]
@@ -177,74 +177,72 @@ def test_prefix_lookup_rechecks_after_save_and_eviction(mode):
     assert scheduler.store_scheduler.batch_is_readable.call_count == 8
 
 
-@pytest.mark.parametrize("draft_first", [False, True])
-@pytest.mark.parametrize("non_causal", [False, True])
-@pytest.mark.parametrize("empty_pp_layers", [False, True])
-def test_joint_prefix_group_ownership_survives_scheduler_conversion_and_empty_pp_layer_names(
-    draft_first, non_causal, empty_pp_layers
-):
-    from vllm.v1.core.kv_cache_utils import generate_scheduler_kv_cache_config
+@pytest.mark.parametrize("store_index", [0, 1])
+def test_dspark_handshake_routes_target_keys_to_owning_pp_stages(store_index):
+    from vllm_ascend.distributed.kv_transfer.ascend_multi_connector import AscendMultiConnector
+    from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.ascend_store_connector import AscendStoreConnector
+    from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.backend.layerwise_keys import LayerwiseKeyBuilder
+    from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.layerwise.pool_worker import LayerwiseKVPoolWorker
 
-    from vllm_ascend.patch.platform import patch_kv_cache_utils
+    def multi(store, transport):
+        connector = AscendMultiConnector.__new__(AscendMultiConnector)
+        connector._dspark_prefix_provider_index = store_index
+        connector._connectors = [transport]
+        connector._connectors.insert(store_index, store)
+        return connector
 
-    target = MLAAttentionSpec(block_size=16, num_kv_heads=1, head_size=1, dtype=torch.float32)
-    # Ownership comes from is_draft, independently of the attention mask.
-    target = replace(target, non_causal_multi_token_decode=non_causal)
-    draft = replace(target, is_draft=True)
-    layer_specs = {"draft": draft, "target": target} if draft_first else {"target": target, "draft": draft}
-    mixed = UniformTypeKVCacheSpecs(block_size=16, kv_cache_specs=layer_specs)
-    config = SimpleNamespace(
-        model_config=SimpleNamespace(hf_config=SimpleNamespace(model_type="kimi_k3")),
-        speculative_config=SimpleNamespace(method="dspark"),
-        kv_transfer_config=None,
-    )
-    kv_config = SimpleNamespace(
-        num_blocks=4,
-        hisparse_host_num_blocks=0,
-        kv_cache_groups=[
-            KVCacheGroupSpec([], draft, is_eagle_group=True),
-            KVCacheGroupSpec([] if empty_pp_layers else list(layer_specs), mixed, is_eagle_group=True),
-            KVCacheGroupSpec(["target-only"], target),
-            KVCacheGroupSpec([], UniformTypeKVCacheSpecs(block_size=16, kv_cache_specs={"draft": draft})),
-        ],
-    )
-    original_groups = copy.deepcopy(kv_config.kv_cache_groups)
-    with (
-        patch.object(patch_kv_cache_utils, "is_deepseek_v41_cache", return_value=False),
-        patch.object(patch_kv_cache_utils, "_get_glm5_next_cache_layout", return_value=None),
-        patch.object(patch_kv_cache_utils, "_is_deepseek_v4_groups", return_value=False),
-        patch.object(patch_kv_cache_utils, "_orig_get_kv_cache_config_from_groups", return_value=kv_config),
-    ):
-        result = patch_kv_cache_utils._ascend_get_kv_cache_config_from_groups(config, kv_config.kv_cache_groups, 0)
-    assert result.dspark_draft_only_group_ids == (0, 3)
-    scheduler_config = generate_scheduler_kv_cache_config([result])
-    assert scheduler_config.dspark_draft_only_group_ids == (0, 3)
-    assert scheduler_config.kv_cache_groups[0].layer_names == []
-    assert scheduler_config.kv_cache_groups[1].kv_cache_spec == next(iter(layer_specs.values()))
-    assert result.kv_cache_groups == original_groups
-
-    # Feed the preserved ownership to its real consumer. A mixed group must
-    # retain target keys even if its representative is draft or this PP stage
-    # has no local layers; standalone draft groups have no target object.
     scheduler = LayerwiseKVPoolScheduler.__new__(LayerwiseKVPoolScheduler)
+    scheduler.pp_size, scheduler.tp_size, scheduler.put_step = 3, 2, 1
     scheduler.sharded_mamba_group_ids = set()
-    scheduler.layerwise_keys = SimpleNamespace(
-        make_hit_check_keys=MagicMock(side_effect=lambda group_id, *_: [f"target-group{group_id}"])
-    )
-    scheduler.tp_size, scheduler.put_step = 4, 4
     scheduler.num_speculative_blocks_by_group = {}
-    scheduler.dspark_prefix_keys = DSparkPrefixKeys("draft-contract", pp_size=2, tp_size=4)
-    scheduler.dspark_draft_only_group_ids = frozenset(scheduler_config.dspark_draft_only_group_ids)
-    draft_keys = scheduler.dspark_prefix_keys.make_hit_check_keys("block-hash")
-    for group_id in (0, 3):
-        assert scheduler._make_layerwise_hit_check_keys(group_id, "block-hash") == draft_keys
-    scheduler.layerwise_keys.make_hit_check_keys.assert_not_called()
-    for group_id in (1, 2):
-        assert scheduler._make_layerwise_hit_check_keys(group_id, "block-hash") == [
-            f"target-group{group_id}",
-            *draft_keys,
+    scheduler.dspark_prefix_keys = DSparkPrefixKeys("draft-contract", pp_size=3, tp_size=2)
+    scheduler.layerwise_keys = LayerwiseKeyBuilder(lambda g, h, r, p: f"{g}/{h}/{r}/{p}", pp_size=3)
+    store = AscendStoreConnector.__new__(AscendStoreConnector)
+    store.dspark_prefix_cache_enabled = True
+    store.connector_scheduler = scheduler
+    transport = MagicMock()
+    scheduler_connector = multi(store, transport)
+
+    # Group 0 spans target and draft stages; group 1 has only draft layers;
+    # group 2 has target layers on both earlier stages.
+    reports = {}
+    for pp, groups in enumerate(
+        [
+            [["target.0"], [], ["target.1"]],
+            [[], [], ["target.2"]],
+            [["draft.3"], ["draft.4"], []],
         ]
-    assert scheduler.layerwise_keys.make_hit_check_keys.call_count == 2
+    ):
+        worker = LayerwiseKVPoolWorker.__new__(LayerwiseKVPoolWorker)
+        worker.kv_cache_config = SimpleNamespace(
+            kv_cache_groups=[SimpleNamespace(layer_names=names) for names in groups],
+            dspark_draft_layer_names=("draft.3", "draft.4") if pp == 2 else (),
+        )
+        worker.cacheable_group_ids = list(range(3))
+        worker._init_layerwise_config = MagicMock()
+        worker._extract_physical_layer_index = lambda name: int(name.split(".")[-1])
+        worker.configure_dspark_prefix_cache(scheduler.dspark_prefix_keys)
+        child = AscendStoreConnector.__new__(AscendStoreConnector)
+        child.dspark_prefix_cache_enabled = True
+        child.connector_worker = worker
+        for tp in range(2):
+            sibling = MagicMock()
+            sibling.get_handshake_metadata.return_value = f"transport/{pp}/{tp}"
+            reports[pp, tp] = multi(child, sibling).get_handshake_metadata()
+    scheduler_connector.set_xfer_handshake_metadata_pp_aware(reports)
+    transport.set_xfer_handshake_metadata_pp_aware.assert_called_once_with(
+        {(pp, tp): f"transport/{pp}/{tp}" for pp, tp in reports}
+    )
+    draft = scheduler.dspark_prefix_keys.make_hit_check_keys("hash")
+    assert scheduler._make_layerwise_hit_check_keys(0, "hash") == ["0/hash/0/0", "0/hash/1/0", *draft]
+    assert scheduler._make_layerwise_hit_check_keys(1, "hash") == draft
+    assert scheduler._make_layerwise_hit_check_keys(2, "hash") == [
+        "2/hash/0/0",
+        "2/hash/1/0",
+        "2/hash/0/1",
+        "2/hash/1/1",
+        *draft,
+    ]
 
 
 def make_config(kv_role="kv_producer", extra_config=None, block_size=16):

@@ -633,15 +633,9 @@ def _ascend_get_kv_cache_config_from_groups(
     speculative_config = getattr(vllm_config, "speculative_config", None)
     if speculative_config is not None and speculative_config.method == "dspark":
         from vllm_ascend.distributed.kv_transfer.kv_p2p.sfa_pd_rd2h.dspark_context import resident_mla_context_group_ids
-        from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.dspark_prefix_layout import draft_only_group_ids
 
-        # Upstream scheduler conversion keeps only the first spec in a uniform
-        # group, losing both residency and per-layer is_draft ownership. Keep
-        # the PD context and external prefix-store classifications separate:
-        # a mixed group needs draft block IDs AND ordinary target hit keys.
-        # Remove these snapshots once upstream preserves per-layer ownership.
+        # Scheduler conversion reduces uniform specs to a single representative.
         kv_cache_config.dspark_context_group_ids = resident_mla_context_group_ids(kv_cache_config.kv_cache_groups)
-        kv_cache_config.dspark_draft_only_group_ids = draft_only_group_ids(kv_cache_config.kv_cache_groups)
     return kv_cache_config
 
 

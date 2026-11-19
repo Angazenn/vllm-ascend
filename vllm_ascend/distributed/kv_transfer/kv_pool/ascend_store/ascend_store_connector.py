@@ -1,5 +1,5 @@
 from collections.abc import Callable, Iterable
-from typing import TYPE_CHECKING, Any, cast
+from typing import Any, cast
 
 import torch
 from vllm.config import VllmConfig
@@ -58,9 +58,6 @@ from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.pool_scheduler imp
     KVPoolScheduler,
 )
 from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.pool_worker import BaseKVPoolWorker, KVPoolWorker
-
-if TYPE_CHECKING:
-    from vllm.distributed.kv_transfer.kv_connector.v1.base import KVConnectorHandshakeMetadata
 
 
 def create_kv_pool_scheduler(
@@ -257,12 +254,26 @@ class AscendStoreConnector(KVConnectorBase_V1, SupportsHMA):
     # Scheduler Side Methods
     ############################################################
 
-    def set_xfer_handshake_metadata_pp_aware(
-        self,
-        metadata: dict[tuple[int, int], "KVConnectorHandshakeMetadata"],
-    ) -> None:
-        """Ignore P/D handshake metadata because AscendStore handles PP via pool keys."""
-        pass
+    def get_handshake_metadata(self):
+        if self.dspark_prefix_cache_enabled:
+            # configure_dspark_prefix_cache filters these to local target owners.
+            return tuple(cast(LayerwiseKVPoolWorker, self.connector_worker).cacheable_group_ids)
+        return None
+
+    def set_xfer_handshake_metadata_pp_aware(self, metadata) -> None:
+        if not self.dspark_prefix_cache_enabled:
+            return
+        scheduler = cast(LayerwiseKVPoolScheduler, self.connector_scheduler)
+        stages: dict[int, list[int]] = {}
+        for pp in range(scheduler.pp_size):
+            # TP ranks within a PP stage own the same layers.
+            groups = metadata[pp, 0]
+            for tp in range(1, scheduler.tp_size):
+                if metadata[pp, tp] != groups:
+                    raise ValueError(f"AscendStore target cache groups differ across TP ranks on PP stage {pp}")
+            for group_id in groups:
+                stages.setdefault(group_id, []).append(pp)
+        scheduler.dspark_target_stages = stages
 
     def get_num_new_matched_tokens(self, request: "Request", num_computed_tokens: int) -> tuple[int, bool]:
         assert self.connector_scheduler is not None

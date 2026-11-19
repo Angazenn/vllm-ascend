@@ -68,6 +68,26 @@ class AscendMultiConnector(MultiConnector, SupportsHMA):
             self._requires_full_dspark_prompt = False
         return bool(providers)
 
+    def get_handshake_metadata(self):
+        if self._dspark_prefix_provider_index is None:
+            return super().get_handshake_metadata()
+        # DSpark needs both the store's stage ownership and the P/D transport's
+        # handshake. Keep child positions stable, including children with no payload.
+        return tuple(child.get_handshake_metadata() for child in self._connectors)
+
+    def set_xfer_handshake_metadata_pp_aware(self, metadata) -> None:
+        if self._dspark_prefix_provider_index is None:
+            return super().set_xfer_handshake_metadata_pp_aware(metadata)
+        for index, child in enumerate(self._connectors):
+            reports = {rank: payload[index] for rank, payload in metadata.items() if payload[index] is not None}
+            if reports or index == self._dspark_prefix_provider_index:
+                child.set_xfer_handshake_metadata_pp_aware(reports)
+
+    def set_xfer_handshake_metadata(self, metadata) -> None:
+        if self._dspark_prefix_provider_index is None:
+            return super().set_xfer_handshake_metadata(metadata)
+        self.set_xfer_handshake_metadata_pp_aware({(0, tp): payload for tp, payload in metadata.items()})
+
     def _configure_layerwise_reuse_completion(self) -> None:
         # Producers that report when a shared physical KV slot is safe to reuse.
         self._layerwise_slot_release_providers = [
